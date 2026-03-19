@@ -1,0 +1,15 @@
+[package]
+name = "kalisto"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kalisto"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kalisto"
+path = "src/main.rs"
+
+[dependencies]
+structopt = "0.3.26"

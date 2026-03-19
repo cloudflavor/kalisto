@@ -1,0 +1,63 @@
+use std::path::PathBuf;
+
+use kalisto::probe::macos_lima_k3s::{ProbeConfig, ProbeStatus, ServerMode, run};
+
+fn live_tests_enabled() -> bool {
+    std::env::var("KALISTO_LIVE_LIMA_K3S_TESTS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+#[test]
+fn macos_lima_k3s_probe() {
+    if !live_tests_enabled() {
+        eprintln!("skipping live macOS Lima k3s probe; set KALISTO_LIVE_LIMA_K3S_TESTS=1");
+        return;
+    }
+
+    let mut config = ProbeConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(template) = std::env::var("KALISTO_LIMA_TEMPLATE") {
+        config.template = template;
+    }
+    if let Ok(network) = std::env::var("KALISTO_LIMA_NETWORK") {
+        config.network = Some(network);
+    }
+    if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
+        config.api_port = port.parse().unwrap_or(16443);
+    }
+    if let Ok(workers) = std::env::var("KALISTO_LIMA_K3S_WORKERS") {
+        config.worker_count = workers.parse().unwrap_or(0);
+    }
+    if let Ok(version) = std::env::var("KALISTO_K3S_VERSION") {
+        config.k3s_version = version;
+    }
+    if std::env::var("KALISTO_LIMA_K3S_AGENTLESS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        config.server_mode = ServerMode::Agentless;
+    }
+    if std::env::var("KALISTO_LIMA_NO_ROSETTA")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        config.enable_rosetta = false;
+    }
+
+    let report = run(&config);
+    for result in &report.results {
+        eprintln!("[{}] {}: {}", result.status, result.name, result.detail);
+    }
+    eprintln!("{}", report.summary());
+
+    let failures: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Fail)
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "live macOS Lima k3s probe had failures: {failures:#?}"
+    );
+}
