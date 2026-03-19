@@ -8,6 +8,33 @@ Current scope:
 - Kubernetes distro: `k3s`
 - image pipeline: container-built seed image plus macOS finalization pass
 
+## Product commands
+
+The first product-facing commands are available now:
+
+```bash
+cargo run -- up --workspace-root .
+cargo run -- status --workspace-root .
+cargo run -- kubeconfig --workspace-root .
+cargo run -- down --workspace-root .
+```
+
+Optional `up` knobs:
+
+```bash
+cargo run -- up \
+  --workspace-root . \
+  --workers 1 \
+  --api-port 16443 \
+  --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
+```
+
+Cluster state is stored under:
+
+```text
+.kalisto/clusters/<name>/
+```
+
 ## Lima image pipeline
 
 Kalisto uses a two-stage image flow:
