@@ -1,8 +1,8 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
+use crate::backend::lima::{Config as LimaBaseConfig, internal_hostname, shell_escape};
 use crate::error::Error;
-use crate::probe::macos_lima::{ProbeConfig as LimaBaseConfig, internal_hostname};
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
 
 use super::config::Config;
@@ -89,7 +89,6 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
     let base_config = LimaBaseConfig {
         template: config.template.clone(),
         workspace_root: workspace_root.clone(),
-        keep_resources: config.keep_resources,
         enable_rosetta: config.enable_rosetta,
         network: effective_network(config),
     };
@@ -227,7 +226,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
 
     let stable_ready_check = format!(
         "ps -ef | grep -F '[k]3s server' >/dev/null && KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/readyz",
-        crate::probe::macos_lima::shell_escape(
+        shell_escape(
             control_plane
                 .artifacts
                 .kubeconfig

@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::backend::lima::shell_escape;
 use crate::k3s::ServerMode;
-use crate::probe::macos_lima::shell_escape;
 
 use super::config::Config;
 

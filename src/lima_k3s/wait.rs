@@ -3,8 +3,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use crate::backend::lima::{guest_sudo_shell, shell_escape};
 use crate::error::{Error, Result};
-use crate::probe::macos_lima::{guest_sudo_shell, shell_escape};
 use crate::process::{CommandRunner, Output};
 
 use super::node::Instance;

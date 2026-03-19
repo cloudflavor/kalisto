@@ -2,11 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::backend::lima::{
+    Config as LimaConfig, InstanceConfig, guest_shell, guest_sudo_shell, shell_escape,
+    start_instance,
+};
 use crate::error::Result;
 use crate::k3s::{BootstrapSpec, NodeRole, ServerMode};
-use crate::probe::macos_lima::{
-    ProbeConfig as LimaBaseConfig, guest_shell, guest_sudo_shell, shell_escape, start_instance,
-};
 use crate::process::{CommandRunner, Output};
 
 use super::config::Config;
@@ -82,9 +83,9 @@ pub fn build_worker_instances(
 
 pub fn start_node_instance(
     runner: &dyn CommandRunner,
-    base_config: &LimaBaseConfig,
+    base_config: &LimaConfig,
     node: &Instance,
-    workspace_root: &Path,
+    _workspace_root: &Path,
     host_api_port: Option<u16>,
     cpus: u8,
     memory_gib: u8,
@@ -92,11 +93,12 @@ pub fn start_node_instance(
     start_instance(
         runner,
         base_config,
-        &node.name,
-        workspace_root,
-        host_api_port,
-        cpus,
-        memory_gib,
+        &InstanceConfig {
+            name: node.name.clone(),
+            host_port_forward: host_api_port,
+            cpus,
+            memory_gib,
+        },
     )
 }
 
@@ -140,7 +142,7 @@ pub fn bootstrap_worker(
 
 pub fn start_worker_instances(
     runner: &dyn CommandRunner,
-    base_config: &LimaBaseConfig,
+    base_config: &LimaConfig,
     workspace_root: &Path,
     workers: &[Instance],
     instances: &mut Vec<String>,

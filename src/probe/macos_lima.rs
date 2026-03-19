@@ -279,10 +279,6 @@ pub(crate) fn start_instance(
     runner.run("limactl", &args)
 }
 
-pub(crate) fn internal_hostname(instance_name: &str) -> String {
-    format!("lima-{instance_name}.internal")
-}
-
 pub(crate) fn guest_shell(
     runner: &dyn CommandRunner,
     instance_name: &str,
@@ -294,25 +290,6 @@ pub(crate) fn guest_shell(
             "-y".into(),
             "shell".into(),
             instance_name.to_owned(),
-            "sh".into(),
-            "-lc".into(),
-            command.to_owned(),
-        ],
-    )
-}
-
-pub(crate) fn guest_sudo_shell(
-    runner: &dyn CommandRunner,
-    instance_name: &str,
-    command: &str,
-) -> Result<Output> {
-    runner.run(
-        "limactl",
-        &[
-            "-y".into(),
-            "shell".into(),
-            instance_name.to_owned(),
-            "sudo".into(),
             "sh".into(),
             "-lc".into(),
             command.to_owned(),

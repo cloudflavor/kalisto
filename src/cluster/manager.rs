@@ -193,7 +193,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let mut start_results = Vec::new();
     let started_workers = start_worker_instances(
         runner,
-        &probe_lima_config(spec, &workspace_root),
+        &base_config,
         &workspace_root,
         &worker_instances,
         &mut started_instances,
@@ -311,19 +311,6 @@ pub fn status_with_runner(
 pub fn kubeconfig_path(workspace_root: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
     let state_root = workspace_root.join(".kalisto").join("clusters").join(name);
     Ok(ClusterState::load(&state_root)?.kubeconfig_path)
-}
-
-fn probe_lima_config(
-    spec: &ClusterSpec,
-    workspace_root: &std::path::Path,
-) -> crate::probe::macos_lima::ProbeConfig {
-    crate::probe::macos_lima::ProbeConfig {
-        template: spec.template.clone(),
-        workspace_root: workspace_root.to_path_buf(),
-        keep_resources: false,
-        enable_rosetta: spec.enable_rosetta,
-        network: spec.network.clone(),
-    }
 }
 
 fn k3s_config_from_spec(
