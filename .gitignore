@@ -1,0 +1,8 @@
+/.cache/
+/.cargo/
+/artifacts/
+/target/
+
+# Keep the checked-in opal project config, ignore any other local opal data.
+/.opal/*
+!/.opal/config.toml

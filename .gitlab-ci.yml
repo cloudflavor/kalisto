@@ -1,0 +1,71 @@
+stages:
+  - validate
+  - build
+
+.rust-job:
+  image: rust:bookworm
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key: rust-v1
+    paths:
+      - .cargo/bin/
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+  before_script:
+    - rustup component add rustfmt clippy
+
+fmt:
+  stage: validate
+  extends: .rust-job
+  script:
+    - cargo fmt --check
+
+clippy:
+  stage: validate
+  extends: .rust-job
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+  stage: validate
+  extends: .rust-job
+  script:
+    - cargo test
+
+build:bin:
+  stage: build
+  extends: .rust-job
+  script:
+    - cargo build --release --bin kalisto
+  artifacts:
+    paths:
+      - target/release/kalisto
+
+build:lima-node-image:
+  stage: build
+  image: debian:bookworm-slim
+  variables:
+    APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
+    DEBIAN_FRONTEND: noninteractive
+    INITRD: "No"
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
+    LIBGUESTFS_BACKEND: direct
+  cache:
+    key: lima-node-image-v1
+    paths:
+      - .cache/apt/archives/
+      - .cache/apt/lists/
+      - .cache/k3s/
+      - .cache/lima-node/work/
+  before_script:
+    - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_IMAGE_WORK_DIR}"
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils "linux-image-$(dpkg --print-architecture)"
+  script:
+    - ./scripts/macos/build_lima_node_image.sh
+  artifacts:
+    paths:
+      - artifacts/lima-node/
