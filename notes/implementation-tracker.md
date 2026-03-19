@@ -57,20 +57,17 @@ The current supported runtime is:
 
 - separate backend lifecycle from bootstrap orchestration
 - move the current `up` path off probe-oriented helpers where it still reuses them indirectly
+  - worker startup and shared runtime helpers now use the real Lima backend module
 
 ## Next
 
-1. Add Lima backend lifecycle module
-   - create/start/stop/delete instances
-   - keep `limactl` details out of command handlers
+1. Make `up` use the finalized image path by default in real runs and benchmark it again
 
-2. Make `up` use the finalized image path by default in real runs and benchmark it again
+2. Add mount/workspace fields to the cluster spec and state model
 
-3. Add mount/workspace fields to the cluster spec and state model
+3. Add benchmark command surface for repeated timing runs
 
-4. Add benchmark command surface for repeated timing runs
-
-5. Reduce duplication between probe-oriented Lima helpers and product backend helpers
+4. Reduce duplication between probe-oriented Lima helpers and product backend helpers
 
 ## Follow-up
 
