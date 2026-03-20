@@ -1,5 +1,8 @@
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+use tracing::{info, info_span, warn};
 
 use crate::backend::lima::{
     Config as LimaConfig, InstanceConfig, canonicalize_path, internal_hostname,
@@ -39,6 +42,14 @@ pub struct UpOutcome {
     pub cluster_ready: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BenchmarkSample {
+    pub run: usize,
+    pub cluster_name: String,
+    pub control_plane_ready: String,
+    pub cluster_ready: String,
+}
+
 pub fn up(spec: &ClusterSpec) -> Result<UpOutcome> {
     let runner = SystemRunner;
     up_with_runner(spec, &runner)
@@ -51,12 +62,22 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
+    let up_span = info_span!(
+        "cluster_up",
+        cluster = %spec.name,
+        workers = spec.worker_count,
+        api_port = spec.api_port,
+        template = %spec.template
+    );
+    let _up_guard = up_span.enter();
+    info!("starting cluster bring-up");
+
     ensure_path_exists(&spec.workspace_root)?;
     let workspace_root = canonicalize_path(&spec.workspace_root)?;
-    let helper_script = spec.helper_script();
+    let helper_script = ClusterSpec::helper_script_for(&workspace_root);
     ensure_path_exists(&helper_script)?;
 
-    let state_root = spec.state_root();
+    let state_root = ClusterSpec::state_root_for(&workspace_root, &spec.name);
     let state_file = ClusterState::state_file(&state_root);
     if state_file.exists() {
         return Err(Error::InvalidArgs(format!(
@@ -67,6 +88,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
 
     fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
+    info!(
+        workspace_root = %workspace_root.display(),
+        helper_script = %helper_script.display(),
+        state_root = %state_root.display(),
+        "resolved cluster paths"
+    );
 
     runner.run("limactl", &["--version".into()])?;
 
@@ -87,6 +114,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let mut started_instances = Vec::new();
     let cluster_started = Instant::now();
 
+    info!(
+        node = %control_plane.name,
+        cpus = 4,
+        memory_gib = 6,
+        "starting control-plane VM"
+    );
     let control_plane_start = start_instance(
         runner,
         &base_config,
@@ -98,12 +131,23 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         },
     );
     if let Err(error) = control_plane_start {
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
     started_instances.push(control_plane.name.clone());
+    info!(node = %control_plane.name, "control-plane VM started");
 
     let k3s_config = k3s_config_from_spec(spec, &workspace_root);
+    info!(
+        node = %control_plane.name,
+        mode = ?spec.server_mode,
+        version = %spec.k3s_version,
+        "bootstrapping control-plane"
+    );
     if let Err(error) = bootstrap_server(
         runner,
         &k3s_config,
@@ -111,27 +155,43 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         &helper_script,
         &control_plane,
     ) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
 
+    info!(node = %control_plane.name, "waiting for control-plane kubeconfig and join token");
     if let Err(error) = wait_for_path(
         &control_plane.artifacts.kubeconfig,
         Duration::from_secs(180),
     ) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
     if let Err(error) = wait_for_path(&control_plane.artifacts.token, Duration::from_secs(180)) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
+    info!(
+        kubeconfig = %control_plane.artifacts.kubeconfig.display(),
+        token_path = %control_plane.artifacts.token.display(),
+        "control-plane artifacts ready"
+    );
 
     let initial_ready =
         initial_readiness_command(spec.server_mode, &control_plane.artifacts.kubeconfig);
+    info!(node = %control_plane.name, "waiting for control-plane API in guest");
     if let Err(error) = wait_for_stable_guest_success(
         runner,
         &control_plane.name,
@@ -140,9 +200,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         1,
         Duration::from_secs(2),
     ) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
 
     let stable_ready_check = format!(
@@ -164,18 +227,30 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         3,
         Duration::from_secs(5),
     ) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
 
     let api_check = format!("https://127.0.0.1:{}/readyz", spec.api_port);
+    info!(url = %api_check, "waiting for control-plane API on the host");
     if let Err(error) = wait_for_host_http(runner, &api_check, Duration::from_secs(90)) {
-        cleanup_instances(runner, &started_instances);
-        let _ = fs::remove_dir_all(&state_root);
-        return Err(error);
+        return Err(rollback_failed_up(
+            runner,
+            &started_instances,
+            &state_root,
+            error,
+        ));
     }
     let control_plane_ready = format_duration(cluster_started.elapsed());
+    info!(
+        elapsed = %control_plane_ready,
+        node = %control_plane.name,
+        "control-plane is ready"
+    );
 
     let server_token = fs::read_to_string(&control_plane.artifacts.token)
         .map_err(io_error("read_to_string"))?
@@ -190,6 +265,9 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         })
         .collect();
 
+    if !worker_instances.is_empty() {
+        info!(workers = worker_instances.len(), "starting worker VMs");
+    }
     let mut start_results = Vec::new();
     let started_workers = start_worker_instances(
         runner,
@@ -203,6 +281,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     for started_worker in started_workers {
         let worker = started_worker.node;
+        info!(node = %worker.name, "bootstrapping worker");
         if let Err(error) = bootstrap_worker(
             runner,
             &k3s_config,
@@ -212,20 +291,32 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
             &server_url,
             &server_token,
         ) {
-            cleanup_instances(runner, &started_instances);
-            let _ = fs::remove_dir_all(&state_root);
-            return Err(error);
+            return Err(rollback_failed_up(
+                runner,
+                &started_instances,
+                &state_root,
+                error,
+            ));
         }
+        info!(node = %worker.name, "waiting for worker process");
         if let Err(error) = wait_for_worker_process(runner, &worker.name) {
-            cleanup_instances(runner, &started_instances);
-            let _ = fs::remove_dir_all(&state_root);
-            return Err(error);
+            return Err(rollback_failed_up(
+                runner,
+                &started_instances,
+                &state_root,
+                error,
+            ));
         }
+        info!(node = %worker.name, "waiting for worker readiness");
         if let Err(error) = wait_for_node_ready(runner, &control_plane, &worker.name) {
-            cleanup_instances(runner, &started_instances);
-            let _ = fs::remove_dir_all(&state_root);
-            return Err(error);
+            return Err(rollback_failed_up(
+                runner,
+                &started_instances,
+                &state_root,
+                error,
+            ));
         }
+        info!(node = %worker.name, "worker is ready");
     }
 
     let state = ClusterState {
@@ -252,12 +343,24 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         }))
         .collect(),
     };
+    info!(
+        state_file = %ClusterState::state_file(&state_root).display(),
+        "persisting cluster state"
+    );
     state.save(&state_root)?;
+    let cluster_ready = format_duration(cluster_started.elapsed());
+    info!(
+        cluster = %state.name,
+        kubeconfig = %state.kubeconfig_path.display(),
+        control_plane_ready = %control_plane_ready,
+        cluster_ready = %cluster_ready,
+        "cluster is ready"
+    );
 
     Ok(UpOutcome {
         state,
         control_plane_ready,
-        cluster_ready: format_duration(cluster_started.elapsed()),
+        cluster_ready,
     })
 }
 
@@ -271,11 +374,14 @@ pub fn down_with_runner(
     name: &str,
     runner: &dyn CommandRunner,
 ) -> Result<()> {
-    let state_root = workspace_root.join(".kalisto").join("clusters").join(name);
+    info!(cluster = %name, "starting cluster teardown");
+    let workspace_root = canonicalize_path(workspace_root)?;
+    let state_root = ClusterSpec::state_root_for(&workspace_root, name);
     let state = ClusterState::load(&state_root)?;
     let instance_names: Vec<String> = state.nodes.iter().map(|node| node.name.clone()).collect();
     cleanup_instances(runner, &instance_names);
     fs::remove_dir_all(&state_root).map_err(io_error("remove_dir_all"))?;
+    info!(cluster = %name, state_root = %state_root.display(), "cluster removed");
     Ok(())
 }
 
@@ -289,7 +395,8 @@ pub fn status_with_runner(
     name: &str,
     runner: &dyn CommandRunner,
 ) -> Result<ClusterStatus> {
-    let state_root = workspace_root.join(".kalisto").join("clusters").join(name);
+    let workspace_root = canonicalize_path(workspace_root)?;
+    let state_root = ClusterSpec::state_root_for(&workspace_root, name);
     let state = ClusterState::load(&state_root)?;
     let mut nodes = Vec::with_capacity(state.nodes.len());
     for node in &state.nodes {
@@ -300,6 +407,7 @@ pub fn status_with_runner(
             lima_status,
         });
     }
+    info!(cluster = %name, nodes = nodes.len(), "loaded cluster status");
     Ok(ClusterStatus {
         name: state.name,
         state_root,
@@ -309,8 +417,65 @@ pub fn status_with_runner(
 }
 
 pub fn kubeconfig_path(workspace_root: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
-    let state_root = workspace_root.join(".kalisto").join("clusters").join(name);
-    Ok(ClusterState::load(&state_root)?.kubeconfig_path)
+    let workspace_root = canonicalize_path(workspace_root)?;
+    let state_root = ClusterSpec::state_root_for(&workspace_root, name);
+    let kubeconfig_path = ClusterState::load(&state_root)?.kubeconfig_path;
+    info!(
+        cluster = %name,
+        kubeconfig = %kubeconfig_path.display(),
+        "resolved kubeconfig path"
+    );
+    Ok(kubeconfig_path)
+}
+
+pub fn benchmark(spec: &ClusterSpec, runs: usize) -> Result<Vec<BenchmarkSample>> {
+    let runner = SystemRunner;
+    benchmark_with_runner(spec, runs, &runner)
+}
+
+pub fn benchmark_with_runner(
+    spec: &ClusterSpec,
+    runs: usize,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<BenchmarkSample>> {
+    if runs == 0 {
+        return Err(Error::InvalidArgs(
+            "benchmark runs must be greater than zero".to_owned(),
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(runs);
+    for run in 0..runs {
+        let run_name = format!("{}-bench-{}", spec.name, run + 1);
+        let mut run_spec = spec.clone();
+        run_spec.name = run_name.clone();
+        info!(
+            benchmark_run = run + 1,
+            benchmark_total = runs,
+            cluster = %run_name,
+            "starting benchmark run"
+        );
+
+        let outcome = up_with_runner(&run_spec, runner)?;
+        samples.push(BenchmarkSample {
+            run: run + 1,
+            cluster_name: run_name.clone(),
+            control_plane_ready: outcome.control_plane_ready,
+            cluster_ready: outcome.cluster_ready,
+        });
+        down_with_runner(&spec.workspace_root, &run_name, runner)?;
+        if let Some(sample) = samples.last() {
+            info!(
+                benchmark_run = sample.run,
+                cluster = %sample.cluster_name,
+                control_plane_ready = %sample.control_plane_ready,
+                cluster_ready = %sample.cluster_ready,
+                "completed benchmark run"
+            );
+        }
+    }
+
+    Ok(samples)
 }
 
 fn k3s_config_from_spec(
@@ -333,8 +498,31 @@ fn k3s_config_from_spec(
 
 fn cleanup_instances(runner: &dyn CommandRunner, instance_names: &[String]) {
     for instance_name in instance_names.iter().rev() {
+        info!(instance = %instance_name, "cleaning up lima instance");
         let _ = stop_and_delete_instance(runner, instance_name);
     }
+}
+
+fn rollback_failed_up(
+    runner: &dyn CommandRunner,
+    started_instances: &[String],
+    state_root: &Path,
+    error: Error,
+) -> Error {
+    warn!(
+        state_root = %state_root.display(),
+        error = %error,
+        "cluster bring-up failed; cleaning up partial state"
+    );
+    cleanup_instances(runner, started_instances);
+    if let Err(cleanup_error) = fs::remove_dir_all(state_root) {
+        warn!(
+            state_root = %state_root.display(),
+            error = %cleanup_error,
+            "failed to remove partial cluster state"
+        );
+    }
+    error
 }
 
 fn io_error(program: &'static str) -> impl FnOnce(std::io::Error) -> Error {

@@ -24,11 +24,13 @@ The current supported runtime is:
 - Lima-only macOS scope
 - extracted Lima `k3s` runtime modules under `src/lima_k3s/`
 - `structopt`-based CLI parsing
+- `tracing` + `tracing_subscriber` lifecycle logging with default `info` stage output
 - first-pass product commands:
   - `kalisto up`
   - `kalisto down`
   - `kalisto status`
   - `kalisto kubeconfig`
+  - `kalisto bench`
 - persisted cluster state under `.kalisto/clusters/<name>/`
 - live Lima substrate probe
 - live Lima `k3s` control-plane and worker-join probe
@@ -58,6 +60,7 @@ The current supported runtime is:
 - separate backend lifecycle from bootstrap orchestration
 - move the current `up` path off probe-oriented helpers where it still reuses them indirectly
   - worker startup and shared runtime helpers now use the real Lima backend module
+- make lifecycle progress visible during `up/down/bench` so the CLI is not silent while Lima boots
 
 ## Next
 
@@ -65,7 +68,7 @@ The current supported runtime is:
 
 2. Add mount/workspace fields to the cluster spec and state model
 
-3. Add benchmark command surface for repeated timing runs
+3. Record repeated real `kalisto bench` samples against the finalized image path
 
 4. Reduce duplication between probe-oriented Lima helpers and product backend helpers
 

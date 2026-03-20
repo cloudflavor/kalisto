@@ -6,3 +6,4 @@ pub mod k3s;
 pub mod lima_k3s;
 pub mod probe;
 pub mod process;
+pub mod telemetry;

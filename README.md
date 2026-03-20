@@ -17,6 +17,15 @@ cargo run -- up --workspace-root .
 cargo run -- status --workspace-root .
 cargo run -- kubeconfig --workspace-root .
 cargo run -- down --workspace-root .
+cargo run -- bench --workspace-root . --runs 3
+```
+
+Lifecycle progress logs are enabled by default at `info` level, so `up`, `down`, and `bench`
+show stage transitions as they happen. Use `RUST_LOG` to raise or lower verbosity:
+
+```bash
+RUST_LOG=debug cargo run -- up --workspace-root . --workers 1
+RUST_LOG=warn cargo run -- bench --workspace-root . --workers 1 --runs 3
 ```
 
 Optional `up` knobs:
@@ -33,6 +42,15 @@ Cluster state is stored under:
 
 ```text
 .kalisto/clusters/<name>/
+```
+
+The benchmark command runs the real lifecycle path repeatedly and prints per-run timings:
+
+```bash
+cargo run -- bench \
+  --workspace-root . \
+  --workers 1 \
+  --runs 3
 ```
 
 ## Lima image pipeline

@@ -2,6 +2,7 @@
 /.cargo/
 /artifacts/
 /target/
+/.kalisto/
 /notes/*
 !/notes/implementation-tracker.md
 

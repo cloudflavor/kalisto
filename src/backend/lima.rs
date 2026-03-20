@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tracing::debug;
+
 use crate::error::{Error, Result};
 use crate::process::{CommandRunner, Output};
 
@@ -31,6 +33,17 @@ pub fn start_instance(
     config: &Config,
     instance: &InstanceConfig,
 ) -> Result<Output> {
+    debug!(
+        instance = %instance.name,
+        template = %config.template,
+        workspace_root = %config.workspace_root.display(),
+        cpus = instance.cpus,
+        memory_gib = instance.memory_gib,
+        host_port_forward = ?instance.host_port_forward,
+        rosetta = config.enable_rosetta,
+        network = %config.network,
+        "starting lima instance"
+    );
     let mut args = vec![
         "start".into(),
         "--tty=false".into(),
@@ -59,6 +72,7 @@ pub fn guest_shell(
     instance_name: &str,
     command: &str,
 ) -> Result<Output> {
+    debug!(instance = %instance_name, command, "running guest shell command");
     runner.run(
         "limactl",
         &[
@@ -77,6 +91,7 @@ pub fn guest_sudo_shell(
     instance_name: &str,
     command: &str,
 ) -> Result<Output> {
+    debug!(instance = %instance_name, command, "running guest sudo shell command");
     runner.run(
         "limactl",
         &[
@@ -92,6 +107,7 @@ pub fn guest_sudo_shell(
 }
 
 pub fn stop_and_delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
+    debug!(instance = %instance_name, "stopping lima instance");
     let _ = runner.run(
         "limactl",
         &[
@@ -101,6 +117,7 @@ pub fn stop_and_delete_instance(runner: &dyn CommandRunner, instance_name: &str)
             instance_name.to_owned(),
         ],
     );
+    debug!(instance = %instance_name, "deleting lima instance");
     runner.run(
         "limactl",
         &[
@@ -114,6 +131,7 @@ pub fn stop_and_delete_instance(runner: &dyn CommandRunner, instance_name: &str)
 }
 
 pub fn query_instance_status(runner: &dyn CommandRunner, instance_name: &str) -> Result<String> {
+    debug!(instance = %instance_name, "querying lima instance status");
     let output = runner.run(
         "limactl",
         &[

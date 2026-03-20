@@ -2,12 +2,13 @@ use std::process::ExitCode;
 
 use structopt::StructOpt;
 
-use kalisto::cli::{Cli, ClusterLookupArgs, Command, MacosLimaArgs, MacosLimaK3sArgs, UpArgs};
-use kalisto::cluster::manager::{
-    down as cluster_down, kubeconfig_path as cluster_kubeconfig_path, status as cluster_status,
-    up as cluster_up,
+use kalisto::cli::{
+    BenchArgs, Cli, ClusterLookupArgs, Command, MacosLimaArgs, MacosLimaK3sArgs, UpArgs,
 };
-use kalisto::cluster::spec::ClusterSpec;
+use kalisto::cluster::manager::{
+    benchmark as cluster_benchmark, down as cluster_down,
+    kubeconfig_path as cluster_kubeconfig_path, status as cluster_status, up as cluster_up,
+};
 use kalisto::error::{Error, Result};
 use kalisto::k3s::ServerMode as K3sServerMode;
 use kalisto::probe::macos_lima::{
@@ -16,6 +17,7 @@ use kalisto::probe::macos_lima::{
 use kalisto::probe::macos_lima_k3s::{
     ProbeConfig as MacosLimaK3sProbeConfig, run as run_macos_lima_k3s_probe,
 };
+use kalisto::telemetry;
 
 fn main() -> ExitCode {
     match real_main() {
@@ -28,44 +30,20 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<()> {
+    telemetry::init()?;
     match Cli::from_args().command {
         Command::Up(args) => run_up(args),
         Command::Down(args) => run_down(args),
         Command::Status(args) => run_status(args),
         Command::Kubeconfig(args) => run_kubeconfig(args),
+        Command::Bench(args) => run_bench(args),
         Command::ProbeMacosLima(args) => run_lima_probe(args),
         Command::ProbeMacosLimaK3s(args) => run_lima_k3s_probe(args),
     }
 }
 
 fn run_up(args: UpArgs) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| ClusterSpec::default_name(&args.workspace_root));
-    let mut spec = ClusterSpec::new(name, args.workspace_root);
-    if let Some(template) = args.template {
-        spec.template = template;
-    }
-    if let Some(workers) = args.workers {
-        spec.worker_count = workers;
-        if workers > 0 && spec.network == "vzNAT" {
-            spec.network = "lima:user-v2".to_owned();
-        }
-    }
-    if let Some(network) = args.network {
-        spec.network = network;
-    }
-    if let Some(api_port) = args.api_port {
-        spec.api_port = api_port;
-    }
-    if let Some(k3s_version) = args.k3s_version {
-        spec.k3s_version = k3s_version;
-    }
-    if args.agentless {
-        spec.server_mode = K3sServerMode::Agentless;
-    }
-    spec.enable_rosetta = !args.no_rosetta;
-
+    let spec = args.into_cluster_spec();
     let outcome = cluster_up(&spec)?;
     println!("cluster: {}", outcome.state.name);
     println!("kubeconfig: {}", outcome.state.kubeconfig_path.display());
@@ -75,18 +53,14 @@ fn run_up(args: UpArgs) -> Result<()> {
 }
 
 fn run_down(args: ClusterLookupArgs) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| ClusterSpec::default_name(&args.workspace_root));
+    let name = args.cluster_name();
     cluster_down(&args.workspace_root, &name)?;
     println!("removed cluster `{name}`");
     Ok(())
 }
 
 fn run_status(args: ClusterLookupArgs) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| ClusterSpec::default_name(&args.workspace_root));
+    let name = args.cluster_name();
     let status = cluster_status(&args.workspace_root, &name)?;
     println!("cluster: {}", status.name);
     println!("state root: {}", status.state_root.display());
@@ -98,13 +72,23 @@ fn run_status(args: ClusterLookupArgs) -> Result<()> {
 }
 
 fn run_kubeconfig(args: ClusterLookupArgs) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| ClusterSpec::default_name(&args.workspace_root));
+    let name = args.cluster_name();
     println!(
         "{}",
         cluster_kubeconfig_path(&args.workspace_root, &name)?.display()
     );
+    Ok(())
+}
+
+fn run_bench(args: BenchArgs) -> Result<()> {
+    let (spec, runs) = args.into_cluster_spec();
+    let samples = cluster_benchmark(&spec, runs)?;
+    for sample in samples {
+        println!(
+            "run {}: cluster={} control-plane-ready={} cluster-ready={}",
+            sample.run, sample.cluster_name, sample.control_plane_ready, sample.cluster_ready
+        );
+    }
     Ok(())
 }
 

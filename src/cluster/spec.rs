@@ -42,21 +42,26 @@ impl ClusterSpec {
     }
 
     pub fn state_root(&self) -> PathBuf {
-        self.workspace_root
-            .join(".kalisto")
-            .join("clusters")
-            .join(&self.name)
+        Self::state_root_for(&self.workspace_root, &self.name)
     }
 
     pub fn helper_script(&self) -> PathBuf {
-        self.workspace_root
-            .join("scripts")
-            .join("macos")
-            .join("k3s_server_probe.sh")
+        Self::helper_script_for(&self.workspace_root)
     }
 
     pub fn control_plane_name(&self) -> String {
         format!("kalisto-{}-cp", self.name)
+    }
+
+    pub fn state_root_for(workspace_root: &Path, name: &str) -> PathBuf {
+        workspace_root.join(".kalisto").join("clusters").join(name)
+    }
+
+    pub fn helper_script_for(workspace_root: &Path) -> PathBuf {
+        workspace_root
+            .join("scripts")
+            .join("macos")
+            .join("k3s_server_probe.sh")
     }
 }
 
