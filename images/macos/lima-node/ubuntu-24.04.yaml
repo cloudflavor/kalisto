@@ -1,7 +1,4 @@
 vmType: "vz"
-rosetta:
-  enabled: true
-  binfmt: true
 mountType: "virtiofs"
 mounts: []
 containerd:
