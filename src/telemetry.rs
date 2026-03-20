@@ -16,6 +16,10 @@ pub fn init() -> Result<()> {
     Ok(())
 }
 
+pub fn raw_streams_enabled() -> bool {
+    tracing::enabled!(tracing::Level::DEBUG)
+}
+
 fn env_filter_from_env() -> Result<EnvFilter> {
     match std::env::var("RUST_LOG") {
         Ok(value) => env_filter_from_directive(&value).or_else(|_| default_env_filter()),
