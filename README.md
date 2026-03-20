@@ -13,43 +13,45 @@ Current scope:
 The first product-facing commands are available now:
 
 ```bash
-cargo run -- up --workspace-root .
-cargo run -- status --workspace-root .
-cargo run -- kubeconfig --workspace-root .
-cargo run -- down --workspace-root .
-cargo run -- bench --workspace-root . --runs 3
+cargo run -- up
+cargo run -- ls
+cargo run -- down --name kalisto
+cargo run -- remove --name kalisto
+cargo run -- status --name kalisto
+cargo run -- kubeconfig --name kalisto
+cargo run -- bench --runs 3
 ```
 
 Lifecycle progress logs are enabled by default at `info` level, so `up`, `down`, and `bench`
-show stage transitions as they happen. Use `RUST_LOG` to raise or lower verbosity:
+show stage transitions as they happen. Raw streamed Lima startup output and live `k3s`
+bootstrap logs are only shown at `debug`. Use `RUST_LOG` to raise or lower verbosity:
 
 ```bash
-RUST_LOG=debug cargo run -- up --workspace-root . --workers 1
-RUST_LOG=warn cargo run -- bench --workspace-root . --workers 1 --runs 3
+RUST_LOG=debug cargo run -- up
+RUST_LOG=warn cargo run -- bench --runs 3
 ```
 
 Optional `up` knobs:
 
 ```bash
 cargo run -- up \
-  --workspace-root . \
-  --workers 1 \
+  --project-root . \
+  --workers 0 \
   --api-port 16443 \
   --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
 ```
 
-Cluster state is stored under:
+Kalisto stores its own files under XDG-style roots:
 
 ```text
-.kalisto/clusters/<name>/
+config: ~/.config/kalisto
+state:  ~/.local/share/kalisto/clusters/<name>/
 ```
 
 The benchmark command runs the real lifecycle path repeatedly and prints per-run timings:
 
 ```bash
 cargo run -- bench \
-  --workspace-root . \
-  --workers 1 \
   --runs 3
 ```
 

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::k3s::{ComponentToggles, ServerMode};
+use crate::paths::{config_root, data_root};
 
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
@@ -21,9 +22,9 @@ impl ClusterSpec {
         Self {
             template: default_template(&workspace_root),
             api_port: 16443,
-            worker_count: 0,
+            worker_count: 1,
             enable_rosetta: true,
-            network: "vzNAT".to_owned(),
+            network: "lima:user-v2".to_owned(),
             k3s_version: "v1.33.5+k3s1".to_owned(),
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
@@ -42,19 +43,31 @@ impl ClusterSpec {
     }
 
     pub fn state_root(&self) -> PathBuf {
-        Self::state_root_for(&self.workspace_root, &self.name)
+        Self::state_root_for(&self.name).expect("data root should be resolvable")
+    }
+
+    pub fn clusters_root(&self) -> PathBuf {
+        Self::clusters_root_for().expect("data root should be resolvable")
     }
 
     pub fn helper_script(&self) -> PathBuf {
         Self::helper_script_for(&self.workspace_root)
     }
 
+    pub fn runtime_root(&self) -> PathBuf {
+        Self::runtime_root_for(&self.workspace_root, &self.name)
+    }
+
     pub fn control_plane_name(&self) -> String {
         format!("kalisto-{}-cp", self.name)
     }
 
-    pub fn state_root_for(workspace_root: &Path, name: &str) -> PathBuf {
-        workspace_root.join(".kalisto").join("clusters").join(name)
+    pub fn state_root_for(name: &str) -> crate::error::Result<PathBuf> {
+        Ok(Self::clusters_root_for()?.join(name))
+    }
+
+    pub fn clusters_root_for() -> crate::error::Result<PathBuf> {
+        Ok(data_root()?.join("clusters"))
     }
 
     pub fn helper_script_for(workspace_root: &Path) -> PathBuf {
@@ -63,9 +76,33 @@ impl ClusterSpec {
             .join("macos")
             .join("k3s_server_probe.sh")
     }
+
+    pub fn runtime_root_for(workspace_root: &Path, name: &str) -> PathBuf {
+        workspace_root
+            .join("target")
+            .join("kalisto")
+            .join("clusters")
+            .join(name)
+    }
 }
 
 pub fn default_template(workspace_root: &Path) -> String {
+    if let Ok(config_root) = config_root() {
+        let configured = config_root
+            .join("lima-node")
+            .join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
+        if configured.is_file() {
+            return configured.display().to_string();
+        }
+
+        let configured_seed = config_root
+            .join("lima-node")
+            .join("ubuntu-24.04-minimal-k3s-arm64.yaml");
+        if configured_seed.is_file() {
+            return configured_seed.display().to_string();
+        }
+    }
+
     let finalized = workspace_root
         .join("artifacts")
         .join("lima-node")
@@ -112,5 +149,16 @@ mod tests {
         assert_eq!(default_template(&root), finalized.display().to_string());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_cluster_shape_is_single_worker_multinode() {
+        let spec = ClusterSpec::new(
+            "kalisto".to_owned(),
+            std::path::PathBuf::from("/tmp/kalisto-workspace"),
+        );
+
+        assert_eq!(spec.worker_count, 1);
+        assert_eq!(spec.network, "lima:user-v2");
     }
 }

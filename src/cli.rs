@@ -4,6 +4,7 @@ use structopt::StructOpt;
 
 use crate::cluster::spec::ClusterSpec;
 use crate::k3s::ServerMode;
+use crate::paths::{default_cluster_name, default_project_root};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kalisto")]
@@ -17,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     Up(UpArgs),
     Down(ClusterLookupArgs),
+    Remove(ClusterLookupArgs),
+    Ls,
     Status(ClusterLookupArgs),
     Kubeconfig(ClusterLookupArgs),
     Bench(BenchArgs),
@@ -27,7 +30,7 @@ pub enum Command {
 #[derive(Debug, StructOpt)]
 pub struct UpArgs {
     #[structopt(long, parse(from_os_str))]
-    pub workspace_root: PathBuf,
+    pub project_root: Option<PathBuf>,
     #[structopt(long)]
     pub name: Option<String>,
     #[structopt(long)]
@@ -47,11 +50,12 @@ pub struct UpArgs {
 }
 
 impl UpArgs {
-    pub fn into_cluster_spec(self) -> ClusterSpec {
+    pub fn into_cluster_spec(self) -> crate::error::Result<ClusterSpec> {
+        let project_root = default_project_root(self.project_root)?;
         let name = self
             .name
-            .unwrap_or_else(|| ClusterSpec::default_name(&self.workspace_root));
-        let mut spec = ClusterSpec::new(name, self.workspace_root);
+            .unwrap_or(default_cluster_name(Some(&project_root))?);
+        let mut spec = ClusterSpec::new(name, project_root);
         if let Some(template) = self.template {
             spec.template = template;
         }
@@ -72,32 +76,32 @@ impl UpArgs {
         }
         if self.agentless {
             spec.server_mode = ServerMode::Agentless;
+            spec.worker_count = 0;
         }
         spec.enable_rosetta = !self.no_rosetta;
-        spec
+        Ok(spec)
     }
 }
 
 #[derive(Debug, StructOpt)]
 pub struct ClusterLookupArgs {
-    #[structopt(long, parse(from_os_str))]
-    pub workspace_root: PathBuf,
     #[structopt(long)]
     pub name: Option<String>,
 }
 
 impl ClusterLookupArgs {
-    pub fn cluster_name(&self) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| ClusterSpec::default_name(&self.workspace_root))
+    pub fn cluster_name(&self) -> crate::error::Result<String> {
+        match &self.name {
+            Some(name) => Ok(name.clone()),
+            None => default_cluster_name(None),
+        }
     }
 }
 
 #[derive(Debug, StructOpt)]
 pub struct BenchArgs {
     #[structopt(long, parse(from_os_str))]
-    pub workspace_root: PathBuf,
+    pub project_root: Option<PathBuf>,
     #[structopt(long)]
     pub name: Option<String>,
     #[structopt(long)]
@@ -119,10 +123,10 @@ pub struct BenchArgs {
 }
 
 impl BenchArgs {
-    pub fn into_cluster_spec(self) -> (ClusterSpec, usize) {
+    pub fn into_cluster_spec(self) -> crate::error::Result<(ClusterSpec, usize)> {
         let runs = self.runs;
         let up = UpArgs {
-            workspace_root: self.workspace_root,
+            project_root: self.project_root,
             name: self.name,
             template: self.template,
             workers: self.workers,
@@ -132,7 +136,7 @@ impl BenchArgs {
             agentless: self.agentless,
             no_rosetta: self.no_rosetta,
         };
-        (up.into_cluster_spec(), runs)
+        Ok((up.into_cluster_spec()?, runs))
     }
 }
 
