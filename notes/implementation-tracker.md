@@ -28,10 +28,13 @@ The current supported runtime is:
 - first-pass product commands:
   - `kalisto up`
   - `kalisto down`
+  - `kalisto ls`
+  - `kalisto remove`
   - `kalisto status`
   - `kalisto kubeconfig`
   - `kalisto bench`
-- persisted cluster state under `.kalisto/clusters/<name>/`
+- global cluster state now lives under `~/.local/share/kalisto/clusters/<name>/`
+- default Kalisto config root reserved under `~/.config/kalisto`
 - live Lima substrate probe
 - live Lima `k3s` control-plane and worker-join probe
 

@@ -64,7 +64,7 @@ pub fn start_instance(
         args.push(format!("--port-forward={host_port}:6443,static=true"));
     }
     args.push(config.template.clone());
-    runner.run("limactl", &args)
+    runner.run_live("limactl", &args)
 }
 
 pub fn guest_shell(

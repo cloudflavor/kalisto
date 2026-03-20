@@ -7,7 +7,8 @@ use kalisto::cli::{
 };
 use kalisto::cluster::manager::{
     benchmark as cluster_benchmark, down as cluster_down,
-    kubeconfig_path as cluster_kubeconfig_path, status as cluster_status, up as cluster_up,
+    kubeconfig_path as cluster_kubeconfig_path, list as cluster_list, status as cluster_status,
+    up as cluster_up,
 };
 use kalisto::error::{Error, Result};
 use kalisto::k3s::ServerMode as K3sServerMode;
@@ -34,6 +35,8 @@ fn real_main() -> Result<()> {
     match Cli::from_args().command {
         Command::Up(args) => run_up(args),
         Command::Down(args) => run_down(args),
+        Command::Remove(args) => run_remove(args),
+        Command::Ls => run_list(),
         Command::Status(args) => run_status(args),
         Command::Kubeconfig(args) => run_kubeconfig(args),
         Command::Bench(args) => run_bench(args),
@@ -43,7 +46,7 @@ fn real_main() -> Result<()> {
 }
 
 fn run_up(args: UpArgs) -> Result<()> {
-    let spec = args.into_cluster_spec();
+    let spec = args.into_cluster_spec()?;
     let outcome = cluster_up(&spec)?;
     println!("cluster: {}", outcome.state.name);
     println!("kubeconfig: {}", outcome.state.kubeconfig_path.display());
@@ -53,15 +56,40 @@ fn run_up(args: UpArgs) -> Result<()> {
 }
 
 fn run_down(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name();
-    cluster_down(&args.workspace_root, &name)?;
+    let name = args.cluster_name()?;
+    cluster_down(&name)?;
+    println!("tore down cluster `{name}`");
+    Ok(())
+}
+
+fn run_remove(args: ClusterLookupArgs) -> Result<()> {
+    let name = args.cluster_name()?;
+    cluster_down(&name)?;
     println!("removed cluster `{name}`");
     Ok(())
 }
 
+fn run_list() -> Result<()> {
+    let clusters = cluster_list()?;
+    if clusters.is_empty() {
+        println!("no clusters");
+        return Ok(());
+    }
+
+    for cluster in clusters {
+        println!("cluster: {}", cluster.name);
+        println!("state root: {}", cluster.state_root.display());
+        println!("kubeconfig: {}", cluster.kubeconfig_path.display());
+        for node in cluster.nodes {
+            println!("{} ({:?}): {}", node.name, node.role, node.lima_status);
+        }
+    }
+    Ok(())
+}
+
 fn run_status(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name();
-    let status = cluster_status(&args.workspace_root, &name)?;
+    let name = args.cluster_name()?;
+    let status = cluster_status(&name)?;
     println!("cluster: {}", status.name);
     println!("state root: {}", status.state_root.display());
     println!("kubeconfig: {}", status.kubeconfig_path.display());
@@ -72,16 +100,13 @@ fn run_status(args: ClusterLookupArgs) -> Result<()> {
 }
 
 fn run_kubeconfig(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name();
-    println!(
-        "{}",
-        cluster_kubeconfig_path(&args.workspace_root, &name)?.display()
-    );
+    let name = args.cluster_name()?;
+    println!("{}", cluster_kubeconfig_path(&name)?.display());
     Ok(())
 }
 
 fn run_bench(args: BenchArgs) -> Result<()> {
-    let (spec, runs) = args.into_cluster_spec();
+    let (spec, runs) = args.into_cluster_spec()?;
     let samples = cluster_benchmark(&spec, runs)?;
     for sample in samples {
         println!(
