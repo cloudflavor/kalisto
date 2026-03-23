@@ -1,0 +1,1351 @@
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use tracing::debug;
+
+use crate::backend::runtime::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig};
+use crate::error::{Error, Result};
+use crate::process::{CommandRunner, Output};
+use crate::telemetry::raw_streams_enabled;
+
+const BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 ds=nocloud;s=file:///var/lib/cloud/seed/nocloud/";
+const GUEST_ARTIFACT_PARENT: &str = "/var/lib/kalisto";
+const GUEST_NOCLOUD_SEED_DIR: &str = "/var/lib/cloud/seed/nocloud";
+const SSH_USER: &str = "ubuntu";
+const BRIDGE_NAME: &str = "kalistofc0";
+const BRIDGE_HOST_IP: &str = "172.31.0.1";
+const BRIDGE_CIDR_BITS: u8 = 16;
+
+#[derive(Debug, Clone, Copy)]
+pub struct FirecrackerBackend;
+
+pub const BACKEND: FirecrackerBackend = FirecrackerBackend;
+
+impl ClusterBackend for FirecrackerBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Firecracker
+    }
+
+    fn check_available(&self, runner: &dyn CommandRunner) -> Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Err(Error::InvalidArgs(
+                "firecracker backend requires a Linux host".to_owned(),
+            ));
+        }
+
+        ensure_path_exists(Path::new("/dev/kvm"), "/dev/kvm")?;
+        runner.run("firecracker", &["--version".into()])?;
+        runner.run("debugfs", &["-V".into()])?;
+        runner.run("ip", &["-V".into()])?;
+        runner.run("iptables", &["--version".into()])?;
+        runner.run("sysctl", &["--version".into()])?;
+        let _ = runner.run("ssh", &["-V".into()]);
+        let _ = runner.run("ssh-keygen", &["-V".into()]);
+        Ok(())
+    }
+
+    fn start_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        config: &BackendConfig,
+        instance: &InstanceConfig,
+    ) -> Result<Output> {
+        let kernel = config
+            .firecracker_kernel
+            .as_deref()
+            .ok_or_else(|| Error::InvalidArgs(missing_artifact_message("kernel")))?;
+        let rootfs = config
+            .firecracker_rootfs
+            .as_deref()
+            .ok_or_else(|| Error::InvalidArgs(missing_artifact_message("rootfs")))?;
+
+        ensure_path_exists(kernel, "firecracker kernel")?;
+        ensure_path_exists(rootfs, "firecracker rootfs")?;
+        fs::create_dir_all(&instance.runtime_root).map_err(io_error("create_dir_all"))?;
+
+        let runtime = RuntimeFiles::new(&instance.runtime_root);
+        let net = NetworkConfig::for_instance(&instance.name);
+        ensure_ssh_key(runner, &runtime.ssh_key)?;
+        write_cloud_init_files(&runtime, &instance.name, &net)?;
+        prepare_instance_rootfs(runner, rootfs, &runtime)?;
+        ensure_prepared_network(&net)?;
+        write_file(
+            &runtime.config,
+            &build_config_json(kernel, instance, &runtime, &net),
+        )?;
+
+        let stdout_file = fs::File::create(&runtime.stdout_log).map_err(io_error("create"))?;
+        let stderr_file = fs::File::create(&runtime.stderr_log).map_err(io_error("create"))?;
+
+        debug!(
+            instance = %instance.name,
+            runtime_root = %instance.runtime_root.display(),
+            kernel = %kernel.display(),
+            rootfs = %runtime.instance_rootfs.display(),
+            tap = %net.tap_name,
+            guest_ip = %net.guest_ip,
+            config = %runtime.config.display(),
+            stdout_log = %runtime.stdout_log.display(),
+            stderr_log = %runtime.stderr_log.display(),
+            meta_data = %runtime.meta_data.display(),
+            user_data = %runtime.user_data.display(),
+            network_config = %runtime.network_config.display(),
+            nocloud_seed_dir = GUEST_NOCLOUD_SEED_DIR,
+            "starting firecracker microvm"
+        );
+
+        let mut child = Command::new("firecracker");
+        child
+            .arg("--id")
+            .arg(&instance.name)
+            .arg("--no-api")
+            .arg("--config-file")
+            .arg(&runtime.config)
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+
+        let mut child = child.spawn().map_err(|source| Error::CommandIo {
+            program: "firecracker".to_owned(),
+            source,
+        })?;
+
+        write_file(&runtime.pid, &format!("{}\n", child.id()))?;
+        write_file(&runtime.guest_ip, &format!("{}\n", net.guest_ip))?;
+        write_file(&runtime.host_ip, &format!("{}\n", net.host_ip))?;
+        write_file(&runtime.tap_name, &format!("{}\n", net.tap_name))?;
+
+        let log_streamer = VmLogStreamer::start_if_enabled(&runtime, config.stream_vm_logs);
+        let wait_result = wait_for_ssh(runner, &runtime, &net, &mut child);
+        if let Some(log_streamer) = log_streamer {
+            log_streamer.stop();
+        }
+        if let Err(error) = wait_result {
+            let _ = stop_process(runner, &runtime, &net, true);
+            return Err(error);
+        }
+
+        Ok(Output {
+            stdout: format!(
+                "firecracker started: pid={} guest_ip={} config={}",
+                child.id(),
+                net.guest_ip,
+                runtime.config.display()
+            ),
+            stderr: String::new(),
+        })
+    }
+
+    fn stop_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+        force: bool,
+    ) -> Result<()> {
+        let runtime = RuntimeFiles::new(runtime_root);
+        let net = load_network_config(&runtime, instance_name)?;
+        stop_process(runner, &runtime, &net, force)
+    }
+
+    fn delete_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+    ) -> Result<()> {
+        self.stop_instance(runner, instance_name, runtime_root, true)
+    }
+
+    fn query_instance_status(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+    ) -> Result<String> {
+        let runtime = RuntimeFiles::new(runtime_root);
+        let pid = read_pid(&runtime.pid)?;
+        let net = load_network_config(&runtime, instance_name)?;
+
+        let Some(pid) = pid else {
+            return Ok(format!("{instance_name} Stopped firecracker"));
+        };
+
+        if process_exists(runner, pid) {
+            return Ok(format!(
+                "{instance_name} Running firecracker pid={pid} guest_ip={}",
+                net.guest_ip
+            ));
+        }
+
+        if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_ok() {
+            Ok(format!(
+                "{instance_name} Running firecracker guest_ip={}",
+                net.guest_ip
+            ))
+        } else {
+            Ok(format!("{instance_name} Exited firecracker pid={pid}"))
+        }
+    }
+
+    fn guest_artifact_root(&self, instance_name: &str, _runtime_root: &Path) -> Result<PathBuf> {
+        Ok(Path::new(GUEST_ARTIFACT_PARENT).join(instance_name))
+    }
+
+    fn guest_shell(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+        command: &str,
+    ) -> Result<Output> {
+        run_ssh(runner, runtime_root, instance_name, command)
+    }
+
+    fn guest_sudo_shell(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+        command: &str,
+    ) -> Result<Output> {
+        run_ssh(
+            runner,
+            runtime_root,
+            instance_name,
+            &format!("sudo sh -lc {}", shell_quote(command)),
+        )
+    }
+
+    fn control_plane_host(&self, instance_name: &str, runtime_root: &Path) -> Result<String> {
+        Ok(load_network_config(&RuntimeFiles::new(runtime_root), instance_name)?.guest_ip)
+    }
+
+    fn host_api_endpoint(
+        &self,
+        instance_name: &str,
+        runtime_root: &Path,
+        _requested_port: u16,
+    ) -> Result<String> {
+        Ok(format!(
+            "{}:6443",
+            load_network_config(&RuntimeFiles::new(runtime_root), instance_name)?.guest_ip
+        ))
+    }
+
+    fn prepare_cluster_network(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_names: &[String],
+    ) -> Result<()> {
+        let bridge_net = instance_names
+            .first()
+            .map(|name| NetworkConfig::for_instance(name))
+            .unwrap_or_else(|| NetworkConfig::for_instance("kalisto"));
+        setup_bridge(runner, &bridge_net)?;
+        for instance_name in instance_names {
+            setup_tap(runner, &NetworkConfig::for_instance(instance_name))?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_cluster_network(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_names: &[String],
+    ) -> Result<()> {
+        for instance_name in instance_names {
+            let net = NetworkConfig::for_instance(instance_name);
+            let _ = runner.run("ip", &["link".into(), "del".into(), net.tap_name]);
+        }
+
+        let bridge_net = instance_names
+            .first()
+            .map(|name| NetworkConfig::for_instance(name))
+            .unwrap_or_else(|| NetworkConfig::for_instance("kalisto"));
+        if runner
+            .run(
+                "ip",
+                &[
+                    "link".into(),
+                    "show".into(),
+                    "dev".into(),
+                    bridge_net.bridge_name.clone(),
+                ],
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        if let Ok(output) = runner.run(
+            "ip",
+            &[
+                "-o".into(),
+                "link".into(),
+                "show".into(),
+                "master".into(),
+                bridge_net.bridge_name.clone(),
+            ],
+        ) && output.stdout.trim().is_empty()
+        {
+            let _ = teardown_host_egress(runner, &bridge_net);
+            let _ = runner.run(
+                "ip",
+                &[
+                    "link".into(),
+                    "set".into(),
+                    "dev".into(),
+                    bridge_net.bridge_name.clone(),
+                    "down".into(),
+                ],
+            );
+            let _ = runner.run(
+                "ip",
+                &[
+                    "link".into(),
+                    "del".into(),
+                    "dev".into(),
+                    bridge_net.bridge_name,
+                    "type".into(),
+                    "bridge".into(),
+                ],
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeFiles {
+    config: PathBuf,
+    pid: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    user_data: PathBuf,
+    meta_data: PathBuf,
+    network_config: PathBuf,
+    instance_rootfs: PathBuf,
+    ssh_key: PathBuf,
+    guest_ip: PathBuf,
+    host_ip: PathBuf,
+    tap_name: PathBuf,
+}
+
+#[derive(Debug)]
+struct VmLogStreamer {
+    stop: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl VmLogStreamer {
+    fn start_if_enabled(runtime: &RuntimeFiles, stream_vm_logs: bool) -> Option<Self> {
+        if !(stream_vm_logs && raw_streams_enabled()) {
+            return None;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let handles = vec![
+            spawn_log_stream_thread(
+                runtime.stdout_log.clone(),
+                format!("{}:serial", runtime.stdout_log.display()),
+                false,
+                Arc::clone(&stop),
+            ),
+            spawn_log_stream_thread(
+                runtime.stderr_log.clone(),
+                format!("{}:firecracker", runtime.stderr_log.display()),
+                true,
+                Arc::clone(&stop),
+            ),
+        ];
+
+        Some(Self { stop, handles })
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamedLogTail {
+    path: PathBuf,
+    label: String,
+    offset: u64,
+    to_stderr: bool,
+}
+
+impl StreamedLogTail {
+    fn new(path: PathBuf, label: String, to_stderr: bool) -> Self {
+        Self {
+            path,
+            label,
+            offset: 0,
+            to_stderr,
+        }
+    }
+
+    fn emit_pending(&mut self) -> Result<()> {
+        if !self.path.is_file() {
+            return Ok(());
+        }
+
+        let mut file = fs::File::open(&self.path).map_err(io_error("open"))?;
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(io_error("seek"))?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(io_error("read_to_end"))?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        self.offset += bytes.len() as u64;
+        let text = String::from_utf8(bytes)?;
+        if self.to_stderr {
+            let mut stderr = std::io::stderr();
+            for line in text.lines() {
+                writeln!(stderr, "[{}] {}", self.label, line).map_err(io_error("write"))?;
+            }
+            stderr.flush().map_err(io_error("flush"))?;
+        } else {
+            let mut stdout = std::io::stdout();
+            for line in text.lines() {
+                writeln!(stdout, "[{}] {}", self.label, line).map_err(io_error("write"))?;
+            }
+            stdout.flush().map_err(io_error("flush"))?;
+        }
+        Ok(())
+    }
+}
+
+fn spawn_log_stream_thread(
+    path: PathBuf,
+    label: String,
+    to_stderr: bool,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tail = StreamedLogTail::new(path, label, to_stderr);
+        while !stop.load(Ordering::Relaxed) {
+            if let Err(error) = tail.emit_pending() {
+                eprintln!("failed to stream VM logs: {error}");
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let _ = tail.emit_pending();
+    })
+}
+
+impl RuntimeFiles {
+    fn new(runtime_root: &Path) -> Self {
+        Self {
+            config: runtime_root.join("firecracker-config.json"),
+            pid: runtime_root.join("firecracker.pid"),
+            stdout_log: runtime_root.join("firecracker.stdout.log"),
+            stderr_log: runtime_root.join("firecracker.stderr.log"),
+            user_data: runtime_root.join("user-data"),
+            meta_data: runtime_root.join("meta-data"),
+            network_config: runtime_root.join("network-config"),
+            instance_rootfs: runtime_root.join("rootfs.raw"),
+            ssh_key: runtime_root.join("id_ed25519"),
+            guest_ip: runtime_root.join("guest-ip"),
+            host_ip: runtime_root.join("host-ip"),
+            tap_name: runtime_root.join("tap-name"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NetworkConfig {
+    bridge_name: String,
+    tap_name: String,
+    host_ip: String,
+    guest_ip: String,
+    guest_mac: String,
+    cidr_bits: u8,
+}
+
+impl NetworkConfig {
+    fn for_instance(name: &str) -> Self {
+        let hash = stable_hash(name);
+        let third = 1 + ((hash >> 8) % 254) as u8;
+        let fourth = 2 + (hash % 253) as u8;
+        let host_ip = BRIDGE_HOST_IP.to_owned();
+        let guest_ip = format!("172.31.{third}.{fourth}");
+        let guest_mac = format!(
+            "06:00:{:02x}:{:02x}:{:02x}:{:02x}",
+            (hash >> 24) as u8,
+            (hash >> 16) as u8,
+            (hash >> 8) as u8,
+            hash as u8
+        );
+        let tap_name = format!("ktap{:08x}", hash);
+        let tap_name = tap_name.chars().take(15).collect();
+
+        Self {
+            bridge_name: BRIDGE_NAME.to_owned(),
+            tap_name,
+            host_ip,
+            guest_ip,
+            guest_mac,
+            cidr_bits: BRIDGE_CIDR_BITS,
+        }
+    }
+}
+
+fn build_config_json(
+    kernel: &Path,
+    instance: &InstanceConfig,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+) -> String {
+    let mem_size_mib = u32::from(instance.memory_gib) * 1024;
+    format!(
+        concat!(
+            "{{\n",
+            "  \"boot-source\": {{\n",
+            "    \"kernel_image_path\": \"{}\",\n",
+            "    \"boot_args\": \"{}\"\n",
+            "  }},\n",
+            "  \"drives\": [\n",
+            "    {{\n",
+            "      \"drive_id\": \"rootfs\",\n",
+            "      \"path_on_host\": \"{}\",\n",
+            "      \"is_root_device\": true,\n",
+            "      \"is_read_only\": false\n",
+            "    }}\n",
+            "  ],\n",
+            "  \"machine-config\": {{\n",
+            "    \"vcpu_count\": {},\n",
+            "    \"mem_size_mib\": {},\n",
+            "    \"smt\": false\n",
+            "  }},\n",
+            "  \"network-interfaces\": [\n",
+            "    {{\n",
+            "      \"iface_id\": \"eth0\",\n",
+            "      \"host_dev_name\": \"{}\",\n",
+            "      \"guest_mac\": \"{}\"\n",
+            "    }}\n",
+            "  ]\n",
+            "}}\n"
+        ),
+        json_escape(kernel.display().to_string().as_str()),
+        json_escape(BOOT_ARGS),
+        json_escape(runtime.instance_rootfs.display().to_string().as_str()),
+        instance.cpus,
+        mem_size_mib,
+        json_escape(&net.tap_name),
+        json_escape(&net.guest_mac),
+    )
+}
+
+fn write_cloud_init_files(
+    runtime: &RuntimeFiles,
+    instance_name: &str,
+    net: &NetworkConfig,
+) -> Result<()> {
+    let pub_key_path = runtime.ssh_key.with_extension("pub");
+    let pub_key = fs::read_to_string(&pub_key_path).map_err(io_error("read_to_string"))?;
+
+    write_file(
+        &runtime.user_data,
+        &format!(
+            concat!(
+                "#cloud-config\n",
+                "users:\n",
+                "  - default\n",
+                "  - name: ubuntu\n",
+                "    sudo: ALL=(ALL) NOPASSWD:ALL\n",
+                "    groups: [sudo]\n",
+                "    shell: /bin/bash\n",
+                "    ssh_authorized_keys:\n",
+                "      - {}\n",
+                "ssh_pwauth: false\n",
+                "disable_root: true\n",
+                "runcmd:\n",
+                "  - mkdir -p {}/{}\n",
+                "  - systemctl enable ssh || systemctl enable sshd || true\n",
+                "  - systemctl start ssh || systemctl start sshd || true\n"
+            ),
+            pub_key.trim(),
+            GUEST_ARTIFACT_PARENT,
+            instance_name,
+        ),
+    )?;
+    write_file(
+        &runtime.meta_data,
+        &format!("instance-id: {instance_name}\nlocal-hostname: {instance_name}\n"),
+    )?;
+    write_file(
+        &runtime.network_config,
+        &format!(
+            concat!(
+                "version: 2\n",
+                "ethernets:\n",
+                "  eth0:\n",
+                "    dhcp4: false\n",
+                "    addresses:\n",
+                "      - {}/{}\n",
+                "    routes:\n",
+                "      - to: 0.0.0.0/0\n",
+                "        via: {}\n",
+                "    nameservers:\n",
+                "      addresses: [1.1.1.1, 8.8.8.8]\n"
+            ),
+            net.guest_ip, net.cidr_bits, net.host_ip
+        ),
+    )?;
+    Ok(())
+}
+
+fn prepare_instance_rootfs(
+    runner: &dyn CommandRunner,
+    base_rootfs: &Path,
+    runtime: &RuntimeFiles,
+) -> Result<()> {
+    let _ = fs::remove_file(&runtime.instance_rootfs);
+    runner.run(
+        "cp",
+        &[
+            "--reflink=auto".into(),
+            "--sparse=always".into(),
+            base_rootfs.display().to_string(),
+            runtime.instance_rootfs.display().to_string(),
+        ],
+    )?;
+    inject_nocloud_seed(runner, &runtime.instance_rootfs, runtime)
+}
+
+fn inject_nocloud_seed(
+    runner: &dyn CommandRunner,
+    rootfs: &Path,
+    runtime: &RuntimeFiles,
+) -> Result<()> {
+    let command_file = runtime.config.with_file_name("debugfs-seed.commands");
+    write_file(
+        &command_file,
+        &format!(
+            concat!(
+                "mkdir /var/lib/cloud\n",
+                "mkdir /var/lib/cloud/seed\n",
+                "mkdir {seed_dir}\n",
+                "write {user_data} {seed_dir}/user-data\n",
+                "write {meta_data} {seed_dir}/meta-data\n",
+                "write {network_config} {seed_dir}/network-config\n"
+            ),
+            seed_dir = GUEST_NOCLOUD_SEED_DIR,
+            user_data = runtime.user_data.display(),
+            meta_data = runtime.meta_data.display(),
+            network_config = runtime.network_config.display(),
+        ),
+    )?;
+
+    runner.run(
+        "debugfs",
+        &[
+            "-w".into(),
+            "-f".into(),
+            command_file.display().to_string(),
+            rootfs.display().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_ssh_key(runner: &dyn CommandRunner, ssh_key: &Path) -> Result<()> {
+    if ssh_key.is_file() && ssh_key.with_extension("pub").is_file() {
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(ssh_key);
+    let _ = fs::remove_file(ssh_key.with_extension("pub"));
+    runner.run(
+        "ssh-keygen",
+        &[
+            "-q".into(),
+            "-t".into(),
+            "ed25519".into(),
+            "-N".into(),
+            String::new(),
+            "-f".into(),
+            ssh_key.display().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn setup_bridge(runner: &dyn CommandRunner, net: &NetworkConfig) -> Result<()> {
+    if runner
+        .run(
+            "ip",
+            &[
+                "link".into(),
+                "show".into(),
+                "dev".into(),
+                net.bridge_name.clone(),
+            ],
+        )
+        .is_err()
+    {
+        runner.run(
+            "ip",
+            &[
+                "link".into(),
+                "add".into(),
+                "name".into(),
+                net.bridge_name.clone(),
+                "type".into(),
+                "bridge".into(),
+            ],
+        )?;
+    }
+
+    runner.run(
+        "ip",
+        &[
+            "addr".into(),
+            "replace".into(),
+            format!("{}/{}", net.host_ip, net.cidr_bits),
+            "dev".into(),
+            net.bridge_name.clone(),
+        ],
+    )?;
+    runner.run(
+        "ip",
+        &[
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            net.bridge_name.clone(),
+            "up".into(),
+        ],
+    )?;
+    ensure_host_egress(runner, net)?;
+    Ok(())
+}
+
+fn setup_tap(runner: &dyn CommandRunner, net: &NetworkConfig) -> Result<()> {
+    let _ = runner.run("ip", &["link".into(), "del".into(), net.tap_name.clone()]);
+    runner.run(
+        "ip",
+        &[
+            "tuntap".into(),
+            "add".into(),
+            "dev".into(),
+            net.tap_name.clone(),
+            "mode".into(),
+            "tap".into(),
+        ],
+    )?;
+    runner.run(
+        "ip",
+        &[
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            net.tap_name.clone(),
+            "master".into(),
+            net.bridge_name.clone(),
+        ],
+    )?;
+    runner.run(
+        "ip",
+        &[
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            net.tap_name.clone(),
+            "up".into(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_prepared_network(net: &NetworkConfig) -> Result<()> {
+    let bridge_path = Path::new("/sys/class/net").join(&net.bridge_name);
+    if !bridge_path.exists() {
+        return Err(Error::InvalidArgs(format!(
+            "firecracker bridge `{}` is not configured; run `kalisto create` with sudo before `kalisto up`",
+            net.bridge_name
+        )));
+    }
+
+    let tap_path = Path::new("/sys/class/net").join(&net.tap_name);
+    if !tap_path.exists() {
+        return Err(Error::InvalidArgs(format!(
+            "firecracker tap `{}` is not configured; run `kalisto create` with sudo before `kalisto up`",
+            net.tap_name
+        )));
+    }
+
+    Ok(())
+}
+
+fn load_network_config(runtime: &RuntimeFiles, instance_name: &str) -> Result<NetworkConfig> {
+    let tap_name = read_trimmed(&runtime.tap_name)?
+        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).tap_name);
+    let host_ip = read_trimmed(&runtime.host_ip)?
+        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).host_ip);
+    let guest_ip = read_trimmed(&runtime.guest_ip)?
+        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).guest_ip);
+    let mut net = NetworkConfig::for_instance(instance_name);
+    net.tap_name = tap_name;
+    net.host_ip = host_ip;
+    net.guest_ip = guest_ip;
+    Ok(net)
+}
+
+fn wait_for_ssh(
+    runner: &dyn CommandRunner,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    for _ in 0..90 {
+        if let Some(status) = child.try_wait().map_err(|source| Error::CommandIo {
+            program: "firecracker".to_owned(),
+            source,
+        })? {
+            let stderr = fs::read_to_string(&runtime.stderr_log).unwrap_or_default();
+            let stdout = fs::read_to_string(&runtime.stdout_log).unwrap_or_default();
+            debug_firecracker_runtime(runtime, net, &stdout, &stderr, "firecracker exited early");
+            let _ = fs::remove_file(&runtime.pid);
+            let hint = firecracker_startup_hint(net, &stdout, &stderr);
+            return Err(Error::InvalidArgs(format!(
+                "firecracker exited early with status {:?}\nstdout:\n{}\nstderr:\n{}{}",
+                status.code(),
+                truncate(&stdout, 2000),
+                truncate(&stderr, 2000),
+                hint
+            )));
+        }
+
+        if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    let stderr = fs::read_to_string(&runtime.stderr_log).unwrap_or_default();
+    let stdout = fs::read_to_string(&runtime.stdout_log).unwrap_or_default();
+    debug_firecracker_runtime(
+        runtime,
+        net,
+        &stdout,
+        &stderr,
+        "timed out waiting for firecracker ssh readiness",
+    );
+    Err(Error::InvalidArgs(format!(
+        "timed out waiting for firecracker ssh readiness at {}\nstderr:\n{}",
+        net.guest_ip,
+        truncate(&stderr, 2000)
+    )))
+}
+
+fn firecracker_startup_hint(net: &NetworkConfig, stdout: &str, stderr: &str) -> String {
+    let combined = format!("{stdout}\n{stderr}");
+    if !combined.contains("Invalid TUN/TAP Backend")
+        || !combined.contains("Device or resource busy")
+    {
+        return String::new();
+    }
+
+    format!(
+        "\n\nhost TAP device `{}` is busy.\nRun a privileged network reset before `kalisto up`:\n  sudo ip link del {} || true\n  sudo ip link del dev {} type bridge || true\n  sudo kalisto create --name <cluster>\n",
+        net.tap_name, net.tap_name, BRIDGE_NAME
+    )
+}
+
+fn debug_firecracker_runtime(
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+    stdout: &str,
+    stderr: &str,
+    message: &str,
+) {
+    debug!(
+        guest_ip = %net.guest_ip,
+        host_ip = %net.host_ip,
+        tap = %net.tap_name,
+        config = %runtime.config.display(),
+        stdout_log = %runtime.stdout_log.display(),
+        stderr_log = %runtime.stderr_log.display(),
+        meta_data = %runtime.meta_data.display(),
+        user_data = %runtime.user_data.display(),
+        network_config = %runtime.network_config.display(),
+        instance_rootfs = %runtime.instance_rootfs.display(),
+        nocloud_seed_dir = GUEST_NOCLOUD_SEED_DIR,
+        stdout_tail = %tail(stdout, 4000),
+        stderr_tail = %tail(stderr, 4000),
+        "{message}"
+    );
+}
+
+fn run_ssh(
+    runner: &dyn CommandRunner,
+    runtime_root: &Path,
+    instance_name: &str,
+    command: &str,
+) -> Result<Output> {
+    let runtime = RuntimeFiles::new(runtime_root);
+    let net = load_network_config(&runtime, instance_name)?;
+    run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, command)
+}
+
+fn run_ssh_command(
+    runner: &dyn CommandRunner,
+    ssh_key: &Path,
+    guest_ip: &str,
+    command: &str,
+) -> Result<Output> {
+    runner.run(
+        "ssh",
+        &[
+            "-F".into(),
+            "/dev/null".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "LogLevel=ERROR".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-i".into(),
+            ssh_key.display().to_string(),
+            format!("{SSH_USER}@{guest_ip}"),
+            command.to_owned(),
+        ],
+    )
+}
+
+fn stop_process(
+    runner: &dyn CommandRunner,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        let _ = run_ssh_command(
+            runner,
+            &runtime.ssh_key,
+            &net.guest_ip,
+            "sudo shutdown -h now || sudo poweroff || true",
+        );
+        for _ in 0..30 {
+            if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    if let Some(pid) = read_pid(&runtime.pid)?
+        && process_exists(runner, pid)
+    {
+        let _ = signal(runner, "-TERM", pid);
+        for _ in 0..20 {
+            if !process_exists(runner, pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if process_exists(runner, pid) {
+            let _ = signal(runner, "-KILL", pid);
+        }
+    }
+
+    let _ = fs::remove_file(&runtime.pid);
+    Ok(())
+}
+
+fn ensure_host_egress(runner: &dyn CommandRunner, net: &NetworkConfig) -> Result<()> {
+    let uplink = detect_uplink_interface(runner)?;
+    runner.run("sysctl", &["-w".into(), "net.ipv4.ip_forward=1".into()])?;
+    ensure_iptables_rule(
+        runner,
+        None,
+        &forward_from_bridge_rule_args(net),
+        &forward_from_bridge_rule_args(net),
+    )?;
+    ensure_iptables_rule(
+        runner,
+        None,
+        &forward_to_bridge_rule_args(net),
+        &forward_to_bridge_rule_args(net),
+    )?;
+    let nat_args = nat_postrouting_rule_args(net, &uplink);
+    ensure_iptables_rule(runner, Some("nat"), &nat_args, &nat_args)?;
+    Ok(())
+}
+
+fn teardown_host_egress(runner: &dyn CommandRunner, net: &NetworkConfig) -> Result<()> {
+    let uplink = detect_uplink_interface(runner)?;
+    remove_iptables_rule(runner, None, &forward_from_bridge_rule_args(net))?;
+    remove_iptables_rule(runner, None, &forward_to_bridge_rule_args(net))?;
+    remove_iptables_rule(
+        runner,
+        Some("nat"),
+        &nat_postrouting_rule_args(net, &uplink),
+    )?;
+    Ok(())
+}
+
+fn detect_uplink_interface(runner: &dyn CommandRunner) -> Result<String> {
+    let output = runner.run("ip", &["route".into(), "show".into(), "default".into()])?;
+    parse_default_route_interface(&output.stdout)
+}
+
+fn parse_default_route_interface(output: &str) -> Result<String> {
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part == "dev" {
+                let interface = parts.next().ok_or_else(|| {
+                    Error::InvalidArgs(format!(
+                        "failed to parse uplink interface from default route output: {output}"
+                    ))
+                })?;
+                if !interface.is_empty() {
+                    return Ok(interface.to_owned());
+                }
+            }
+        }
+    }
+
+    Err(Error::InvalidArgs(format!(
+        "failed to detect host uplink interface from default route output: {output}"
+    )))
+}
+
+fn ensure_iptables_rule(
+    runner: &dyn CommandRunner,
+    table: Option<&str>,
+    check_args: &[String],
+    add_args: &[String],
+) -> Result<()> {
+    let mut check = iptables_base_args(table);
+    check.push("-C".into());
+    check.extend_from_slice(check_args);
+    if runner.run("iptables", &check).is_ok() {
+        return Ok(());
+    }
+
+    let mut add = iptables_base_args(table);
+    add.push("-A".into());
+    add.extend_from_slice(add_args);
+    runner.run("iptables", &add)?;
+    Ok(())
+}
+
+fn remove_iptables_rule(
+    runner: &dyn CommandRunner,
+    table: Option<&str>,
+    delete_args: &[String],
+) -> Result<()> {
+    let mut check = iptables_base_args(table);
+    check.push("-C".into());
+    check.extend_from_slice(delete_args);
+    if runner.run("iptables", &check).is_err() {
+        return Ok(());
+    }
+
+    let mut delete = iptables_base_args(table);
+    delete.push("-D".into());
+    delete.extend_from_slice(delete_args);
+    runner.run("iptables", &delete)?;
+    Ok(())
+}
+
+fn iptables_base_args(table: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(table) = table {
+        args.push("-t".into());
+        args.push(table.to_owned());
+    }
+    args
+}
+
+fn forward_from_bridge_rule_args(net: &NetworkConfig) -> Vec<String> {
+    vec![
+        "FORWARD".into(),
+        "-i".into(),
+        net.bridge_name.clone(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ]
+}
+
+fn forward_to_bridge_rule_args(net: &NetworkConfig) -> Vec<String> {
+    vec![
+        "FORWARD".into(),
+        "-o".into(),
+        net.bridge_name.clone(),
+        "-m".into(),
+        "conntrack".into(),
+        "--ctstate".into(),
+        "RELATED,ESTABLISHED".into(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ]
+}
+
+fn nat_postrouting_rule_args(net: &NetworkConfig, uplink: &str) -> Vec<String> {
+    vec![
+        "POSTROUTING".into(),
+        "-s".into(),
+        firecracker_subnet(net),
+        "!".into(),
+        "-d".into(),
+        firecracker_subnet(net),
+        "-o".into(),
+        uplink.to_owned(),
+        "-j".into(),
+        "MASQUERADE".into(),
+    ]
+}
+
+fn firecracker_subnet(net: &NetworkConfig) -> String {
+    let mut octets = [0_u8; 4];
+    for (index, part) in net.host_ip.split('.').take(4).enumerate() {
+        octets[index] = part.parse::<u8>().unwrap_or(0);
+    }
+
+    let prefix_bytes = usize::from(net.cidr_bits / 8);
+    for octet in octets.iter_mut().skip(prefix_bytes) {
+        *octet = 0;
+    }
+
+    format!(
+        "{}.{}.{}.{}/{}",
+        octets[0], octets[1], octets[2], octets[3], net.cidr_bits
+    )
+}
+
+fn read_trimmed(path: &Path) -> Result<Option<String>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(
+        fs::read_to_string(path)
+            .map_err(io_error("read_to_string"))?
+            .trim()
+            .to_owned(),
+    ))
+}
+
+fn read_pid(path: &Path) -> Result<Option<u32>> {
+    let Some(content) = read_trimmed(path)? else {
+        return Ok(None);
+    };
+    let pid = content
+        .parse::<u32>()
+        .map_err(|error| Error::InvalidArgs(format!("invalid firecracker pid file: {error}")))?;
+    Ok(Some(pid))
+}
+
+fn process_exists(runner: &dyn CommandRunner, pid: u32) -> bool {
+    signal(runner, "-0", pid).is_ok()
+}
+
+fn signal(runner: &dyn CommandRunner, signal: &str, pid: u32) -> Result<Output> {
+    runner.run("kill", &[signal.to_owned(), pid.to_string()])
+}
+
+fn stable_hash(input: &str) -> u32 {
+    let mut value = 0x811c9dc5_u32;
+    for byte in input.bytes() {
+        value ^= u32::from(byte);
+        value = value.wrapping_mul(0x01000193);
+    }
+    value
+}
+
+fn json_escape(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn ensure_path_exists(path: &Path, label: &str) -> Result<()> {
+    if path.exists() {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs(format!(
+            "{label} path does not exist: {}",
+            path.display()
+        )))
+    }
+}
+
+fn write_file(path: &Path, content: &str) -> Result<()> {
+    fs::write(path, content).map_err(io_error("write"))
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn tail(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_owned();
+    }
+
+    let skipped = char_count - max_chars;
+    let tailed: String = text.chars().skip(skipped).collect();
+    format!("...{tailed}")
+}
+
+fn missing_artifact_message(label: &str) -> String {
+    format!(
+        "firecracker backend requires a configured {label} path; pass --firecracker-{label} or configure artifact discovery"
+    )
+}
+
+fn io_error(program: &'static str) -> impl FnOnce(std::io::Error) -> Error {
+    move |source| Error::CommandIo {
+        program: program.to_owned(),
+        source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use super::{
+        BACKEND, NetworkConfig, build_config_json, firecracker_subnet, nat_postrouting_rule_args,
+        parse_default_route_interface, stable_hash,
+    };
+    use crate::backend::InstanceConfig;
+    use crate::backend::runtime::ClusterBackend;
+    use crate::error::Result;
+    use crate::process::{CommandRunner, Output};
+
+    #[derive(Default)]
+    struct PanicRunner;
+
+    impl CommandRunner for PanicRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+            panic!("unexpected command invocation: {program} {args:?}");
+        }
+    }
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn firecracker_config_contains_required_sections() {
+        let runtime_root = Path::new("/tmp/runtime");
+        let runtime = super::RuntimeFiles::new(runtime_root);
+        let net = NetworkConfig::for_instance("vm");
+        let json = build_config_json(
+            Path::new("/tmp/vmlinux"),
+            &InstanceConfig {
+                name: "vm".to_owned(),
+                runtime_root: runtime_root.to_path_buf(),
+                host_port_forward: None,
+                cpus: 2,
+                memory_gib: 4,
+            },
+            &runtime,
+            &net,
+        );
+
+        assert!(json.contains("\"boot-source\""));
+        assert!(json.contains("\"drives\""));
+        assert!(json.contains("\"network-interfaces\""));
+        assert!(json.contains("\"mem_size_mib\": 4096"));
+        assert!(json.contains(runtime.instance_rootfs.display().to_string().as_str()));
+        assert!(!json.contains("\"drive_id\": \"seed\""));
+        assert!(json.contains("ds=nocloud;s=file:///var/lib/cloud/seed/nocloud/"));
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        assert_eq!(stable_hash("kalisto-cp"), stable_hash("kalisto-cp"));
+        assert_ne!(stable_hash("kalisto-cp"), stable_hash("kalisto-w0"));
+    }
+
+    #[test]
+    fn parses_default_route_uplink_interface() {
+        let output = "default via 192.168.1.1 dev eno1 proto dhcp src 192.168.1.20 metric 100\n";
+        assert_eq!(parse_default_route_interface(output).unwrap(), "eno1");
+    }
+
+    #[test]
+    fn firecracker_subnet_matches_bridge_network() {
+        let net = NetworkConfig::for_instance("vm");
+        assert_eq!(firecracker_subnet(&net), "172.31.0.0/16");
+    }
+
+    #[test]
+    fn nat_rule_targets_uplink_and_bridge_subnet() {
+        let net = NetworkConfig::for_instance("vm");
+        let args = nat_postrouting_rule_args(&net, "eno1");
+
+        assert_eq!(
+            args,
+            vec![
+                "POSTROUTING",
+                "-s",
+                "172.31.0.0/16",
+                "!",
+                "-d",
+                "172.31.0.0/16",
+                "-o",
+                "eno1",
+                "-j",
+                "MASQUERADE"
+            ]
+        );
+    }
+
+    #[test]
+    fn query_status_without_pid_reports_stopped_without_shelling_out() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let runtime_root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-status-no-pid-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&runtime_root).unwrap();
+        let runner = PanicRunner;
+
+        let status = BACKEND
+            .query_instance_status(&runner, "kalisto-test-cp", &runtime_root)
+            .unwrap();
+        assert_eq!(status, "kalisto-test-cp Stopped firecracker");
+
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+}
