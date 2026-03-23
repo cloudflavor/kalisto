@@ -5,6 +5,7 @@ Early validation harness for a local-development Kubernetes runtime on macOS usi
 Current scope:
 
 - macOS backend: Lima (`vz` + Rosetta)
+- Linux backend: Firecracker (in progress)
 - Kubernetes distro: `k3s`
 - image pipeline: container-built seed image plus macOS finalization pass
 
@@ -16,7 +17,7 @@ The first product-facing commands are available now:
 cargo run -- up
 cargo run -- ls
 cargo run -- down --name kalisto
-cargo run -- remove --name kalisto
+cargo run -- destroy --name kalisto
 cargo run -- status --name kalisto
 cargo run -- kubeconfig --name kalisto
 cargo run -- bench --runs 3
@@ -92,6 +93,103 @@ Default artifacts:
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.img`
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+
+## Firecracker artifact pipeline
+
+The Linux Firecracker path should reuse the same Ubuntu guest lineage as Lima, but emit Firecracker-specific artifacts.
+
+Current shape:
+
+- shared guest provisioning script:
+  - [scripts/image/provision_kalisto_node.sh](/home/runner/projects/rust/kalisto/scripts/image/provision_kalisto_node.sh)
+- Linux kernel builder:
+  - [scripts/linux/build_firecracker_kernel.sh](/home/runner/projects/rust/kalisto/scripts/linux/build_firecracker_kernel.sh)
+- Linux rootfs builder:
+  - [scripts/linux/build_firecracker_rootfs.sh](/home/runner/projects/rust/kalisto/scripts/linux/build_firecracker_rootfs.sh)
+- unified artifact manifest renderer:
+  - [scripts/linux/render_firecracker_artifact_manifest.sh](/home/runner/projects/rust/kalisto/scripts/linux/render_firecracker_artifact_manifest.sh)
+- prerequisites:
+  - [docs/prerequisites-linux-firecracker.md](/home/runner/projects/rust/kalisto/docs/prerequisites-linux-firecracker.md)
+
+Build the Firecracker kernel, rootfs, and unified manifest locally on Linux:
+
+```bash
+./scripts/linux/build_firecracker_kernel.sh
+./scripts/linux/build_firecracker_rootfs.sh
+./scripts/linux/render_firecracker_artifact_manifest.sh
+```
+
+By default, the Linux Firecracker scripts detect the installed Firecracker
+version and host architecture, then place artifacts under a versioned directory
+such as `artifacts/firecracker-node/v1.13/x86_64/`.
+
+Default artifacts for a host running Firecracker `v1.13.x` on `x86_64`:
+
+- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux`
+- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux.config`
+- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux.manifest`
+- `artifacts/firecracker-node/v1.13/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.raw`
+- `artifacts/firecracker-node/v1.13/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.manifest`
+- `artifacts/firecracker-node/v1.13/x86_64/firecracker-artifacts.manifest`
+
+## Firecracker artifact manager
+
+`kalisto up` on Linux now resolves Firecracker boot artifacts in this order:
+
+1. explicit CLI paths:
+   - `--firecracker-kernel`
+   - `--firecracker-rootfs`
+2. versioned artifact roots for the detected Firecracker release track and host architecture:
+   - `artifacts/firecracker-node/<major.minor>/<arch>/`
+   - `~/.local/share/kalisto/artifacts/firecracker-node/<major.minor>/<arch>/`
+3. legacy artifact roots:
+   - `artifacts/firecracker-node/`
+   - `~/.local/share/kalisto/artifacts/firecracker-node/`
+4. optional fetch-on-miss URLs declared explicitly or through a published Kalisto manifest
+
+On Linux, Kalisto now detects the installed Firecracker version from `firecracker --version`, maps it to the matching upstream artifact track such as `v1.13`, and prefers the cache path under:
+
+```text
+~/.local/share/kalisto/artifacts/firecracker-node/v1.13/x86_64/
+```
+
+If no managed artifacts are present locally, Kalisto can fetch them into that
+versioned directory from either:
+
+- `KALISTO_FIRECRACKER_MANIFEST_URL`, which supplies the managed filenames,
+  checksums, URLs, and baked `k3s` version
+- explicit `KALISTO_FIRECRACKER_KERNEL_URL` and
+  `KALISTO_FIRECRACKER_ROOTFS_URL` overrides
+
+The default managed kernel artifact is now Kalisto-owned instead of discovered
+from the upstream Firecracker CI bucket. The writable Firecracker rootfs
+remains Kalisto-managed and is still expected to come from a local workspace
+artifact, a published Kalisto artifact set, or an explicit path override.
+
+Supported fetch-on-miss environment variables:
+
+- `KALISTO_FIRECRACKER_MANIFEST_URL`
+- `KALISTO_FIRECRACKER_KERNEL_URL`
+- `KALISTO_FIRECRACKER_ROOTFS_URL`
+- `KALISTO_FIRECRACKER_KERNEL_FILENAME`
+- `KALISTO_FIRECRACKER_ROOTFS_FILENAME`
+- `KALISTO_FIRECRACKER_KERNEL_SHA256`
+- `KALISTO_FIRECRACKER_ROOTFS_SHA256`
+- `KALISTO_FIRECRACKER_ARTIFACT_DIR`
+- `KALISTO_FIRECRACKER_ARTIFACT_CACHE_DIR`
+- `KALISTO_FIRECRACKER_VERSION`
+- `KALISTO_FIRECRACKER_ARCH`
+
+Current limitation:
+
+- auto-managed Firecracker rootfs resolution only supports the `k3s` version declared by the managed artifact set
+- non-default `k3s` versions still require an explicit `--firecracker-rootfs`
+
+The GitLab pipeline now publishes a combined `publish:firecracker-artifacts` job artifact set. A stable manifest URL for the default branch can be addressed through GitLab's latest-artifact endpoint pattern:
+
+```text
+<project-url>/-/jobs/artifacts/<ref>/raw/artifacts/firecracker-node/<major.minor>/<arch>/firecracker-artifacts.manifest?job=publish:firecracker-artifacts
+```
 
 ## Lima substrate probe
 

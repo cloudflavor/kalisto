@@ -63,9 +63,100 @@ build:lima-node-image:
   before_script:
     - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_IMAGE_WORK_DIR}"
     - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils "linux-image-$(dpkg --print-architecture)"
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils xz-utils "linux-image-$(dpkg --print-architecture)"
   script:
     - ./scripts/macos/build_lima_node_image.sh
   artifacts:
     paths:
       - artifacts/lima-node/
+
+build:firecracker-kernel:
+  stage: build
+  image: debian:bookworm-slim
+  variables:
+    APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
+    DEBIAN_FRONTEND: noninteractive
+    INITRD: "No"
+    KALISTO_FIRECRACKER_VERSION: "v1.13.1"
+    KALISTO_FIRECRACKER_ARTIFACT_TRACK: "v1.13"
+    KALISTO_FIRECRACKER_ARCH: "x86_64"
+    KALISTO_FIRECRACKER_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/firecracker-kernel/v1.13/x86_64"
+    KALISTO_FIRECRACKER_KERNEL_WORK_DIR: "$CI_PROJECT_DIR/.cache/firecracker-node/work/kernel"
+    KALISTO_FIRECRACKER_KERNEL_FILENAME: "kalisto-vmlinux"
+    KALISTO_FIRECRACKER_KERNEL_JOBS: "6"
+  cache:
+    key: firecracker-kernel-v1
+    paths:
+      - .cache/apt/archives/
+      - .cache/apt/lists/
+      - .cache/firecracker-node/work/kernel/
+  before_script:
+    - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_FIRECRACKER_KERNEL_WORK_DIR}"
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends bc build-essential ca-certificates curl file flex bison libelf-dev libssl-dev rsync xz-utils
+  script:
+    - ./scripts/linux/build_firecracker_kernel.sh
+  artifacts:
+    paths:
+      - artifacts/firecracker-kernel/
+
+build:firecracker-rootfs:
+  stage: build
+  image: debian:bookworm-slim
+  variables:
+    APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
+    DEBIAN_FRONTEND: noninteractive
+    INITRD: "No"
+    KALISTO_FIRECRACKER_VERSION: "v1.13.1"
+    KALISTO_FIRECRACKER_ARTIFACT_TRACK: "v1.13"
+    KALISTO_FIRECRACKER_ARCH: "x86_64"
+    KALISTO_FIRECRACKER_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/firecracker-rootfs/v1.13/x86_64"
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_FIRECRACKER_WORK_DIR: "$CI_PROJECT_DIR/.cache/firecracker-node/work"
+    LIBGUESTFS_BACKEND: direct
+  cache:
+    key: firecracker-rootfs-v1
+    paths:
+      - .cache/apt/archives/
+      - .cache/apt/lists/
+      - .cache/k3s/
+      - .cache/firecracker-node/work/
+  before_script:
+    - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_FIRECRACKER_WORK_DIR}"
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils xz-utils "linux-image-$(dpkg --print-architecture)"
+  script:
+    - ./scripts/linux/build_firecracker_rootfs.sh
+  artifacts:
+    paths:
+      - artifacts/firecracker-rootfs/
+
+publish:firecracker-artifacts:
+  stage: build
+  image: debian:bookworm-slim
+  variables:
+    KALISTO_IMAGE_BASENAME: "ubuntu-24.04-minimal-k3s-amd64"
+    KALISTO_FIRECRACKER_VERSION: "v1.13.1"
+    KALISTO_FIRECRACKER_ARTIFACT_TRACK: "v1.13"
+    KALISTO_FIRECRACKER_ARCH: "x86_64"
+    KALISTO_FIRECRACKER_KERNEL_FILENAME: "kalisto-vmlinux"
+  needs:
+    - job: build:firecracker-kernel
+      artifacts: true
+    - job: build:firecracker-rootfs
+      artifacts: true
+  script:
+    - mkdir -p "artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}"
+    - cp "artifacts/firecracker-kernel/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/"* "artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/"
+    - cp "artifacts/firecracker-rootfs/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.raw" "artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.raw"
+    - if [ -f "artifacts/firecracker-rootfs/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.raw.xz" ]; then cp "artifacts/firecracker-rootfs/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.raw.xz" "artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.raw.xz"; fi
+    - cp "artifacts/firecracker-rootfs/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.manifest" "artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.manifest"
+    - |
+      KALISTO_FIRECRACKER_OUTPUT_DIR="${CI_PROJECT_DIR}/artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}" \
+      KALISTO_FIRECRACKER_ROOTFS_MANIFEST_PATH="${CI_PROJECT_DIR}/artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/${KALISTO_IMAGE_BASENAME}-rootfs.manifest" \
+      KALISTO_FIRECRACKER_ARTIFACT_MANIFEST_PATH="${CI_PROJECT_DIR}/artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}/firecracker-artifacts.manifest" \
+      KALISTO_FIRECRACKER_ARTIFACT_BASE_URL="${CI_PROJECT_URL:+${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARCH}}" \
+      ./scripts/linux/render_firecracker_artifact_manifest.sh
+  artifacts:
+    paths:
+      - artifacts/firecracker-node/

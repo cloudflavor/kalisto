@@ -2,7 +2,7 @@
 set -eu
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
-PROVISION_SCRIPT="${KALISTO_IMAGE_PROVISION_SCRIPT:-${ROOT_DIR}/scripts/macos/provision_lima_node.sh}"
+PROVISION_SCRIPT="${KALISTO_IMAGE_PROVISION_SCRIPT:-${ROOT_DIR}/scripts/image/provision_kalisto_node.sh}"
 OUTPUT_DIR="${KALISTO_IMAGE_OUTPUT_DIR:-${ROOT_DIR}/artifacts/lima-node}"
 WORK_DIR="${KALISTO_IMAGE_WORK_DIR:-${ROOT_DIR}/artifacts/lima-node/work}"
 K3S_CACHE_DIR="${KALISTO_K3S_CACHE_DIR:-${ROOT_DIR}/artifacts/lima-node/cache/k3s}"

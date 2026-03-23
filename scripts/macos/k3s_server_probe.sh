@@ -12,6 +12,7 @@ KALISTO_K3S_NODE_ROLE="${KALISTO_K3S_NODE_ROLE:-server}"
 KALISTO_K3S_NODE_NAME="${KALISTO_K3S_NODE_NAME:-}"
 KALISTO_K3S_SERVER_URL="${KALISTO_K3S_SERVER_URL:-}"
 KALISTO_K3S_TOKEN="${KALISTO_K3S_TOKEN:-}"
+KALISTO_K3S_TLS_SANS="${KALISTO_K3S_TLS_SANS:-}"
 KALISTO_K3S_DISABLE_AGENT="${KALISTO_K3S_DISABLE_AGENT:-0}"
 KALISTO_K3S_USE_SYSTEMD="${KALISTO_K3S_USE_SYSTEMD:-0}"
 KALISTO_K3S_DISABLE_TRAEFIK="${KALISTO_K3S_DISABLE_TRAEFIK:-1}"
@@ -51,6 +52,21 @@ case "${ARCH}" in
     ;;
 esac
 
+tls_san_args() {
+  if [ -z "${KALISTO_K3S_TLS_SANS}" ]; then
+    return 0
+  fi
+
+  PREV_IFS="${IFS}"
+  IFS=','
+  for SAN in ${KALISTO_K3S_TLS_SANS}; do
+    if [ -n "${SAN}" ]; then
+      printf ' --tls-san %s' "${SAN}"
+    fi
+  done
+  IFS="${PREV_IFS}"
+}
+
 TMP_K3S=/tmp/k3s
 if ! [ -x /usr/local/bin/k3s ] || ! /usr/local/bin/k3s --version >/dev/null 2>&1; then
   rm -f /usr/local/bin/k3s
@@ -78,6 +94,22 @@ cat > /usr/local/bin/kalisto-k3s-node <<EOF
 set -eu
 
 export K3S_KUBECONFIG_MODE=0644
+
+tls_san_args() {
+  if [ -z "\${KALISTO_K3S_TLS_SANS:-}" ]; then
+    return 0
+  fi
+
+  PREV_IFS="\${IFS}"
+  IFS=','
+  for SAN in \${KALISTO_K3S_TLS_SANS}; do
+    if [ -n "\${SAN}" ]; then
+      printf ' --tls-san %s' "\${SAN}"
+    fi
+  done
+  IFS="\${PREV_IFS}"
+}
+
 NODE_NAME_ARGS=
 if [ -n "\${KALISTO_K3S_NODE_NAME:-}" ]; then
   NODE_NAME_ARGS="--node-name \${KALISTO_K3S_NODE_NAME}"
@@ -86,6 +118,7 @@ fi
 case "\${KALISTO_K3S_NODE_ROLE:-server}" in
   server)
     EXTRA_ARGS=
+    TLS_SAN_ARGS="$(tls_san_args)"
     if [ "\${KALISTO_K3S_DISABLE_TRAEFIK:-1}" = "1" ]; then
       EXTRA_ARGS="\${EXTRA_ARGS} --disable=traefik"
     fi
@@ -117,7 +150,7 @@ case "\${KALISTO_K3S_NODE_ROLE:-server}" in
     --disable-agent \
     --write-kubeconfig ${KUBECONFIG_PATH} \
     --write-kubeconfig-mode 0644 \
-    --tls-san 127.0.0.1 \
+    \${TLS_SAN_ARGS} \
     --prefer-bundled-bin \${EXTRA_ARGS}"
     fi
 
@@ -125,7 +158,7 @@ case "\${KALISTO_K3S_NODE_ROLE:-server}" in
   \${NODE_NAME_ARGS} \
   --write-kubeconfig ${KUBECONFIG_PATH} \
   --write-kubeconfig-mode 0644 \
-  --tls-san 127.0.0.1 \
+  \${TLS_SAN_ARGS} \
   --prefer-bundled-bin \${EXTRA_ARGS}"
     ;;
   agent)
@@ -149,6 +182,20 @@ EOF
 
 chmod 0755 /usr/local/bin/kalisto-k3s-node
 
+is_k3s_node_running() {
+  case "${KALISTO_K3S_NODE_ROLE}" in
+    server)
+      ps -eo comm=,args= | awk '$1 == "k3s" && $0 ~ /(^|[[:space:]])server([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'
+      ;;
+    agent)
+      ps -eo comm=,args= | awk '$1 == "k3s" && $0 ~ /(^|[[:space:]])agent([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 if [ "${KALISTO_K3S_USE_SYSTEMD}" = "1" ]; then
   test -s /etc/machine-id || dbus-uuidgen --ensure=/etc/machine-id
 
@@ -165,6 +212,7 @@ Environment=KALISTO_K3S_NODE_ROLE=${KALISTO_K3S_NODE_ROLE}
 Environment=KALISTO_K3S_NODE_NAME=${KALISTO_K3S_NODE_NAME}
 Environment=KALISTO_K3S_SERVER_URL=${KALISTO_K3S_SERVER_URL}
 Environment=KALISTO_K3S_TOKEN=${KALISTO_K3S_TOKEN}
+Environment=KALISTO_K3S_TLS_SANS=${KALISTO_K3S_TLS_SANS}
 Environment=KALISTO_K3S_DISABLE_AGENT=${KALISTO_K3S_DISABLE_AGENT}
 Environment=KALISTO_K3S_DISABLE_KUBE_PROXY=${KALISTO_K3S_DISABLE_KUBE_PROXY}
 ExecStart=/bin/sh -lc '/usr/local/bin/kalisto-k3s-node >>"${STDOUT_LOG}" 2>>"${STDERR_LOG}"'
@@ -180,7 +228,7 @@ EOF
   systemctl enable kalisto-k3s.service >/dev/null 2>&1 || true
   systemctl restart kalisto-k3s.service
 else
-  if pgrep -f "/usr/local/bin/kalisto-k3s-node" >/dev/null 2>&1; then
+  if is_k3s_node_running; then
     exit 0
   fi
 
