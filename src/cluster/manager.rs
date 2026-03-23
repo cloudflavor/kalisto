@@ -4,27 +4,34 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, info_span, warn};
 
-use crate::backend::lima::{
-    Config as LimaConfig, InstanceConfig, canonicalize_path, internal_hostname,
-    query_instance_status, shell_escape, start_instance, stop_and_delete_instance,
+use crate::artifact::resolve_cluster_spec;
+use crate::backend::lima::canonicalize_path;
+use crate::backend::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig, backend_for};
+use crate::cluster::addon::{
+    AddonId, CniPlugin, install_catalog_addon_with_cilium_version, install_post_ready_addons,
+};
+use crate::cluster::node::{
+    Instance, JoinConfig, K3sBootstrapConfig, bootstrap_server, bootstrap_worker,
+    start_worker_instances,
 };
 use crate::cluster::spec::ClusterSpec;
 use crate::cluster::state::{ClusterState, NodeState};
-use crate::error::{Error, Result};
-use crate::k3s::NodeRole;
-use crate::lima_k3s::node::{Instance, bootstrap_server, bootstrap_worker, start_worker_instances};
-use crate::lima_k3s::util::{format_duration, initial_readiness_command};
-use crate::lima_k3s::wait::{
-    LiveLogTail, wait_for_host_http_with_tail, wait_for_node_ready, wait_for_path_with_tail,
+use crate::cluster::util::{format_duration, initial_readiness_command};
+use crate::cluster::wait::{
+    GuestFileCopy, GuestWait, LiveLogTail, wait_for_guest_text_file_copy,
+    wait_for_host_http_with_tail, wait_for_node_ready, wait_for_path_with_tail,
     wait_for_stable_guest_success_with_tail, wait_for_worker_process,
 };
+use crate::error::{Error, Result};
+use crate::k3s::NodeRole;
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
+use crate::shell::shell_escape;
 
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
     pub name: String,
     pub role: NodeRole,
-    pub lima_status: String,
+    pub backend_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +40,44 @@ pub struct ClusterStatus {
     pub state_root: std::path::PathBuf,
     pub kubeconfig_path: std::path::PathBuf,
     pub nodes: Vec<NodeStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeStats {
+    pub name: String,
+    pub role: NodeRole,
+    pub backend_status: String,
+    pub configured_cpus: u8,
+    pub configured_memory_gib: u8,
+    pub pid: Option<u32>,
+    pub guest_ip: Option<String>,
+    pub rss_bytes: Option<u64>,
+    pub vsz_bytes: Option<u64>,
+    pub rootfs_bytes: Option<u64>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterStats {
+    pub name: String,
+    pub state_root: std::path::PathBuf,
+    pub kubeconfig_path: std::path::PathBuf,
+    pub nodes: Vec<NodeStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeLogSection {
+    pub label: String,
+    pub path: std::path::PathBuf,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeLogs {
+    pub cluster: String,
+    pub node: String,
+    pub sections: Vec<NodeLogSection>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,21 +95,117 @@ pub struct BenchmarkSample {
     pub cluster_ready: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ScaleOutcome {
+    pub name: String,
+    pub previous_workers: usize,
+    pub current_workers: usize,
+    pub added_workers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddonInstallOutcome {
+    pub cluster: String,
+    pub addon: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateOutcome {
+    pub state: ClusterState,
+}
+
+struct WorkerJoinContext<'a> {
+    base_config: &'a BackendConfig,
+    k3s_config: &'a K3sBootstrapConfig,
+    control_plane: &'a Instance,
+    control_plane_guest_kubeconfig: &'a Path,
+    worker_cpus: u8,
+    worker_memory_gib: u8,
+    server_url: &'a str,
+    server_token: &'a str,
+}
+
 pub fn up(spec: &ClusterSpec) -> Result<UpOutcome> {
     let runner = SystemRunner;
     up_with_runner(spec, &runner)
 }
 
-pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<UpOutcome> {
-    if !cfg!(target_os = "macos") {
-        return Err(Error::InvalidArgs(
-            "kalisto up currently supports only macOS".to_owned(),
-        ));
+pub fn create(spec: &ClusterSpec) -> Result<CreateOutcome> {
+    let runner = SystemRunner;
+    create_with_runner(spec, &runner)
+}
+
+pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<CreateOutcome> {
+    let resolved_spec = resolve_cluster_spec(spec, runner)?;
+    let state_root = ClusterSpec::state_root_for(&resolved_spec.name)?;
+    let state_file = ClusterState::state_file(&state_root);
+    if state_file.exists() {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{}` already exists at {}",
+            resolved_spec.name,
+            state_root.display()
+        )));
     }
 
+    ensure_path_exists(&resolved_spec.workspace_root)?;
+    let workspace_root = canonicalize_path(&resolved_spec.workspace_root)?;
+    let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &resolved_spec.name);
+    fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
+    fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
+
+    let backend = backend_for(resolved_spec.backend);
+    backend.check_available(runner)?;
+
+    let state = cluster_state_from_spec(&resolved_spec, workspace_root.clone(), &state_root);
+    let instance_names = state
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = backend.prepare_cluster_network(runner, &instance_names) {
+        let _ = backend.cleanup_cluster_network(runner, &instance_names);
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&runtime_root);
+        return Err(error);
+    }
+
+    state.save(&state_root)?;
+    if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
+        warn!(
+            error = %error,
+            state_root = %state_root.display(),
+            runtime_root = %runtime_root.display(),
+            "failed to hand off cluster files to invoking user"
+        );
+    }
+
+    Ok(CreateOutcome { state })
+}
+
+pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<UpOutcome> {
+    let state_root = ClusterSpec::state_root_for(&spec.name)?;
+    let state_file = ClusterState::state_file(&state_root);
+    if !state_file.exists() {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{}` is not created; run `kalisto create --name {}` first",
+            spec.name, spec.name
+        )));
+    }
+    let state = ClusterState::load(&state_root)?;
+    if cluster_has_running_nodes(runner, &state)? {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{}` is already running",
+            state.name
+        )));
+    }
+    let mut resolved_spec = cluster_spec_from_state(&state);
+    resolved_spec.keep_failed_runtime = spec.keep_failed_runtime;
+    resolved_spec.stream_vm_logs = spec.stream_vm_logs;
+    let spec = &resolved_spec;
     let up_span = info_span!(
         "cluster_up",
         cluster = %spec.name,
+        backend = spec.backend.as_str(),
         workers = spec.worker_count,
         api_port = spec.api_port,
         template = %spec.template
@@ -74,37 +215,29 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     ensure_path_exists(&spec.workspace_root)?;
     let workspace_root = canonicalize_path(&spec.workspace_root)?;
-    let helper_script = ClusterSpec::helper_script_for(&workspace_root);
-    ensure_path_exists(&helper_script)?;
 
-    let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
-    let state_file = ClusterState::state_file(&state_root);
-    if state_file.exists() {
-        return Err(Error::InvalidArgs(format!(
-            "cluster `{}` already exists at {}",
-            spec.name,
-            state_root.display()
-        )));
-    }
-
     fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
     fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
     info!(
+        backend = spec.backend.as_str(),
         workspace_root = %workspace_root.display(),
-        helper_script = %helper_script.display(),
         state_root = %state_root.display(),
         runtime_root = %runtime_root.display(),
         "resolved cluster paths"
     );
 
-    runner.run("limactl", &["--version".into()])?;
+    let backend = backend_for(spec.backend);
+    backend.check_available(runner)?;
 
-    let base_config = LimaConfig {
+    let base_config = BackendConfig {
         template: spec.template.clone(),
         workspace_root: workspace_root.clone(),
         enable_rosetta: spec.enable_rosetta,
         network: spec.network.clone(),
+        firecracker_kernel: spec.firecracker_kernel.clone(),
+        firecracker_rootfs: spec.firecracker_rootfs.clone(),
+        stream_vm_logs: spec.stream_vm_logs,
     };
 
     let control_plane = Instance::new(
@@ -119,33 +252,62 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     info!(
         node = %control_plane.name,
-        cpus = 4,
-        memory_gib = 6,
+        cpus = spec.control_plane_resources.cpus,
+        memory_gib = spec.control_plane_resources.memory_gib,
         "starting control-plane VM"
     );
-    let control_plane_start = start_instance(
+    let control_plane_start = backend.start_instance(
         runner,
         &base_config,
         &InstanceConfig {
             name: control_plane.name.clone(),
+            runtime_root: control_plane.artifacts.root.clone(),
             host_port_forward: Some(spec.api_port),
-            cpus: 4,
-            memory_gib: 6,
+            cpus: spec.control_plane_resources.cpus,
+            memory_gib: spec.control_plane_resources.memory_gib,
         },
     );
     if let Err(error) = control_plane_start {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
-    started_instances.push(control_plane.name.clone());
+    started_instances.push(NodeState {
+        name: control_plane.name.clone(),
+        role: control_plane.role,
+        artifacts_root: control_plane.artifacts.root.clone(),
+    });
     info!(node = %control_plane.name, "control-plane VM started");
 
-    let k3s_config = k3s_config_from_spec(spec, &workspace_root);
+    let control_plane_host =
+        backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root)?;
+    let api_endpoint = backend.host_api_endpoint(
+        &control_plane.name,
+        &control_plane.artifacts.root,
+        spec.api_port,
+    )?;
+    let control_plane_tls_sans = tls_sans_for_control_plane(&control_plane_host, &api_endpoint);
+    let control_plane_guest_artifacts =
+        backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
+    let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
+    let control_plane_guest_token = match spec.backend {
+        BackendKind::Firecracker => {
+            Path::new("/var/lib/rancher/k3s/server/node-token").to_path_buf()
+        }
+        BackendKind::Lima => control_plane_guest_artifacts.join("node-token"),
+    };
+
+    let k3s_config = K3sBootstrapConfig {
+        k3s_version: spec.k3s_version.clone(),
+        server_mode: spec.server_mode,
+        component_toggles: spec.component_toggles,
+    };
     info!(
         node = %control_plane.name,
         mode = ?spec.server_mode,
@@ -153,17 +315,19 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         "bootstrapping control-plane"
     );
     if let Err(error) = bootstrap_server(
+        backend,
         runner,
         &k3s_config,
-        &workspace_root,
-        &helper_script,
         &control_plane,
+        &control_plane_tls_sans,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
@@ -173,29 +337,41 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         format!("{}:k3s", control_plane.name),
     );
     info!(node = %control_plane.name, "waiting for control-plane kubeconfig and join token");
-    if let Err(error) = wait_for_path_with_tail(
+    if let Err(error) = sync_control_plane_artifact(
+        backend,
+        runner,
+        &control_plane,
+        &control_plane_guest_kubeconfig,
         &control_plane.artifacts.kubeconfig,
         Duration::from_secs(180),
         &mut control_plane_tail,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
-    if let Err(error) = wait_for_path_with_tail(
+    if let Err(error) = sync_control_plane_artifact(
+        backend,
+        runner,
+        &control_plane,
+        &control_plane_guest_token,
         &control_plane.artifacts.token,
         Duration::from_secs(180),
         &mut control_plane_tail,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
@@ -206,22 +382,28 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     );
 
     let initial_ready =
-        initial_readiness_command(spec.server_mode, &control_plane.artifacts.kubeconfig);
+        initial_readiness_command(spec.server_mode, &control_plane_guest_kubeconfig);
     info!(node = %control_plane.name, "waiting for control-plane API in guest");
     if let Err(error) = wait_for_stable_guest_success_with_tail(
+        backend,
         runner,
-        &control_plane.name,
-        &initial_ready,
-        Duration::from_secs(90),
-        1,
-        Duration::from_secs(2),
+        GuestWait {
+            instance_name: &control_plane.name,
+            runtime_root: &control_plane.artifacts.root,
+            command: &initial_ready,
+            timeout: Duration::from_secs(90),
+            consecutive_successes: 1,
+            interval: Duration::from_secs(2),
+        },
         &mut control_plane_tail,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
@@ -229,33 +411,37 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let stable_ready_check = format!(
         "ps -ef | grep -F '[k]3s server' >/dev/null && KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/readyz",
         shell_escape(
-            control_plane
-                .artifacts
-                .kubeconfig
+            control_plane_guest_kubeconfig
                 .as_os_str()
                 .to_string_lossy()
                 .as_ref()
         )
     );
     if let Err(error) = wait_for_stable_guest_success_with_tail(
+        backend,
         runner,
-        &control_plane.name,
-        &stable_ready_check,
-        Duration::from_secs(30),
-        3,
-        Duration::from_secs(5),
+        GuestWait {
+            instance_name: &control_plane.name,
+            runtime_root: &control_plane.artifacts.root,
+            command: &stable_ready_check,
+            timeout: Duration::from_secs(120),
+            consecutive_successes: 3,
+            interval: Duration::from_secs(5),
+        },
         &mut control_plane_tail,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
 
-    let api_check = format!("https://127.0.0.1:{}/readyz", spec.api_port);
+    let api_check = format!("https://{api_endpoint}/readyz");
     info!(url = %api_check, "waiting for control-plane API on the host");
     if let Err(error) = wait_for_host_http_with_tail(
         runner,
@@ -264,10 +450,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         &mut control_plane_tail,
     ) {
         return Err(rollback_failed_up(
+            backend,
             runner,
             &started_instances,
             &state_root,
             &runtime_root,
+            spec.keep_failed_runtime,
             error,
         ));
     }
@@ -282,7 +470,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         .map_err(io_error("read_to_string"))?
         .trim()
         .to_owned();
-    let server_url = format!("https://{}:6443", internal_hostname(&control_plane.name));
+    let server_url = format!("https://{control_plane_host}:6443");
 
     let worker_instances: Vec<Instance> = (0..spec.worker_count)
         .map(|index| {
@@ -294,58 +482,80 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     if !worker_instances.is_empty() {
         info!(workers = worker_instances.len(), "starting worker VMs");
     }
-    let mut start_results = Vec::new();
-    let started_workers = start_worker_instances(
+    if let Err(error) = start_and_join_workers(
+        backend,
         runner,
-        &base_config,
-        &workspace_root,
+        WorkerJoinContext {
+            base_config: &base_config,
+            k3s_config: &k3s_config,
+            control_plane: &control_plane,
+            control_plane_guest_kubeconfig: &control_plane_guest_kubeconfig,
+            worker_cpus: spec.worker_resources.cpus,
+            worker_memory_gib: spec.worker_resources.memory_gib,
+            server_url: &server_url,
+            server_token: &server_token,
+        },
         &worker_instances,
         &mut started_instances,
-        &mut start_results,
-    )
-    .map_err(report_error)?;
-
-    for started_worker in started_workers {
-        let worker = started_worker.node;
-        info!(node = %worker.name, "bootstrapping worker");
-        if let Err(error) = bootstrap_worker(
+        spec.cni_plugin == CniPlugin::Flannel,
+    ) {
+        return Err(rollback_failed_up(
+            backend,
             runner,
-            &k3s_config,
-            &workspace_root,
-            &helper_script,
-            &worker,
-            &server_url,
-            &server_token,
-        ) {
-            return Err(rollback_failed_up(
+            &started_instances,
+            &state_root,
+            &runtime_root,
+            spec.keep_failed_runtime,
+            error,
+        ));
+    }
+
+    if let Err(error) = install_post_ready_addons(
+        backend,
+        runner,
+        &control_plane,
+        &control_plane_guest_kubeconfig,
+        spec.cni_plugin,
+        &spec.cilium_version,
+        &spec.addons,
+    ) {
+        return Err(rollback_failed_up(
+            backend,
+            runner,
+            &started_instances,
+            &state_root,
+            &runtime_root,
+            spec.keep_failed_runtime,
+            error,
+        ));
+    }
+
+    if spec.cni_plugin == CniPlugin::Cilium {
+        for worker in &worker_instances {
+            info!(
+                node = %worker.name,
+                "waiting for worker readiness after cilium bootstrap"
+            );
+            if let Err(error) = wait_for_node_ready(
+                backend,
                 runner,
-                &started_instances,
-                &state_root,
-                &runtime_root,
-                error,
-            ));
+                &control_plane.name,
+                &control_plane.artifacts.root,
+                &control_plane_guest_kubeconfig,
+                &worker.name,
+            ) {
+                return Err(rollback_failed_up(
+                    backend,
+                    runner,
+                    &started_instances,
+                    &state_root,
+                    &runtime_root,
+                    spec.keep_failed_runtime,
+                    error,
+                ));
+            }
+            info!(node = %worker.name, "worker is ready");
         }
-        info!(node = %worker.name, "waiting for worker process");
-        if let Err(error) = wait_for_worker_process(runner, &worker.name) {
-            return Err(rollback_failed_up(
-                runner,
-                &started_instances,
-                &state_root,
-                &runtime_root,
-                error,
-            ));
-        }
-        info!(node = %worker.name, "waiting for worker readiness");
-        if let Err(error) = wait_for_node_ready(runner, &control_plane, &worker.name) {
-            return Err(rollback_failed_up(
-                runner,
-                &started_instances,
-                &state_root,
-                &runtime_root,
-                error,
-            ));
-        }
-        info!(node = %worker.name, "worker is ready");
     }
 
     let persisted_kubeconfig = state_root.join("kubeconfig.yaml");
@@ -353,7 +563,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     persist_kubeconfig(
         &control_plane.artifacts.kubeconfig,
         &persisted_kubeconfig,
-        spec.api_port,
+        &api_endpoint,
     )?;
     copy_artifact(
         &control_plane.artifacts.token,
@@ -363,14 +573,23 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     let state = ClusterState {
         name: spec.name.clone(),
+        backend: spec.backend,
         workspace_root: workspace_root.clone(),
         template: spec.template.clone(),
+        firecracker_kernel: spec.firecracker_kernel.clone(),
+        firecracker_rootfs: spec.firecracker_rootfs.clone(),
         api_port: spec.api_port,
         worker_count: spec.worker_count,
+        control_plane_resources: spec.control_plane_resources,
+        worker_resources: spec.worker_resources,
         enable_rosetta: spec.enable_rosetta,
         network: spec.network.clone(),
         k3s_version: spec.k3s_version.clone(),
+        cni_plugin: spec.cni_plugin,
+        cilium_version: spec.cilium_version.clone(),
+        addons: spec.addons.clone(),
         server_mode: spec.server_mode,
+        component_toggles: spec.component_toggles,
         kubeconfig_path: persisted_kubeconfig,
         token_path: persisted_token,
         nodes: std::iter::once(NodeState {
@@ -390,6 +609,14 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         "persisting cluster state"
     );
     state.save(&state_root)?;
+    if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
+        warn!(
+            error = %error,
+            state_root = %state_root.display(),
+            runtime_root = %runtime_root.display(),
+            "failed to hand off cluster files to invoking user"
+        );
+    }
     let cluster_ready = format_duration(cluster_started.elapsed());
     info!(
         cluster = %state.name,
@@ -406,22 +633,62 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     })
 }
 
-pub fn down(name: &str) -> Result<()> {
+pub fn down(name: &str, force: bool) -> Result<()> {
     let runner = SystemRunner;
-    down_with_runner(name, &runner)
+    down_with_runner(name, force, &runner)
 }
 
-pub fn down_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<()> {
-    info!(cluster = %name, "starting cluster teardown");
+pub fn destroy(name: &str) -> Result<()> {
+    let runner = SystemRunner;
+    destroy_with_runner(name, &runner)
+}
+
+pub fn scale(name: &str, workers: usize) -> Result<ScaleOutcome> {
+    let runner = SystemRunner;
+    scale_with_runner(name, workers, &runner)
+}
+
+pub fn install_addon(name: &str, addon: &str) -> Result<AddonInstallOutcome> {
+    let runner = SystemRunner;
+    install_addon_with_runner(name, addon, &runner)
+}
+
+pub fn down_with_runner(name: &str, force: bool, runner: &dyn CommandRunner) -> Result<()> {
+    info!(cluster = %name, force, "starting cluster teardown");
     let state_root = require_cluster_state_root(name)?;
-    down_at_root(&state_root, name, runner)
+    down_at_root(&state_root, name, force, runner)
 }
 
-fn down_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) -> Result<()> {
+fn down_at_root(
+    state_root: &Path,
+    name: &str,
+    force: bool,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
+    let state = ClusterState::load(state_root)?;
+    let backend = backend_for(state.backend);
+    stop_instances(backend, runner, &state.nodes, force);
+    info!(cluster = %name, force, state_root = %state_root.display(), "cluster stopped");
+    Ok(())
+}
+
+pub fn destroy_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<()> {
+    info!(cluster = %name, "starting cluster removal");
+    let state_root = require_cluster_state_root(name)?;
+    destroy_at_root(&state_root, name, runner)
+}
+
+fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) -> Result<()> {
     let state = ClusterState::load(state_root)?;
     let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
-    let instance_names: Vec<String> = state.nodes.iter().map(|node| node.name.clone()).collect();
-    cleanup_instances(runner, &instance_names);
+    let backend = backend_for(state.backend);
+    delete_instances(backend, runner, &state.nodes);
+    let instance_names = state
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<Vec<_>>();
+    backend.cleanup_cluster_network(runner, &instance_names)?;
     fs::remove_dir_all(state_root).map_err(io_error("remove_dir_all"))?;
     if runtime_root.exists() {
         fs::remove_dir_all(&runtime_root).map_err(io_error("remove_dir_all"))?;
@@ -435,9 +702,449 @@ pub fn status(name: &str) -> Result<ClusterStatus> {
     status_with_runner(name, &runner)
 }
 
+pub fn stats(name: &str) -> Result<ClusterStats> {
+    let runner = SystemRunner;
+    stats_with_runner(name, &runner)
+}
+
+pub fn logs(name: &str, node_name: &str) -> Result<NodeLogs> {
+    let state_root = require_cluster_state_root(name)?;
+    logs_at_root(&state_root, node_name)
+}
+
 pub fn list() -> Result<Vec<ClusterStatus>> {
     let runner = SystemRunner;
     list_with_runner(&runner)
+}
+
+fn logs_at_root(state_root: &Path, node_name: &str) -> Result<NodeLogs> {
+    let state = ClusterState::load(state_root)?;
+    let node = state
+        .nodes
+        .iter()
+        .find(|node| node.name == node_name)
+        .cloned()
+        .ok_or_else(|| {
+            Error::InvalidArgs(format!(
+                "node `{node_name}` is not defined in cluster `{}`",
+                state.name
+            ))
+        })?;
+    let sections = collect_node_log_sections(&node)?;
+
+    if sections.is_empty() {
+        return Err(Error::InvalidArgs(format!(
+            "no local log files found for node `{node_name}`"
+        )));
+    }
+
+    Ok(NodeLogs {
+        cluster: state.name,
+        node: node.name,
+        sections,
+    })
+}
+
+pub fn scale_with_runner(
+    name: &str,
+    workers: usize,
+    runner: &dyn CommandRunner,
+) -> Result<ScaleOutcome> {
+    let state_root = require_cluster_state_root(name)?;
+    scale_at_root(&state_root, name, workers, runner)
+}
+
+pub fn install_addon_with_runner(
+    name: &str,
+    addon: &str,
+    runner: &dyn CommandRunner,
+) -> Result<AddonInstallOutcome> {
+    let state_root = require_cluster_state_root(name)?;
+    install_addon_at_root(&state_root, name, addon, runner)
+}
+
+fn scale_at_root(
+    state_root: &Path,
+    name: &str,
+    workers: usize,
+    runner: &dyn CommandRunner,
+) -> Result<ScaleOutcome> {
+    let mut state = ClusterState::load(state_root)?;
+    let previous_workers = state.worker_count;
+    let scale_span = info_span!(
+        "cluster_scale",
+        cluster = %state.name,
+        backend = state.backend.as_str(),
+        current_workers = previous_workers,
+        requested_workers = workers
+    );
+    let _scale_guard = scale_span.enter();
+    info!("starting cluster scale");
+
+    if workers < state.worker_count {
+        return Err(Error::InvalidArgs(format!(
+            "scaling down is not implemented yet; current workers={}, requested workers={workers}",
+            state.worker_count
+        )));
+    }
+    if workers == state.worker_count {
+        info!("requested worker count already matches cluster state");
+        return Ok(ScaleOutcome {
+            name: state.name,
+            previous_workers: state.worker_count,
+            current_workers: state.worker_count,
+            added_workers: Vec::new(),
+        });
+    }
+
+    let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
+    let backend = backend_for(state.backend);
+    let control_plane_state = state
+        .nodes
+        .iter()
+        .find(|node| node.role == NodeRole::ControlPlane)
+        .cloned()
+        .ok_or_else(|| {
+            Error::InvalidArgs("cluster state is missing a control-plane node".to_owned())
+        })?;
+    let control_plane_status = backend.query_instance_status(
+        runner,
+        &control_plane_state.name,
+        &control_plane_state.artifacts_root,
+    )?;
+    info!(
+        control_plane = %control_plane_state.name,
+        status = %control_plane_status,
+        "resolved control-plane status for scale"
+    );
+    if !instance_status_is_running(&control_plane_status) {
+        return Err(Error::InvalidArgs(format!(
+            "control-plane `{}` is not running; start the cluster before scaling",
+            control_plane_state.name
+        )));
+    }
+
+    let control_plane = Instance::new(
+        control_plane_state.name.clone(),
+        NodeRole::ControlPlane,
+        control_plane_state.artifacts_root.clone(),
+    );
+    let control_plane_host =
+        backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root)?;
+    let control_plane_guest_artifacts =
+        backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
+    let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
+    let server_token = fs::read_to_string(&state.token_path)
+        .map_err(io_error("read_to_string"))?
+        .trim()
+        .to_owned();
+    let server_url = format!("https://{control_plane_host}:6443");
+    let k3s_config = K3sBootstrapConfig {
+        k3s_version: state.k3s_version.clone(),
+        server_mode: state.server_mode,
+        component_toggles: state.component_toggles,
+    };
+    let base_config = BackendConfig {
+        template: state.template.clone(),
+        workspace_root: state.workspace_root.clone(),
+        enable_rosetta: state.enable_rosetta,
+        network: state.network.clone(),
+        firecracker_kernel: state.firecracker_kernel.clone(),
+        firecracker_rootfs: state.firecracker_rootfs.clone(),
+        stream_vm_logs: false,
+    };
+
+    let new_workers: Vec<Instance> = (state.worker_count..workers)
+        .map(|index| {
+            let worker_name = format!("kalisto-{}-w{index}", state.name);
+            Instance::new(
+                worker_name.clone(),
+                NodeRole::Worker,
+                runtime_root.join(&worker_name),
+            )
+        })
+        .collect();
+
+    info!(
+        adding_workers = new_workers.len(),
+        worker_names = %new_workers
+            .iter()
+            .map(|worker| worker.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "planned worker scale-up"
+    );
+
+    let new_worker_names = new_workers
+        .iter()
+        .map(|worker| worker.name.clone())
+        .collect::<Vec<_>>();
+    backend.prepare_cluster_network(runner, &new_worker_names)?;
+
+    start_and_join_workers(
+        backend,
+        runner,
+        WorkerJoinContext {
+            base_config: &base_config,
+            k3s_config: &k3s_config,
+            control_plane: &control_plane,
+            control_plane_guest_kubeconfig: &control_plane_guest_kubeconfig,
+            worker_cpus: state.worker_resources.cpus,
+            worker_memory_gib: state.worker_resources.memory_gib,
+            server_url: &server_url,
+            server_token: &server_token,
+        },
+        &new_workers,
+        &mut state.nodes,
+        true,
+    )?;
+
+    let added_workers = new_workers
+        .iter()
+        .map(|worker| worker.name.clone())
+        .collect();
+    state.worker_count = workers;
+    state.save(state_root)?;
+    if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root) {
+        warn!(
+            error = %error,
+            state_root = %state_root.display(),
+            runtime_root = %runtime_root.display(),
+            "failed to hand off scaled cluster files to invoking user"
+        );
+    }
+
+    info!(
+        previous_workers,
+        current_workers = workers,
+        added_workers = %new_workers
+            .iter()
+            .map(|worker| worker.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "cluster scale completed"
+    );
+
+    Ok(ScaleOutcome {
+        name: state.name,
+        previous_workers,
+        current_workers: workers,
+        added_workers,
+    })
+}
+
+fn collect_node_log_sections(node: &NodeState) -> Result<Vec<NodeLogSection>> {
+    let candidates = [
+        ("k3s stdout", node.artifacts_root.join("k3s.stdout.log")),
+        ("k3s stderr", node.artifacts_root.join("k3s.stderr.log")),
+        (
+            "firecracker serial",
+            node.artifacts_root.join("firecracker.stdout.log"),
+        ),
+        (
+            "firecracker stderr",
+            node.artifacts_root.join("firecracker.stderr.log"),
+        ),
+    ];
+
+    let mut sections = Vec::new();
+    for (label, path) in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        sections.push(NodeLogSection {
+            label: label.to_owned(),
+            content: fs::read_to_string(&path).map_err(io_error("read_to_string"))?,
+            path,
+        });
+    }
+    Ok(sections)
+}
+
+fn install_addon_at_root(
+    state_root: &Path,
+    name: &str,
+    addon: &str,
+    runner: &dyn CommandRunner,
+) -> Result<AddonInstallOutcome> {
+    let addon_id = AddonId::parse(addon)
+        .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
+    let mut state = ClusterState::load(state_root)?;
+    let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
+    let backend = backend_for(state.backend);
+    let control_plane_state = state
+        .nodes
+        .iter()
+        .find(|node| node.role == NodeRole::ControlPlane)
+        .cloned()
+        .ok_or_else(|| {
+            Error::InvalidArgs("cluster state is missing a control-plane node".to_owned())
+        })?;
+    let control_plane_status = backend.query_instance_status(
+        runner,
+        &control_plane_state.name,
+        &control_plane_state.artifacts_root,
+    )?;
+    if !instance_status_is_running(&control_plane_status) {
+        return Err(Error::InvalidArgs(format!(
+            "control-plane `{}` is not running; start the cluster before installing add-ons",
+            control_plane_state.name
+        )));
+    }
+
+    let control_plane = Instance::new(
+        control_plane_state.name.clone(),
+        NodeRole::ControlPlane,
+        control_plane_state.artifacts_root.clone(),
+    );
+    let control_plane_guest_artifacts =
+        backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
+    let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
+
+    info!(
+        cluster = %state.name,
+        addon = addon_id.as_str(),
+        "installing cluster add-on"
+    );
+    let desired_state_changed = record_desired_addon_state(&mut state, addon_id);
+    let flannel_interface_present = if addon_id == AddonId::CniCilium {
+        backend
+            .guest_shell(
+                runner,
+                &control_plane.name,
+                &control_plane.artifacts.root,
+                "ip link show flannel.1 >/dev/null 2>&1",
+            )
+            .is_ok()
+    } else {
+        false
+    };
+    let recycle_required = should_recycle_cluster_for_addon(
+        addon_id,
+        desired_state_changed,
+        flannel_interface_present,
+    );
+    if desired_state_changed {
+        state.save(state_root)?;
+        if let Err(error) =
+            handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root)
+        {
+            warn!(
+                error = %error,
+                state_root = %state_root.display(),
+                runtime_root = %runtime_root.display(),
+                "failed to hand off cluster files to invoking user"
+            );
+        }
+    }
+
+    if recycle_required {
+        info!(
+            cluster = %state.name,
+            addon = addon_id.as_str(),
+            desired_state_changed,
+            flannel_interface_present,
+            "restarting cluster to apply add-on runtime changes"
+        );
+        down_at_root(state_root, name, false, runner)?;
+        up_with_runner(&cluster_spec_from_state(&state), runner)?;
+    }
+
+    install_catalog_addon_with_cilium_version(
+        backend,
+        runner,
+        &control_plane,
+        &control_plane_guest_kubeconfig,
+        addon_id.as_str(),
+        &state.cilium_version,
+    )?;
+
+    if desired_state_changed {
+        state.save(state_root)?;
+        if let Err(error) =
+            handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root)
+        {
+            warn!(
+                error = %error,
+                state_root = %state_root.display(),
+                runtime_root = %runtime_root.display(),
+                "failed to hand off cluster files to invoking user"
+            );
+        }
+    }
+
+    Ok(AddonInstallOutcome {
+        cluster: state.name,
+        addon: addon_id.as_str().to_owned(),
+    })
+}
+
+fn should_recycle_cluster_for_addon(
+    addon_id: AddonId,
+    desired_state_changed: bool,
+    flannel_interface_present: bool,
+) -> bool {
+    match addon_id {
+        AddonId::CniCilium => desired_state_changed || flannel_interface_present,
+        AddonId::CniFlannel => desired_state_changed,
+        AddonId::LbServiceLb => desired_state_changed,
+        _ => false,
+    }
+}
+
+fn record_desired_addon_state(state: &mut ClusterState, addon_id: AddonId) -> bool {
+    match addon_id {
+        AddonId::CniFlannel => {
+            let mut changed = false;
+            if state.cni_plugin != CniPlugin::Flannel {
+                state.cni_plugin = CniPlugin::Flannel;
+                changed = true;
+            }
+
+            let mut desired_toggles = state.component_toggles;
+            CniPlugin::Flannel.apply_component_defaults(&mut desired_toggles);
+            if state.component_toggles != desired_toggles {
+                state.component_toggles = desired_toggles;
+                changed = true;
+            }
+            changed
+        }
+        AddonId::CniCilium => {
+            let mut changed = false;
+            if state.cni_plugin != CniPlugin::Cilium {
+                state.cni_plugin = CniPlugin::Cilium;
+                changed = true;
+            }
+
+            let mut desired_toggles = state.component_toggles;
+            CniPlugin::Cilium.apply_component_defaults(&mut desired_toggles);
+            if state.component_toggles != desired_toggles {
+                state.component_toggles = desired_toggles;
+                changed = true;
+            }
+            changed
+        }
+        AddonId::LbServiceLb => {
+            if state.component_toggles.disable_servicelb {
+                state.component_toggles.disable_servicelb = false;
+                true
+            } else {
+                false
+            }
+        }
+        _ => {
+            if state
+                .addons
+                .iter()
+                .any(|installed| installed == addon_id.as_str())
+            {
+                false
+            } else {
+                state.addons.push(addon_id.as_str().to_owned());
+                true
+            }
+        }
+    }
 }
 
 pub fn status_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<ClusterStatus> {
@@ -451,13 +1158,15 @@ fn status_at_root(
     runner: &dyn CommandRunner,
 ) -> Result<ClusterStatus> {
     let state = ClusterState::load(state_root)?;
+    let backend = backend_for(state.backend);
     let mut nodes = Vec::with_capacity(state.nodes.len());
     for node in &state.nodes {
-        let lima_status = query_instance_status(runner, &node.name)?;
+        let backend_status =
+            backend.query_instance_status(runner, &node.name, &node.artifacts_root)?;
         nodes.push(NodeStatus {
             name: node.name.clone(),
             role: node.role,
-            lima_status,
+            backend_status,
         });
     }
     info!(cluster = %name, nodes = nodes.len(), "loaded cluster status");
@@ -472,6 +1181,49 @@ fn status_at_root(
 pub fn list_with_runner(runner: &dyn CommandRunner) -> Result<Vec<ClusterStatus>> {
     let clusters_root = ClusterSpec::clusters_root_for()?;
     list_at_root(&clusters_root, runner)
+}
+
+pub fn stats_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<ClusterStats> {
+    let state_root = require_cluster_state_root(name)?;
+    let state = ClusterState::load(&state_root)?;
+    let backend = backend_for(state.backend);
+    let mut nodes = Vec::with_capacity(state.nodes.len());
+    for node in &state.nodes {
+        let backend_status =
+            backend.query_instance_status(runner, &node.name, &node.artifacts_root)?;
+        let (configured_cpus, configured_memory_gib) = match node.role {
+            NodeRole::ControlPlane => (
+                state.control_plane_resources.cpus,
+                state.control_plane_resources.memory_gib,
+            ),
+            NodeRole::Worker => (
+                state.worker_resources.cpus,
+                state.worker_resources.memory_gib,
+            ),
+        };
+        let host_metrics = load_host_node_metrics(runner, state.backend, &node.artifacts_root);
+        nodes.push(NodeStats {
+            name: node.name.clone(),
+            role: node.role,
+            backend_status,
+            configured_cpus,
+            configured_memory_gib,
+            pid: host_metrics.pid,
+            guest_ip: host_metrics.guest_ip,
+            rss_bytes: host_metrics.rss_bytes,
+            vsz_bytes: host_metrics.vsz_bytes,
+            rootfs_bytes: host_metrics.rootfs_bytes,
+            rx_bytes: host_metrics.rx_bytes,
+            tx_bytes: host_metrics.tx_bytes,
+        });
+    }
+
+    Ok(ClusterStats {
+        name: state.name,
+        state_root,
+        kubeconfig_path: state.kubeconfig_path,
+        nodes,
+    })
 }
 
 fn list_at_root(clusters_root: &Path, runner: &dyn CommandRunner) -> Result<Vec<ClusterStatus>> {
@@ -493,13 +1245,15 @@ fn list_at_root(clusters_root: &Path, runner: &dyn CommandRunner) -> Result<Vec<
     let mut clusters = Vec::with_capacity(cluster_roots.len());
     for state_root in cluster_roots {
         let state = ClusterState::load(&state_root)?;
+        let backend = backend_for(state.backend);
         let mut nodes = Vec::with_capacity(state.nodes.len());
         for node in &state.nodes {
-            let lima_status = query_instance_status(runner, &node.name)?;
+            let backend_status =
+                backend.query_instance_status(runner, &node.name, &node.artifacts_root)?;
             nodes.push(NodeStatus {
                 name: node.name.clone(),
                 role: node.role,
-                lima_status,
+                backend_status,
             });
         }
         clusters.push(ClusterStatus {
@@ -523,6 +1277,112 @@ pub fn kubeconfig_path(name: &str) -> Result<std::path::PathBuf> {
         "resolved kubeconfig path"
     );
     Ok(kubeconfig_path)
+}
+
+#[derive(Debug, Default)]
+struct HostNodeMetrics {
+    pid: Option<u32>,
+    guest_ip: Option<String>,
+    rss_bytes: Option<u64>,
+    vsz_bytes: Option<u64>,
+    rootfs_bytes: Option<u64>,
+    rx_bytes: Option<u64>,
+    tx_bytes: Option<u64>,
+}
+
+fn load_host_node_metrics(
+    runner: &dyn CommandRunner,
+    backend: BackendKind,
+    artifacts_root: &Path,
+) -> HostNodeMetrics {
+    match backend {
+        BackendKind::Firecracker => load_firecracker_host_metrics(runner, artifacts_root),
+        BackendKind::Lima => HostNodeMetrics::default(),
+    }
+}
+
+fn load_firecracker_host_metrics(
+    runner: &dyn CommandRunner,
+    artifacts_root: &Path,
+) -> HostNodeMetrics {
+    let pid = read_optional_u32(&artifacts_root.join("firecracker.pid"));
+    let guest_ip = read_optional_trimmed(&artifacts_root.join("guest-ip"));
+    let tap_name = read_optional_trimmed(&artifacts_root.join("tap-name"));
+    let rootfs_bytes = fs::metadata(artifacts_root.join("rootfs.raw"))
+        .ok()
+        .map(|metadata| metadata.len());
+    let (rss_bytes, vsz_bytes) = pid
+        .and_then(|pid| read_process_memory_bytes(runner, pid).ok())
+        .unwrap_or((None, None));
+    let (rx_bytes, tx_bytes) = tap_name
+        .as_deref()
+        .map(read_tap_bytes)
+        .unwrap_or((None, None));
+
+    HostNodeMetrics {
+        pid,
+        guest_ip,
+        rss_bytes,
+        vsz_bytes,
+        rootfs_bytes,
+        rx_bytes,
+        tx_bytes,
+    }
+}
+
+fn read_process_memory_bytes(
+    runner: &dyn CommandRunner,
+    pid: u32,
+) -> Result<(Option<u64>, Option<u64>)> {
+    let output = runner.run(
+        "ps",
+        &[
+            "-o".to_owned(),
+            "rss=,vsz=".to_owned(),
+            "-p".to_owned(),
+            pid.to_string(),
+        ],
+    )?;
+    let Some(line) = output.stdout.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok((None, None));
+    };
+    let mut parts = line.split_whitespace();
+    let rss_bytes = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value * 1024);
+    let vsz_bytes = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value * 1024);
+    Ok((rss_bytes, vsz_bytes))
+}
+
+fn read_tap_bytes(tap_name: &str) -> (Option<u64>, Option<u64>) {
+    let statistics_root = Path::new("/sys/class/net")
+        .join(tap_name)
+        .join("statistics");
+    let rx_bytes = read_optional_u64(&statistics_root.join("rx_bytes"));
+    let tx_bytes = read_optional_u64(&statistics_root.join("tx_bytes"));
+    (rx_bytes, tx_bytes)
+}
+
+fn read_optional_trimmed(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn read_optional_u32(path: &Path) -> Option<u32> {
+    read_optional_trimmed(path)?.parse::<u32>().ok()
+}
+
+fn read_optional_u64(path: &Path) -> Option<u64> {
+    read_optional_trimmed(path)?.parse::<u64>().ok()
 }
 
 pub fn benchmark(spec: &ClusterSpec, runs: usize) -> Result<Vec<BenchmarkSample>> {
@@ -553,6 +1413,7 @@ pub fn benchmark_with_runner(
             "starting benchmark run"
         );
 
+        create_with_runner(&run_spec, runner)?;
         let outcome = up_with_runner(&run_spec, runner)?;
         samples.push(BenchmarkSample {
             run: run + 1,
@@ -560,7 +1421,8 @@ pub fn benchmark_with_runner(
             control_plane_ready: outcome.control_plane_ready,
             cluster_ready: outcome.cluster_ready,
         });
-        down_with_runner(&run_name, runner)?;
+        down_with_runner(&run_name, false, runner)?;
+        destroy_with_runner(&run_name, runner)?;
         if let Some(sample) = samples.last() {
             info!(
                 benchmark_run = sample.run,
@@ -575,59 +1437,219 @@ pub fn benchmark_with_runner(
     Ok(samples)
 }
 
-fn k3s_config_from_spec(
-    spec: &ClusterSpec,
-    workspace_root: &std::path::Path,
-) -> crate::lima_k3s::config::Config {
-    crate::lima_k3s::config::Config {
-        template: spec.template.clone(),
-        workspace_root: workspace_root.to_path_buf(),
-        api_port: spec.api_port,
-        keep_resources: false,
-        k3s_version: spec.k3s_version.clone(),
-        server_mode: spec.server_mode,
-        component_toggles: spec.component_toggles,
-        enable_rosetta: spec.enable_rosetta,
-        worker_count: spec.worker_count,
-        network: Some(spec.network.clone()),
+fn cleanup_instances(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    nodes: &[NodeState],
+) {
+    delete_instances(backend, runner, nodes);
+}
+
+fn stop_instances(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    nodes: &[NodeState],
+    force: bool,
+) {
+    for node in nodes.iter().rev() {
+        info!(
+            backend = backend.kind().as_str(),
+            instance = %node.name,
+            force,
+            "stopping backend instance"
+        );
+        let _ = backend.stop_instance(runner, &node.name, &node.artifacts_root, force);
     }
 }
 
-fn cleanup_instances(runner: &dyn CommandRunner, instance_names: &[String]) {
-    for instance_name in instance_names.iter().rev() {
-        info!(instance = %instance_name, "cleaning up lima instance");
-        let _ = stop_and_delete_instance(runner, instance_name);
+fn delete_instances(backend: &dyn ClusterBackend, runner: &dyn CommandRunner, nodes: &[NodeState]) {
+    for node in nodes.iter().rev() {
+        info!(
+            backend = backend.kind().as_str(),
+            instance = %node.name,
+            "cleaning up backend instance"
+        );
+        let _ = backend.delete_instance(runner, &node.name, &node.artifacts_root);
+    }
+}
+
+fn start_and_join_workers(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    context: WorkerJoinContext<'_>,
+    worker_instances: &[Instance],
+    instances: &mut Vec<NodeState>,
+    wait_for_ready: bool,
+) -> Result<()> {
+    let started_workers = start_worker_instances(
+        backend,
+        runner,
+        context.base_config,
+        worker_instances,
+        context.worker_cpus,
+        context.worker_memory_gib,
+        instances,
+    )
+    .map_err(|error| Error::InvalidArgs(error.detail))?;
+
+    for started_worker in started_workers {
+        let worker = started_worker.node;
+        info!(node = %worker.name, "bootstrapping worker");
+        bootstrap_worker(
+            backend,
+            runner,
+            context.k3s_config,
+            &worker,
+            JoinConfig {
+                server_url: context.server_url,
+                token: context.server_token,
+            },
+        )?;
+        info!(node = %worker.name, "waiting for worker process");
+        wait_for_worker_process(backend, runner, &worker.name, &worker.artifacts.root)?;
+        if wait_for_ready {
+            info!(node = %worker.name, "waiting for worker readiness");
+            wait_for_node_ready(
+                backend,
+                runner,
+                &context.control_plane.name,
+                &context.control_plane.artifacts.root,
+                context.control_plane_guest_kubeconfig,
+                &worker.name,
+            )?;
+            info!(
+                node = %worker.name,
+                ready_after = %format_duration(started_worker.boot_started.elapsed()),
+                "worker is ready"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn instance_status_is_running(status: &str) -> bool {
+    status.split_whitespace().any(|token| token == "Running")
+}
+
+fn cluster_has_running_nodes(runner: &dyn CommandRunner, state: &ClusterState) -> Result<bool> {
+    let backend = backend_for(state.backend);
+    for node in &state.nodes {
+        let status = backend.query_instance_status(runner, &node.name, &node.artifacts_root)?;
+        if instance_status_is_running(&status) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cluster_spec_from_state(state: &ClusterState) -> ClusterSpec {
+    ClusterSpec {
+        name: state.name.clone(),
+        backend: state.backend,
+        workspace_root: state.workspace_root.clone(),
+        template: state.template.clone(),
+        firecracker_kernel: state.firecracker_kernel.clone(),
+        firecracker_rootfs: state.firecracker_rootfs.clone(),
+        api_port: state.api_port,
+        worker_count: state.worker_count,
+        control_plane_resources: state.control_plane_resources,
+        worker_resources: state.worker_resources,
+        enable_rosetta: state.enable_rosetta,
+        network: state.network.clone(),
+        k3s_version: state.k3s_version.clone(),
+        cni_plugin: state.cni_plugin,
+        cilium_version: state.cilium_version.clone(),
+        addons: state.addons.clone(),
+        server_mode: state.server_mode,
+        component_toggles: state.component_toggles,
+        keep_failed_runtime: false,
+        stream_vm_logs: false,
+    }
+}
+
+fn cluster_state_from_spec(
+    spec: &ClusterSpec,
+    workspace_root: std::path::PathBuf,
+    state_root: &Path,
+) -> ClusterState {
+    let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+    let control_plane_name = spec.control_plane_name();
+    let mut nodes = Vec::with_capacity(spec.worker_count + 1);
+    nodes.push(NodeState {
+        name: control_plane_name,
+        role: NodeRole::ControlPlane,
+        artifacts_root: runtime_root.join("control-plane"),
+    });
+    for index in 0..spec.worker_count {
+        let name = format!("kalisto-{}-w{index}", spec.name);
+        nodes.push(NodeState {
+            name: name.clone(),
+            role: NodeRole::Worker,
+            artifacts_root: runtime_root.join(&name),
+        });
+    }
+
+    ClusterState {
+        name: spec.name.clone(),
+        backend: spec.backend,
+        workspace_root,
+        template: spec.template.clone(),
+        firecracker_kernel: spec.firecracker_kernel.clone(),
+        firecracker_rootfs: spec.firecracker_rootfs.clone(),
+        api_port: spec.api_port,
+        worker_count: spec.worker_count,
+        control_plane_resources: spec.control_plane_resources,
+        worker_resources: spec.worker_resources,
+        enable_rosetta: spec.enable_rosetta,
+        network: spec.network.clone(),
+        k3s_version: spec.k3s_version.clone(),
+        cni_plugin: spec.cni_plugin,
+        cilium_version: spec.cilium_version.clone(),
+        addons: spec.addons.clone(),
+        server_mode: spec.server_mode,
+        component_toggles: spec.component_toggles,
+        kubeconfig_path: state_root.join("kubeconfig.yaml"),
+        token_path: state_root.join("node-token"),
+        nodes,
     }
 }
 
 fn rollback_failed_up(
+    backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
-    started_instances: &[String],
+    started_instances: &[NodeState],
     state_root: &Path,
     runtime_root: &Path,
+    keep_failed_runtime: bool,
     error: Error,
 ) -> Error {
-    warn!(
-        state_root = %state_root.display(),
-        runtime_root = %runtime_root.display(),
-        error = %error,
-        "cluster bring-up failed; cleaning up partial state"
-    );
-    cleanup_instances(runner, started_instances);
-    if let Err(cleanup_error) = fs::remove_dir_all(state_root) {
+    if let Err(chown_error) =
+        handoff_cluster_paths_to_invoking_user(runner, state_root, runtime_root)
+    {
+        warn!(
+            error = %chown_error,
+            state_root = %state_root.display(),
+            runtime_root = %runtime_root.display(),
+            "failed to hand off preserved failed cluster files to invoking user"
+        );
+    }
+    if keep_failed_runtime {
         warn!(
             state_root = %state_root.display(),
-            error = %cleanup_error,
-            "failed to remove partial cluster state"
-        );
-    }
-    if let Err(cleanup_error) = fs::remove_dir_all(runtime_root) {
-        warn!(
             runtime_root = %runtime_root.display(),
-            error = %cleanup_error,
-            "failed to remove partial cluster runtime artifacts"
+            error = %error,
+            "cluster bring-up failed; preserving runtime artifacts"
+        );
+    } else {
+        warn!(
+            state_root = %state_root.display(),
+            runtime_root = %runtime_root.display(),
+            error = %error,
+            "cluster bring-up failed; preserving cluster definition"
         );
     }
+    cleanup_instances(backend, runner, started_instances);
     error
 }
 
@@ -645,32 +1667,90 @@ fn copy_artifact(source: &Path, destination: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn persist_kubeconfig(source: &Path, destination: &Path, api_port: u16) -> Result<()> {
+fn handoff_cluster_paths_to_invoking_user(
+    runner: &dyn CommandRunner,
+    state_root: &Path,
+    runtime_root: &Path,
+) -> Result<()> {
+    let Some((uid, gid)) = sudo_invoking_user_ids() else {
+        return Ok(());
+    };
+
+    for path in [state_root, runtime_root] {
+        if !path.exists() {
+            continue;
+        }
+        runner.run(
+            "chown",
+            &[
+                "-R".to_owned(),
+                format!("{uid}:{gid}"),
+                path.display().to_string(),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn sudo_invoking_user_ids() -> Option<(u32, u32)> {
+    let uid = std::env::var("SUDO_UID").ok()?.parse::<u32>().ok()?;
+    let gid = std::env::var("SUDO_GID").ok()?.parse::<u32>().ok()?;
+    Some((uid, gid))
+}
+
+fn sync_control_plane_artifact(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    guest_path: &Path,
+    host_path: &Path,
+    timeout: Duration,
+    tail: &mut LiveLogTail,
+) -> Result<()> {
+    match backend.kind() {
+        BackendKind::Lima => wait_for_path_with_tail(host_path, timeout, tail),
+        BackendKind::Firecracker => wait_for_guest_text_file_copy(
+            backend,
+            runner,
+            GuestFileCopy {
+                instance_name: &control_plane.name,
+                runtime_root: &control_plane.artifacts.root,
+                guest_path,
+                host_path,
+                timeout,
+            },
+            tail,
+        ),
+    }
+}
+
+fn persist_kubeconfig(source: &Path, destination: &Path, api_endpoint: &str) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(io_error("create_dir_all"))?;
     }
 
     let kubeconfig = fs::read_to_string(source).map_err(io_error("read_to_string"))?;
-    let rewritten = rewrite_kubeconfig_server(&kubeconfig, api_port)?;
+    let rewritten = rewrite_kubeconfig_server(&kubeconfig, api_endpoint)?;
     fs::write(destination, rewritten).map_err(io_error("write"))?;
     info!(
         artifact = "kubeconfig",
         source = %source.display(),
         destination = %destination.display(),
-        api_port,
+        api_endpoint,
         "copied cluster artifact into persisted state"
     );
     Ok(())
 }
 
-fn rewrite_kubeconfig_server(kubeconfig: &str, api_port: u16) -> Result<String> {
+fn rewrite_kubeconfig_server(kubeconfig: &str, api_endpoint: &str) -> Result<String> {
     let mut found_server = false;
     let rewritten = kubeconfig
         .lines()
         .map(|line| {
             if line.trim_start().starts_with("server: ") {
                 found_server = true;
-                format!("    server: https://127.0.0.1:{api_port}")
+                format!("    server: https://{api_endpoint}")
             } else {
                 line.to_owned()
             }
@@ -685,6 +1765,25 @@ fn rewrite_kubeconfig_server(kubeconfig: &str, api_port: u16) -> Result<String> 
     }
 
     Ok(rewritten)
+}
+
+fn tls_sans_for_control_plane(control_plane_host: &str, api_endpoint: &str) -> Vec<String> {
+    let mut tls_sans = vec!["127.0.0.1".to_owned()];
+    let api_host = endpoint_host(api_endpoint);
+    if control_plane_host != "127.0.0.1" {
+        tls_sans.push(control_plane_host.to_owned());
+    }
+    if api_host != "127.0.0.1" && api_host != control_plane_host {
+        tls_sans.push(api_host);
+    }
+    tls_sans
+}
+
+fn endpoint_host(api_endpoint: &str) -> String {
+    api_endpoint
+        .rsplit_once(':')
+        .map(|(host, _)| host.to_owned())
+        .unwrap_or_else(|| api_endpoint.to_owned())
 }
 
 fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
@@ -706,27 +1805,27 @@ fn io_error(program: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     }
 }
 
-fn report_error(report: crate::lima_k3s::report::Report) -> Error {
-    Error::InvalidArgs(
-        report
-            .results
-            .last()
-            .map(|result| result.detail.clone())
-            .unwrap_or_else(|| "unknown worker startup failure".to_owned()),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
 
+    use crate::backend::BackendKind;
+    use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION};
+    use crate::cluster::spec::NodeResources;
     use crate::cluster::state::{ClusterState, NodeState};
     use crate::error::Error;
-    use crate::k3s::{NodeRole, ServerMode};
+    use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
     use crate::process::{CommandRunner, Output};
 
-    use super::{down_at_root, list_at_root};
+    use super::{
+        down_at_root, list_at_root, logs_at_root, record_desired_addon_state, scale_at_root,
+        should_recycle_cluster_for_addon,
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Default)]
     struct FakeRunner {
@@ -807,7 +1906,7 @@ mod tests {
         assert_eq!(clusters[0].name, "alpha");
         assert_eq!(clusters[0].nodes.len(), 2);
         assert_eq!(
-            clusters[0].nodes[0].lima_status,
+            clusters[0].nodes[0].backend_status,
             "kalisto-alpha-cp Running vz"
         );
         assert_eq!(clusters[1].name, "beta");
@@ -831,26 +1930,283 @@ mod tests {
         );
 
         let runner = FakeRunner::default();
-        down_at_root(&state_root, "dev", &runner).unwrap();
-        assert!(!state_root.exists());
+        down_at_root(&state_root, "dev", false, &runner).unwrap();
+        assert!(state_root.exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scale_with_runner_adds_workers_and_persists_state() {
+        let root = std::env::temp_dir().join(format!("kalisto-scale-{}", std::process::id()));
+        let workspace_root = root.join("workspace");
+        let state_root = workspace_root.join(".kalisto").join("clusters").join("dev");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![
+                ("kalisto-dev-cp", NodeRole::ControlPlane),
+                ("kalisto-dev-w0", NodeRole::Worker),
+            ],
+        );
+        fs::write(state_root.join("node-token"), "secret\n").unwrap();
+
+        let runner = FakeRunner::with_statuses([("kalisto-dev-cp", "Running")]);
+        let outcome = scale_at_root(&state_root, "dev", 2, &runner).unwrap();
+        assert_eq!(outcome.previous_workers, 1);
+        assert_eq!(outcome.current_workers, 2);
+        assert_eq!(outcome.added_workers, vec!["kalisto-dev-w1".to_owned()]);
+
+        let loaded = ClusterState::load(&state_root).unwrap();
+        assert_eq!(loaded.worker_count, 2);
+        assert_eq!(loaded.nodes.len(), 3);
+        assert!(
+            loaded
+                .nodes
+                .iter()
+                .any(|node| node.name == "kalisto-dev-w1")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_desired_cilium_state_updates_cluster_networking_mode() {
+        let root = std::env::temp_dir().join(format!("kalisto-addon-state-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(state.cni_plugin, CniPlugin::Flannel);
+        assert!(!state.component_toggles.flannel_backend_none);
+
+        assert!(record_desired_addon_state(&mut state, AddonId::CniCilium));
+        assert_eq!(state.cni_plugin, CniPlugin::Cilium);
+        assert!(state.component_toggles.flannel_backend_none);
+        assert!(!state.component_toggles.disable_coredns);
+        assert!(state.component_toggles.disable_network_policy);
+        assert!(state.addons.is_empty());
+    }
+
+    #[test]
+    fn record_desired_storage_addon_persists_once() {
+        let root = std::env::temp_dir().join(format!("kalisto-addon-list-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        assert!(record_desired_addon_state(
+            &mut state,
+            AddonId::StorageLocalPath
+        ));
+        assert_eq!(state.addons, vec!["storage/local-path".to_owned()]);
+        assert!(!record_desired_addon_state(
+            &mut state,
+            AddonId::StorageLocalPath
+        ));
+        assert_eq!(state.addons, vec!["storage/local-path".to_owned()]);
+    }
+
+    #[test]
+    fn lb_servicelb_enables_k3s_servicelb_without_mutating_addon_catalog() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-servicelb-state-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        assert!(state.component_toggles.disable_servicelb);
+        assert!(state.addons.is_empty());
+
+        assert!(record_desired_addon_state(&mut state, AddonId::LbServiceLb));
+        assert!(!state.component_toggles.disable_servicelb);
+        assert!(state.addons.is_empty());
+        assert!(!record_desired_addon_state(
+            &mut state,
+            AddonId::LbServiceLb
+        ));
+    }
+
+    #[test]
+    fn addon_recycle_rules_match_runtime_requirements() {
+        assert!(should_recycle_cluster_for_addon(
+            AddonId::CniCilium,
+            true,
+            false
+        ));
+        assert!(should_recycle_cluster_for_addon(
+            AddonId::CniCilium,
+            false,
+            true
+        ));
+        assert!(!should_recycle_cluster_for_addon(
+            AddonId::CniCilium,
+            false,
+            false
+        ));
+        assert!(should_recycle_cluster_for_addon(
+            AddonId::CniFlannel,
+            true,
+            false
+        ));
+        assert!(!should_recycle_cluster_for_addon(
+            AddonId::CniFlannel,
+            false,
+            true
+        ));
+        assert!(should_recycle_cluster_for_addon(
+            AddonId::LbServiceLb,
+            true,
+            false
+        ));
+        assert!(!should_recycle_cluster_for_addon(
+            AddonId::LbServiceLb,
+            false,
+            true
+        ));
+        assert!(!should_recycle_cluster_for_addon(
+            AddonId::StorageLocalPath,
+            true,
+            true
+        ));
+        assert!(!should_recycle_cluster_for_addon(
+            AddonId::IngressTraefik,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn logs_returns_local_node_log_sections() {
+        let root = std::env::temp_dir().join(format!("kalisto-logs-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        let node_root = state_root.join("kalisto-dev-cp");
+        fs::create_dir_all(&node_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+        fs::write(node_root.join("k3s.stdout.log"), "server up\n").unwrap();
+        fs::write(node_root.join("firecracker.stdout.log"), "boot log\n").unwrap();
+
+        let logs = logs_at_root(&state_root, "kalisto-dev-cp").unwrap();
+        assert_eq!(logs.cluster, "dev");
+        assert_eq!(logs.node, "kalisto-dev-cp");
+        assert_eq!(logs.sections.len(), 2);
+        assert_eq!(logs.sections[0].label, "k3s stdout");
+        assert_eq!(logs.sections[0].content, "server up\n");
+        assert_eq!(logs.sections[1].label, "firecracker serial");
+        assert_eq!(logs.sections[1].content, "boot log\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_cluster_paths_to_invoking_user_runs_recursive_chown_under_sudo() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_sudo_uid = std::env::var_os("SUDO_UID");
+        let original_sudo_gid = std::env::var_os("SUDO_GID");
+        let root = std::env::temp_dir().join(format!("kalisto-handoff-{}", std::process::id()));
+        let state_root = root.join("state");
+        let runtime_root = root.join("runtime");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&runtime_root).unwrap();
+
+        unsafe {
+            std::env::set_var("SUDO_UID", "1000");
+            std::env::set_var("SUDO_GID", "1001");
+        }
+
+        let runner = FakeRunner::default();
+        super::handoff_cluster_paths_to_invoking_user(&runner, &state_root, &runtime_root).unwrap();
+
+        let invocations = runner.invocations.lock().unwrap().clone();
+        assert_eq!(
+            invocations,
+            vec![
+                chown_invocation("1000:1001", &state_root),
+                chown_invocation("1000:1001", &runtime_root),
+            ]
+        );
+
+        restore_env("SUDO_UID", original_sudo_uid);
+        restore_env("SUDO_GID", original_sudo_gid);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_cluster_paths_to_invoking_user_is_noop_without_sudo_ids() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_sudo_uid = std::env::var_os("SUDO_UID");
+        let original_sudo_gid = std::env::var_os("SUDO_GID");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-handoff-noop-{}", std::process::id()));
+        let state_root = root.join("state");
+        let runtime_root = root.join("runtime");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&runtime_root).unwrap();
+
+        unsafe {
+            std::env::remove_var("SUDO_UID");
+            std::env::remove_var("SUDO_GID");
+        }
+
+        let runner = FakeRunner::default();
+        super::handoff_cluster_paths_to_invoking_user(&runner, &state_root, &runtime_root).unwrap();
+
+        assert!(runner.invocations.lock().unwrap().is_empty());
+
+        restore_env("SUDO_UID", original_sudo_uid);
+        restore_env("SUDO_GID", original_sudo_gid);
         let _ = fs::remove_dir_all(root);
     }
 
     fn save_state(root: &std::path::Path, name: &str, nodes: Vec<(&str, NodeRole)>) {
         let state = ClusterState {
             name: name.to_owned(),
+            backend: BackendKind::Lima,
             workspace_root: root.ancestors().nth(3).unwrap().to_path_buf(),
             template: "template://default".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
             api_port: 16443,
             worker_count: nodes
                 .iter()
                 .filter(|(_, role)| *role == NodeRole::Worker)
                 .count(),
+            control_plane_resources: NodeResources {
+                cpus: 4,
+                memory_gib: 6,
+            },
+            worker_resources: NodeResources {
+                cpus: 2,
+                memory_gib: 4,
+            },
             enable_rosetta: true,
             network: "lima:user-v2".to_owned(),
             k3s_version: "v1.33.5+k3s1".to_owned(),
+            cni_plugin: CniPlugin::Flannel,
+            cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
+            addons: Vec::new(),
             server_mode: ServerMode::Standard,
+            component_toggles: ComponentToggles::default(),
             kubeconfig_path: root.join("kubeconfig.yaml"),
             token_path: root.join("node-token"),
             nodes: nodes
@@ -894,7 +2250,7 @@ mod tests {
         let clusters_root = workspace_root.join(".kalisto").join("clusters");
         let error = list_at_root(&clusters_root, &runner).unwrap_err();
         match error {
-            Error::InvalidArgs(message) => assert!(message.contains("missing workspace_root")),
+            Error::InvalidArgs(message) => assert!(message.contains("missing backend")),
             other => panic!("unexpected error: {other}"),
         }
 
@@ -912,19 +2268,47 @@ clusters:
   name: default
 ";
 
-        let rewritten = super::rewrite_kubeconfig_server(kubeconfig, 16443).unwrap();
+        let rewritten = super::rewrite_kubeconfig_server(kubeconfig, "127.0.0.1:16443").unwrap();
         assert!(rewritten.contains("server: https://127.0.0.1:16443"));
         assert!(!rewritten.contains("server: https://127.0.0.1:6443"));
     }
 
     #[test]
     fn rewrite_kubeconfig_server_requires_server_line() {
-        let error = super::rewrite_kubeconfig_server("apiVersion: v1\n", 16443).unwrap_err();
+        let error =
+            super::rewrite_kubeconfig_server("apiVersion: v1\n", "127.0.0.1:16443").unwrap_err();
         match error {
             Error::InvalidArgs(message) => {
                 assert!(message.contains("did not contain a server endpoint"))
             }
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn control_plane_tls_sans_include_join_and_api_hosts_once() {
+        let tls_sans = super::tls_sans_for_control_plane("172.31.2.10", "172.31.2.10:6443");
+        assert_eq!(
+            tls_sans,
+            vec!["127.0.0.1".to_owned(), "172.31.2.10".to_owned()]
+        );
+    }
+
+    fn chown_invocation(owner: &str, path: &Path) -> (String, Vec<String>) {
+        (
+            "chown".to_owned(),
+            vec![
+                "-R".to_owned(),
+                owner.to_owned(),
+                path.display().to_string(),
+            ],
+        )
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
         }
     }
 }
