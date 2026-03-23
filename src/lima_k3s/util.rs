@@ -108,7 +108,7 @@ mod tests {
         let exports = ComponentToggles::default().export_commands().join("; ");
         assert!(exports.contains("export KALISTO_K3S_DISABLE_TRAEFIK=1"));
         assert!(exports.contains("export KALISTO_K3S_DISABLE_LOCAL_STORAGE=1"));
-        assert!(exports.contains("export KALISTO_K3S_DISABLE_COREDNS=1"));
+        assert!(exports.contains("export KALISTO_K3S_DISABLE_COREDNS=0"));
         assert!(exports.contains("export KALISTO_K3S_DISABLE_NETWORK_POLICY=1"));
         assert!(exports.contains("export KALISTO_K3S_DISABLE_KUBE_PROXY=0"));
         assert!(exports.contains("export KALISTO_K3S_FLANNEL_BACKEND_NONE=0"));

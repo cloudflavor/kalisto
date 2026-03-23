@@ -2,10 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::backend::lima::{
-    Config as LimaConfig, InstanceConfig, guest_shell, guest_sudo_shell, shell_escape,
-    start_instance,
-};
+use crate::backend::lima::{guest_shell, guest_sudo_shell, shell_escape, start_instance};
+use crate::backend::{BackendConfig, InstanceConfig};
 use crate::error::Result;
 use crate::k3s::{BootstrapSpec, NodeRole, ServerMode};
 use crate::process::{CommandRunner, Output};
@@ -83,7 +81,7 @@ pub fn build_worker_instances(
 
 pub fn start_node_instance(
     runner: &dyn CommandRunner,
-    base_config: &LimaConfig,
+    base_config: &BackendConfig,
     node: &Instance,
     _workspace_root: &Path,
     host_api_port: Option<u16>,
@@ -95,6 +93,7 @@ pub fn start_node_instance(
         base_config,
         &InstanceConfig {
             name: node.name.clone(),
+            runtime_root: node.artifacts.root.clone(),
             host_port_forward: host_api_port,
             cpus,
             memory_gib,
@@ -142,7 +141,7 @@ pub fn bootstrap_worker(
 
 pub fn start_worker_instances(
     runner: &dyn CommandRunner,
-    base_config: &LimaConfig,
+    base_config: &BackendConfig,
     workspace_root: &Path,
     workers: &[Instance],
     instances: &mut Vec<String>,
@@ -237,6 +236,7 @@ fn build_bootstrap_command(
         server_mode,
         component_toggles: config.component_toggles,
         use_systemd: false,
+        tls_sans: Vec::new(),
         server_url: server_url.map(ToOwned::to_owned),
         token: token.map(ToOwned::to_owned),
     };

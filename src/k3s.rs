@@ -46,7 +46,7 @@ impl Default for ComponentToggles {
             disable_servicelb: true,
             disable_metrics_server: true,
             disable_local_storage: true,
-            disable_coredns: true,
+            disable_coredns: false,
             disable_network_policy: true,
             disable_kube_proxy: false,
             flannel_backend_none: false,
@@ -91,6 +91,7 @@ pub struct BootstrapSpec {
     pub server_mode: ServerMode,
     pub component_toggles: ComponentToggles,
     pub use_systemd: bool,
+    pub tls_sans: Vec<String>,
     pub server_url: Option<String>,
     pub token: Option<String>,
 }
@@ -123,6 +124,12 @@ impl BootstrapSpec {
             ),
         ];
         commands.extend(self.component_toggles.export_commands());
+        if !self.tls_sans.is_empty() {
+            commands.push(format!(
+                "export KALISTO_K3S_TLS_SANS={}",
+                escape(&self.tls_sans.join(","))
+            ));
+        }
 
         if let Some(server_url) = &self.server_url {
             commands.push(format!(
@@ -154,7 +161,7 @@ mod tests {
         assert!(toggles.disable_servicelb);
         assert!(toggles.disable_metrics_server);
         assert!(toggles.disable_local_storage);
-        assert!(toggles.disable_coredns);
+        assert!(!toggles.disable_coredns);
         assert!(toggles.disable_network_policy);
         assert!(!toggles.disable_kube_proxy);
         assert!(!toggles.flannel_backend_none);
@@ -171,6 +178,7 @@ mod tests {
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             use_systemd: false,
+            tls_sans: vec!["127.0.0.1".to_owned(), "cp.example.test".to_owned()],
             server_url: Some("https://cp.example.test:6443".to_owned()),
             token: Some("secret".to_owned()),
         };
@@ -180,8 +188,9 @@ mod tests {
             .join("; ");
         assert!(exports.contains("export KALISTO_K3S_NODE_ROLE=agent"));
         assert!(exports.contains("export KALISTO_K3S_NODE_NAME='worker-0'"));
+        assert!(exports.contains("export KALISTO_K3S_TLS_SANS='127.0.0.1,cp.example.test'"));
         assert!(exports.contains("export KALISTO_K3S_SERVER_URL='https://cp.example.test:6443'"));
         assert!(exports.contains("export KALISTO_K3S_TOKEN='secret'"));
-        assert!(exports.contains("export KALISTO_K3S_DISABLE_COREDNS=1"));
+        assert!(exports.contains("export KALISTO_K3S_DISABLE_COREDNS=0"));
     }
 }

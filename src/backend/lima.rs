@@ -2,24 +2,15 @@ use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
+use crate::backend::runtime::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig};
 use crate::error::{Error, Result};
 use crate::process::{CommandRunner, Output};
+use crate::shell::shell_escape as shared_shell_escape;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub template: String,
-    pub workspace_root: PathBuf,
-    pub enable_rosetta: bool,
-    pub network: String,
-}
+#[derive(Debug, Clone, Copy)]
+pub struct LimaBackend;
 
-#[derive(Debug, Clone)]
-pub struct InstanceConfig {
-    pub name: String,
-    pub host_port_forward: Option<u16>,
-    pub cpus: u8,
-    pub memory_gib: u8,
-}
+pub const BACKEND: LimaBackend = LimaBackend;
 
 pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|source| Error::CommandIo {
@@ -28,9 +19,94 @@ pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+impl ClusterBackend for LimaBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Lima
+    }
+
+    fn check_available(&self, runner: &dyn CommandRunner) -> Result<()> {
+        runner.run("limactl", &["--version".into()])?;
+        Ok(())
+    }
+
+    fn start_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        config: &BackendConfig,
+        instance: &InstanceConfig,
+    ) -> Result<Output> {
+        self::start_instance(runner, config, instance)
+    }
+
+    fn stop_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        _runtime_root: &Path,
+        _force: bool,
+    ) -> Result<()> {
+        self::stop_instance(runner, instance_name)
+    }
+
+    fn delete_instance(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        _runtime_root: &Path,
+    ) -> Result<()> {
+        self::delete_instance(runner, instance_name)
+    }
+
+    fn query_instance_status(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        _runtime_root: &Path,
+    ) -> Result<String> {
+        self::query_instance_status(runner, instance_name)
+    }
+
+    fn guest_artifact_root(&self, _instance_name: &str, runtime_root: &Path) -> Result<PathBuf> {
+        Ok(runtime_root.to_path_buf())
+    }
+
+    fn guest_shell(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        _runtime_root: &Path,
+        command: &str,
+    ) -> Result<Output> {
+        self::guest_shell(runner, instance_name, command)
+    }
+
+    fn guest_sudo_shell(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        _runtime_root: &Path,
+        command: &str,
+    ) -> Result<Output> {
+        self::guest_sudo_shell(runner, instance_name, command)
+    }
+
+    fn control_plane_host(&self, instance_name: &str, _runtime_root: &Path) -> Result<String> {
+        Ok(self::internal_hostname(instance_name))
+    }
+
+    fn host_api_endpoint(
+        &self,
+        _instance_name: &str,
+        _runtime_root: &Path,
+        requested_port: u16,
+    ) -> Result<String> {
+        Ok(format!("127.0.0.1:{requested_port}"))
+    }
+}
+
 pub fn start_instance(
     runner: &dyn CommandRunner,
-    config: &Config,
+    config: &BackendConfig,
     instance: &InstanceConfig,
 ) -> Result<Output> {
     debug!(
@@ -106,9 +182,9 @@ pub fn guest_sudo_shell(
     )
 }
 
-pub fn stop_and_delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
+pub fn stop_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "stopping lima instance");
-    let _ = runner.run(
+    runner.run(
         "limactl",
         &[
             "-y".into(),
@@ -116,7 +192,11 @@ pub fn stop_and_delete_instance(runner: &dyn CommandRunner, instance_name: &str)
             "--force".into(),
             instance_name.to_owned(),
         ],
-    );
+    )?;
+    Ok(())
+}
+
+pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "deleting lima instance");
     runner.run(
         "limactl",
@@ -154,5 +234,5 @@ pub fn internal_hostname(instance_name: &str) -> String {
 }
 
 pub fn shell_escape(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
+    shared_shell_escape(input)
 }

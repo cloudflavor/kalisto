@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod backend;
 pub mod cli;
 pub mod cluster;
@@ -7,4 +8,5 @@ pub mod lima_k3s;
 pub mod paths;
 pub mod probe;
 pub mod process;
+pub mod shell;
 pub mod telemetry;

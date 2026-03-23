@@ -1,7 +1,8 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-use crate::backend::lima::{Config as LimaBaseConfig, internal_hostname, shell_escape};
+use crate::backend::BackendConfig;
+use crate::backend::lima::{internal_hostname, shell_escape};
 use crate::error::Error;
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
 
@@ -86,11 +87,14 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
     }
 
     let cluster_suffix = unique_suffix();
-    let base_config = LimaBaseConfig {
+    let base_config = BackendConfig {
         template: config.template.clone(),
         workspace_root: workspace_root.clone(),
         enable_rosetta: config.enable_rosetta,
         network: effective_network(config),
+        firecracker_kernel: None,
+        firecracker_rootfs: None,
+        stream_vm_logs: false,
     };
 
     let control_plane = Instance::new(
