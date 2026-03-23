@@ -1,11 +1,12 @@
+use tracing::Level;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::error::{Error, Result};
 
 const DEFAULT_FILTER_DIRECTIVE: &str = "info";
 
-pub fn init() -> Result<()> {
-    let env_filter = env_filter_from_env()?;
+pub fn init(log_level: Option<Level>) -> Result<()> {
+    let env_filter = env_filter(log_level)?;
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt::layer().with_target(false).compact())
@@ -20,10 +21,13 @@ pub fn raw_streams_enabled() -> bool {
     tracing::enabled!(tracing::Level::DEBUG)
 }
 
-fn env_filter_from_env() -> Result<EnvFilter> {
+fn env_filter(log_level: Option<Level>) -> Result<EnvFilter> {
     match std::env::var("RUST_LOG") {
         Ok(value) => env_filter_from_directive(&value).or_else(|_| default_env_filter()),
-        Err(std::env::VarError::NotPresent) => default_env_filter(),
+        Err(std::env::VarError::NotPresent) => match log_level {
+            Some(level) => env_filter_from_level(level),
+            None => default_env_filter(),
+        },
         Err(error) => Err(Error::InvalidArgs(format!(
             "failed to read RUST_LOG: {error}"
         ))),
@@ -36,13 +40,21 @@ fn env_filter_from_directive(directive: &str) -> Result<EnvFilter> {
     })
 }
 
+fn env_filter_from_level(level: Level) -> Result<EnvFilter> {
+    env_filter_from_directive(level.as_str())
+}
+
 fn default_env_filter() -> Result<EnvFilter> {
     env_filter_from_directive(DEFAULT_FILTER_DIRECTIVE)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_FILTER_DIRECTIVE, default_env_filter, env_filter_from_directive};
+    use tracing::Level;
+
+    use super::{
+        DEFAULT_FILTER_DIRECTIVE, default_env_filter, env_filter, env_filter_from_directive,
+    };
 
     #[test]
     fn default_filter_is_valid() {
@@ -56,5 +68,17 @@ mod tests {
             .expect("custom filter should parse");
         let rendered = filter.to_string();
         assert!(rendered.contains("kalisto=debug"));
+    }
+
+    #[test]
+    fn cli_log_level_is_used_when_rust_log_is_unset() {
+        let original = std::env::var_os("RUST_LOG");
+        unsafe { std::env::remove_var("RUST_LOG") };
+        let filter = env_filter(Some(Level::DEBUG)).expect("debug log level should parse");
+        match original {
+            Some(value) => unsafe { std::env::set_var("RUST_LOG", value) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        assert!(filter.to_string().contains("debug"));
     }
 }

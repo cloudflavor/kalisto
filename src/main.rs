@@ -1,23 +1,35 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use structopt::StructOpt;
 
 use kalisto::cli::{
-    BenchArgs, Cli, ClusterLookupArgs, Command, MacosLimaArgs, MacosLimaK3sArgs, UpArgs,
+    AddonArgs, AddonCommand, AddonInstallArgs, BenchArgs, Cli, ClusterLookupArgs, Command,
+    CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs,
+    StatsArgs, UpArgs,
 };
 use kalisto::cluster::manager::{
-    benchmark as cluster_benchmark, down as cluster_down,
-    kubeconfig_path as cluster_kubeconfig_path, list as cluster_list, status as cluster_status,
-    up as cluster_up,
+    benchmark as cluster_benchmark, create as cluster_create, destroy as cluster_destroy,
+    down as cluster_down, install_addon as cluster_install_addon,
+    kubeconfig_path as cluster_kubeconfig_path, list as cluster_list, logs as cluster_logs,
+    scale as cluster_scale, stats as cluster_stats, status as cluster_status, up as cluster_up,
 };
 use kalisto::error::{Error, Result};
 use kalisto::k3s::ServerMode as K3sServerMode;
+use kalisto::paths::{
+    clear_default_cluster_name_if_matches, handoff_default_cluster_file_to_invoking_user,
+    read_default_cluster_name, write_default_cluster_name,
+};
 use kalisto::probe::macos_lima::{
     ProbeConfig as MacosLimaProbeConfig, run as run_macos_lima_probe,
 };
 use kalisto::probe::macos_lima_k3s::{
     ProbeConfig as MacosLimaK3sProbeConfig, run as run_macos_lima_k3s_probe,
 };
+use kalisto::process::SystemRunner;
 use kalisto::telemetry;
 
 fn main() -> ExitCode {
@@ -31,12 +43,20 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<()> {
-    telemetry::init()?;
-    match Cli::from_args().command {
+    let cli = Cli::from_args();
+    telemetry::init(cli.log_level)?;
+    match cli.command {
+        Command::Create(args) => run_create(args),
         Command::Up(args) => run_up(args),
         Command::Down(args) => run_down(args),
-        Command::Remove(args) => run_remove(args),
+        Command::Destroy(args) => run_destroy(args),
+        Command::Logs(args) => run_logs(args),
+        Command::Addon(args) => run_addon(args),
+        Command::Use(args) => run_use(args),
+        Command::Scale(args) => run_scale(args),
+        Command::Completions(args) => run_completions(args),
         Command::Ls => run_list(),
+        Command::Stats(args) => run_stats(args),
         Command::Status(args) => run_status(args),
         Command::Kubeconfig(args) => run_kubeconfig(args),
         Command::Bench(args) => run_bench(args),
@@ -45,9 +65,28 @@ fn real_main() -> Result<()> {
     }
 }
 
+fn run_create(args: UpArgs) -> Result<()> {
+    let spec = args.into_cluster_spec()?;
+    let outcome = cluster_create(&spec)?;
+    if read_default_cluster_name()?.is_none() {
+        write_default_cluster_name(&outcome.state.name)?;
+        handoff_default_cluster_file_to_invoking_user(&SystemRunner)?;
+    }
+    let state_root = kalisto::cluster::spec::ClusterSpec::state_root_for(&outcome.state.name)?;
+    println!("cluster: {}", outcome.state.name);
+    println!("state root: {}", state_root.display());
+    println!("runtime root: {}", spec.runtime_root().display());
+    println!("created cluster definition");
+    Ok(())
+}
+
 fn run_up(args: UpArgs) -> Result<()> {
     let spec = args.into_cluster_spec()?;
     let outcome = cluster_up(&spec)?;
+    if read_default_cluster_name()?.is_none() {
+        write_default_cluster_name(&outcome.state.name)?;
+        handoff_default_cluster_file_to_invoking_user(&SystemRunner)?;
+    }
     println!("cluster: {}", outcome.state.name);
     println!("kubeconfig: {}", outcome.state.kubeconfig_path.display());
     println!("control-plane ready: {}", outcome.control_plane_ready);
@@ -56,51 +95,196 @@ fn run_up(args: UpArgs) -> Result<()> {
 }
 
 fn run_down(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name()?;
-    cluster_down(&name)?;
-    println!("tore down cluster `{name}`");
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    cluster_down(&name, args.force)?;
+    println!("stopped cluster `{name}`");
     Ok(())
 }
 
-fn run_remove(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name()?;
-    cluster_down(&name)?;
-    println!("removed cluster `{name}`");
+fn run_destroy(args: ClusterLookupArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    cluster_destroy(&name)?;
+    clear_default_cluster_name_if_matches(&name)?;
+    println!("destroyed cluster `{name}`");
+    Ok(())
+}
+
+fn run_addon(args: AddonArgs) -> Result<()> {
+    match args.command {
+        AddonCommand::Install(args) => run_addon_install(args),
+    }
+}
+
+fn run_addon_install(args: AddonInstallArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let outcome = cluster_install_addon(&name, &args.addon)?;
+    println!("cluster: {}", outcome.cluster);
+    println!("installed add-on: {}", outcome.addon);
+    Ok(())
+}
+
+fn run_logs(args: NodeLogsArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let logs = cluster_logs(&name, &args.node)?;
+    println!("cluster: {}", logs.cluster);
+    println!("node: {}", logs.node);
+    println!();
+    for (index, section) in logs.sections.iter().enumerate() {
+        println!("== {} ({}) ==", section.label, section.path.display());
+        print!("{}", section.content);
+        if !section.content.ends_with('\n') {
+            println!();
+        }
+        if index + 1 != logs.sections.len() {
+            println!();
+        }
+    }
+    if args.follow {
+        follow_log_sections(&logs.sections)?;
+    }
+    Ok(())
+}
+
+fn run_use(args: NamedClusterArgs) -> Result<()> {
+    let clusters = cluster_list()?;
+    if !clusters.iter().any(|cluster| cluster.name == args.name) {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{}` is not defined",
+            args.name
+        )));
+    }
+    write_default_cluster_name(&args.name)?;
+    handoff_default_cluster_file_to_invoking_user(&SystemRunner)?;
+    println!("default cluster: {}", args.name);
+    Ok(())
+}
+
+fn run_scale(args: ScaleArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let outcome = cluster_scale(&name, args.workers)?;
+    println!("cluster: {}", outcome.name);
+    println!(
+        "workers: {} -> {}",
+        outcome.previous_workers, outcome.current_workers
+    );
+    if outcome.added_workers.is_empty() {
+        println!("added nodes: none");
+    } else {
+        println!("added nodes: {}", outcome.added_workers.join(", "));
+    }
+    Ok(())
+}
+
+fn run_completions(args: CompletionsArgs) -> Result<()> {
+    Cli::clap().gen_completions_to("kalisto", args.shell, &mut std::io::stdout());
     Ok(())
 }
 
 fn run_list() -> Result<()> {
     let clusters = cluster_list()?;
+    let default_cluster = read_default_cluster_name()?;
     if clusters.is_empty() {
         println!("no clusters");
         return Ok(());
     }
 
-    for cluster in clusters {
-        println!("cluster: {}", cluster.name);
-        println!("state root: {}", cluster.state_root.display());
-        println!("kubeconfig: {}", cluster.kubeconfig_path.display());
-        for node in cluster.nodes {
-            println!("{} ({:?}): {}", node.name, node.role, node.lima_status);
+    let mut cluster_rows = Vec::with_capacity(clusters.len() + 1);
+    cluster_rows.push(vec![
+        "CLUSTER".to_owned(),
+        "DEFAULT".to_owned(),
+        "STATE".to_owned(),
+        "NODES".to_owned(),
+        "KUBECONFIG".to_owned(),
+    ]);
+
+    let mut node_rows = vec![vec![
+        "CLUSTER".to_owned(),
+        "NODE".to_owned(),
+        "ROLE".to_owned(),
+        "STATE".to_owned(),
+        "DETAIL".to_owned(),
+    ]];
+
+    for cluster in &clusters {
+        cluster_rows.push(vec![
+            cluster.name.clone(),
+            if default_cluster.as_deref() == Some(cluster.name.as_str()) {
+                "yes".to_owned()
+            } else {
+                String::new()
+            },
+            cluster_state_label(cluster),
+            cluster.nodes.len().to_string(),
+            cluster.kubeconfig_path.display().to_string(),
+        ]);
+        for node in &cluster.nodes {
+            node_rows.push(vec![
+                cluster.name.clone(),
+                node.name.clone(),
+                role_label(node.role).to_owned(),
+                render_node_state(&node.backend_status),
+                node.backend_status.clone(),
+            ]);
         }
     }
+
+    print_table(&cluster_rows);
+    println!();
+    print_table(&node_rows);
     Ok(())
 }
 
 fn run_status(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name()?;
+    let Some(name) = args.cluster_name()? else {
+        return Ok(());
+    };
     let status = cluster_status(&name)?;
     println!("cluster: {}", status.name);
     println!("state root: {}", status.state_root.display());
     println!("kubeconfig: {}", status.kubeconfig_path.display());
+    println!();
+    let mut rows = vec![vec![
+        "NODE".to_owned(),
+        "ROLE".to_owned(),
+        "STATE".to_owned(),
+        "DETAIL".to_owned(),
+    ]];
     for node in status.nodes {
-        println!("{} ({:?}): {}", node.name, node.role, node.lima_status);
+        rows.push(vec![
+            node.name,
+            role_label(node.role).to_owned(),
+            render_node_state(&node.backend_status),
+            node.backend_status,
+        ]);
     }
+    print_table(&rows);
     Ok(())
 }
 
+fn run_stats(args: StatsArgs) -> Result<()> {
+    let Some(name) = args.cluster_name()? else {
+        return Ok(());
+    };
+    let interval = Duration::from_secs(args.interval_secs.max(1));
+
+    if args.watch {
+        loop {
+            let stats = cluster_stats(&name)?;
+            print!("\x1b[2J\x1b[H");
+            println!("{}", render_stats(&stats));
+            thread::sleep(interval);
+        }
+    } else {
+        let stats = cluster_stats(&name)?;
+        print!("{}", render_stats(&stats));
+        Ok(())
+    }
+}
+
 fn run_kubeconfig(args: ClusterLookupArgs) -> Result<()> {
-    let name = args.cluster_name()?;
+    let Some(name) = args.cluster_name()? else {
+        return Ok(());
+    };
     println!("{}", cluster_kubeconfig_path(&name)?.display());
     Ok(())
 }
@@ -180,5 +364,347 @@ fn run_lima_k3s_probe(args: MacosLimaK3sArgs) -> Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn print_table(rows: &[Vec<String>]) {
+    print!("{}", render_table(rows));
+}
+
+fn render_stats(stats: &kalisto::cluster::manager::ClusterStats) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("cluster: {}\n", stats.name));
+    output.push_str(&format!("state root: {}\n", stats.state_root.display()));
+    output.push_str(&format!(
+        "kubeconfig: {}\n\n",
+        stats.kubeconfig_path.display()
+    ));
+
+    let mut rows = vec![vec![
+        "NODE".to_owned(),
+        "ROLE".to_owned(),
+        "STATE".to_owned(),
+        "CPU".to_owned(),
+        "MEM".to_owned(),
+        "PID".to_owned(),
+        "GUEST IP".to_owned(),
+        "RSS".to_owned(),
+        "VSZ".to_owned(),
+        "ROOTFS".to_owned(),
+        "RX".to_owned(),
+        "TX".to_owned(),
+    ]];
+    for node in &stats.nodes {
+        rows.push(vec![
+            node.name.clone(),
+            role_label(node.role).to_owned(),
+            node_state_label(&node.backend_status),
+            node.configured_cpus.to_string(),
+            format!("{} GiB", node.configured_memory_gib),
+            optional_u32(node.pid),
+            optional_string(node.guest_ip.clone()),
+            optional_bytes(node.rss_bytes),
+            optional_bytes(node.vsz_bytes),
+            optional_bytes(node.rootfs_bytes),
+            optional_bytes(node.rx_bytes),
+            optional_bytes(node.tx_bytes),
+        ]);
+    }
+    output.push_str(&render_table(&rows));
+    output
+}
+
+fn render_table(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return String::new();
+    }
+
+    let widths: Vec<usize> = (0..column_count)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|value| visible_width(value))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut output = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        for (column, width) in widths.iter().enumerate().take(column_count) {
+            if column > 0 {
+                output.push_str("  ");
+            }
+            let value = row.get(column).map(String::as_str).unwrap_or("");
+            output.push_str(value);
+            let value_width = visible_width(value);
+            if *width > value_width {
+                output.push_str(&" ".repeat(*width - value_width));
+            }
+        }
+        output.push('\n');
+
+        if index == 0 {
+            for (column, width) in widths.iter().enumerate() {
+                if column > 0 {
+                    output.push_str("  ");
+                }
+                output.push_str(&format!("{:-<width$}", "", width = *width));
+            }
+            output.push('\n');
+        }
+    }
+
+    output
+}
+
+fn follow_log_sections(sections: &[kalisto::cluster::manager::NodeLogSection]) -> Result<()> {
+    let mut followers: Vec<LogFollower> = sections
+        .iter()
+        .map(|section| LogFollower {
+            label: section.label.clone(),
+            path: section.path.clone(),
+            offset: section.content.len() as u64,
+        })
+        .collect();
+
+    loop {
+        for follower in &mut followers {
+            follower.emit_pending()?;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+struct LogFollower {
+    label: String,
+    path: std::path::PathBuf,
+    offset: u64,
+}
+
+impl LogFollower {
+    fn emit_pending(&mut self) -> Result<()> {
+        if !self.path.is_file() {
+            return Ok(());
+        }
+
+        let mut file = File::open(&self.path).map_err(|source| Error::CommandIo {
+            program: "open".to_owned(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|source| Error::CommandIo {
+                program: "seek".to_owned(),
+                source,
+            })?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| Error::CommandIo {
+                program: "read_to_end".to_owned(),
+                source,
+            })?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        self.offset += bytes.len() as u64;
+        let text = String::from_utf8(bytes)?;
+        for line in text.lines() {
+            println!("[{}] {}", self.label, line);
+        }
+        if !text.ends_with('\n') {
+            print!("[{}] ", self.label);
+        }
+        Ok(())
+    }
+}
+
+fn cluster_state_label(status: &kalisto::cluster::manager::ClusterStatus) -> String {
+    let mut has_up = false;
+    let mut has_down = false;
+    let mut has_failed = false;
+
+    for node in &status.nodes {
+        match node_health(&node.backend_status) {
+            NodeHealth::Up => has_up = true,
+            NodeHealth::Down => has_down = true,
+            NodeHealth::Failed => has_failed = true,
+            NodeHealth::Unknown => {}
+        }
+    }
+
+    let (label, color) = if has_failed {
+        if has_up {
+            ("degraded", ColorStyle::Yellow)
+        } else {
+            ("failed", ColorStyle::Red)
+        }
+    } else if has_up {
+        ("up", ColorStyle::Green)
+    } else if has_down {
+        ("down", ColorStyle::Yellow)
+    } else {
+        ("unknown", ColorStyle::Dim)
+    };
+
+    colorize(label, color)
+}
+
+fn role_label(role: kalisto::k3s::NodeRole) -> &'static str {
+    match role {
+        kalisto::k3s::NodeRole::ControlPlane => "control-plane",
+        kalisto::k3s::NodeRole::Worker => "worker",
+    }
+}
+
+fn require_selected_cluster_name(name: Option<String>) -> Result<String> {
+    name.ok_or_else(|| {
+        Error::InvalidArgs(
+            "no default cluster selected; use --name or `kalisto use <name>`".to_owned(),
+        )
+    })
+}
+
+fn node_state_label(backend_status: &str) -> String {
+    match node_health(backend_status) {
+        NodeHealth::Up => "up".to_owned(),
+        NodeHealth::Down => "down".to_owned(),
+        NodeHealth::Failed => "failed".to_owned(),
+        NodeHealth::Unknown => "unknown".to_owned(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeBackendState {
+    Running,
+    Exited,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeHealth {
+    Up,
+    Down,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorStyle {
+    Green,
+    Yellow,
+    Red,
+    Dim,
+}
+
+fn backend_status_state(status: &str) -> Option<NodeBackendState> {
+    for token in status.split_whitespace() {
+        match token {
+            "Running" => return Some(NodeBackendState::Running),
+            "Exited" => return Some(NodeBackendState::Exited),
+            "Stopped" => return Some(NodeBackendState::Stopped),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn node_health(status: &str) -> NodeHealth {
+    match backend_status_state(status) {
+        Some(NodeBackendState::Running) => NodeHealth::Up,
+        Some(NodeBackendState::Stopped) => NodeHealth::Down,
+        Some(NodeBackendState::Exited) => NodeHealth::Failed,
+        None => NodeHealth::Unknown,
+    }
+}
+
+fn render_node_state(status: &str) -> String {
+    match node_health(status) {
+        NodeHealth::Up => colorize("up", ColorStyle::Green),
+        NodeHealth::Down => colorize("down", ColorStyle::Yellow),
+        NodeHealth::Failed => colorize("failed", ColorStyle::Red),
+        NodeHealth::Unknown => colorize("unknown", ColorStyle::Dim),
+    }
+}
+
+fn colorize(value: &str, style: ColorStyle) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return value.to_owned();
+    }
+
+    let code = match style {
+        ColorStyle::Green => "32",
+        ColorStyle::Yellow => "33",
+        ColorStyle::Red => "31",
+        ColorStyle::Dim => "2",
+    };
+    format!("\x1b[{code}m{value}\x1b[0m")
+}
+
+fn visible_width(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut width = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if index < bytes.len() && bytes[index] == b'[' {
+                index += 1;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if byte == b'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        let rest = &value[index..];
+        if let Some(ch) = rest.chars().next() {
+            width += 1;
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    width
+}
+
+fn optional_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn optional_string(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "-".to_owned())
+}
+
+fn optional_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut unit_index = 0;
+    let mut value = bytes as f64;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
     }
 }
