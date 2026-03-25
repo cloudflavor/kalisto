@@ -1,0 +1,48 @@
+[[plugin]]
+id = "cni/flannel"
+category = "cni"
+install_kind = "k3s-builtin"
+conflicts = ["cni/cilium"]
+description = "Use the built-in K3s flannel networking stack"
+
+[[plugin]]
+id = "cni/cilium"
+category = "cni"
+install_kind = "manifest"
+conflicts = ["cni/flannel"]
+description = "Install Cilium as the cluster CNI"
+
+[[plugin]]
+id = "ingress/traefik"
+category = "ingress"
+install_kind = "manifest"
+conflicts = []
+description = "Install Traefik ingress controller"
+
+[[plugin]]
+id = "lb/servicelb"
+category = "lb"
+install_kind = "k3s-builtin"
+conflicts = []
+description = "Enable the built-in K3s ServiceLB controller"
+
+[[plugin]]
+id = "lb/metallb"
+category = "lb"
+install_kind = "manifest"
+conflicts = []
+description = "Install MetalLB for bare-metal style LoadBalancer services"
+
+[[plugin]]
+id = "storage/longhorn"
+category = "storage"
+install_kind = "manifest"
+conflicts = []
+description = "Install Longhorn distributed block storage"
+
+[[plugin]]
+id = "storage/local-path"
+category = "storage"
+install_kind = "manifest"
+conflicts = []
+description = "Install Rancher local-path provisioner"
