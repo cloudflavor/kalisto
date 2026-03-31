@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::backend::BackendKind;
-use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION};
+use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION, ImageArch};
 use crate::error::{Error, Result};
-use crate::paths::artifacts_root;
+use crate::paths::{artifacts_root, config_root};
 use crate::process::CommandRunner;
 use crate::shell::shell_escape;
 
+const LIMA_ARTIFACT_DIR: &str = "lima-node";
 const FIRECRACKER_ARTIFACT_DIR: &str = "firecracker-node";
 const FIRECRACKER_ARTIFACT_MANIFEST_FILENAME: &str = "firecracker-artifacts.manifest";
 const DEFAULT_FIRECRACKER_KERNEL_FILENAME: &str = "kalisto-vmlinux";
@@ -55,6 +56,42 @@ struct ManifestData {
     entries: Vec<(String, String)>,
 }
 
+fn default_lima_image_arch_suffix() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" | "arm64" => "arm64",
+        "x86_64" | "amd64" => "amd64",
+        _ => "arm64",
+    }
+}
+
+fn default_lima_finalized_image_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}-finalized.qcow2",
+        default_lima_image_arch_suffix()
+    )
+}
+
+fn default_lima_finalized_template_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}-finalized.yaml",
+        default_lima_image_arch_suffix()
+    )
+}
+
+fn default_lima_seed_image_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}.qcow2",
+        default_lima_image_arch_suffix()
+    )
+}
+
+fn default_lima_seed_template_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}.yaml",
+        default_lima_image_arch_suffix()
+    )
+}
+
 impl ManifestData {
     fn parse(content: &str) -> Self {
         let mut entries = Vec::new();
@@ -79,6 +116,16 @@ impl ManifestData {
 }
 
 pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
+    if spec.backend == BackendKind::Lima {
+        if spec.template != "template://default" {
+            return Ok(spec.clone());
+        }
+
+        let mut resolved_spec = spec.clone();
+        resolved_spec.template = resolve_lima_template(spec, runner)?.display().to_string();
+        return Ok(resolved_spec);
+    }
+
     if spec.backend != BackendKind::Firecracker {
         return Ok(spec.clone());
     }
@@ -90,6 +137,136 @@ pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> R
     resolved_spec.firecracker_kernel = Some(resolved.kernel);
     resolved_spec.firecracker_rootfs = Some(resolved.rootfs);
     Ok(resolved_spec)
+}
+
+fn resolve_lima_template(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf> {
+    let cache_root = artifacts_root()?.join(LIMA_ARTIFACT_DIR);
+    let search_roots = lima_search_roots(&spec.workspace_root)?;
+
+    for root in &search_roots {
+        if let Some(template) = local_lima_template(root) {
+            return Ok(template);
+        }
+    }
+
+    for root in &search_roots {
+        if let Some(image) = local_lima_image(root) {
+            return render_lima_template(
+                root,
+                &image,
+                spec.image_arch.unwrap_or_else(ImageArch::host_default),
+            );
+        }
+    }
+
+    if let Some(image_url) = std::env::var_os("KALISTO_LIMA_IMAGE_URL") {
+        let image_url = image_url.to_string_lossy().into_owned();
+        let image_filename = std::env::var("KALISTO_LIMA_IMAGE_FILENAME")
+            .unwrap_or_else(|_| default_lima_image_filename(&image_url));
+        let image_sha256 = std::env::var("KALISTO_LIMA_IMAGE_SHA256").ok();
+        let image = fetch_into_cache(
+            runner,
+            &cache_root,
+            &image_url,
+            image_sha256.as_deref(),
+            "lima image",
+            &image_filename,
+        )?;
+        return render_lima_template(
+            &cache_root,
+            &image,
+            spec.image_arch.unwrap_or_else(ImageArch::host_default),
+        );
+    }
+
+    Err(Error::InvalidArgs(
+        "no managed Lima template found for Kalisto; install Kalisto Lima artifacts under ~/.local/share/kalisto/artifacts/lima-node, place them under <project>/artifacts/lima-node, set KALISTO_LIMA_IMAGE_URL to fetch them automatically, or pass --template explicitly"
+            .to_owned(),
+    ))
+}
+
+fn lima_search_roots(workspace_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = vec![artifacts_root()?.join(LIMA_ARTIFACT_DIR)];
+    roots.push(workspace_root.join("artifacts").join(LIMA_ARTIFACT_DIR));
+    if let Ok(config_root) = config_root() {
+        roots.push(config_root.join(LIMA_ARTIFACT_DIR));
+    }
+    Ok(roots)
+}
+
+fn local_lima_template(cache_root: &Path) -> Option<PathBuf> {
+    let finalized = cache_root.join(default_lima_finalized_template_filename());
+    if finalized.is_file() {
+        return Some(finalized);
+    }
+
+    let seeded = cache_root.join(default_lima_seed_template_filename());
+    if seeded.is_file() {
+        return Some(seeded);
+    }
+
+    None
+}
+
+fn local_lima_image(cache_root: &Path) -> Option<PathBuf> {
+    let finalized = cache_root.join(default_lima_finalized_image_filename());
+    if finalized.is_file() {
+        return Some(finalized);
+    }
+
+    let seeded = cache_root.join(default_lima_seed_image_filename());
+    if seeded.is_file() {
+        return Some(seeded);
+    }
+
+    None
+}
+
+fn render_lima_template(
+    cache_root: &Path,
+    image_path: &Path,
+    image_arch: ImageArch,
+) -> Result<PathBuf> {
+    fs::create_dir_all(cache_root).map_err(io_error("create_dir_all"))?;
+    let file_name = image_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let template_name = if file_name.contains("-finalized.") {
+        default_lima_finalized_template_filename()
+    } else {
+        default_lima_seed_template_filename()
+    };
+    let template_path = cache_root.join(template_name);
+    let template = format!(
+        concat!(
+            "vmType: \"vz\"\n",
+            "mountType: \"virtiofs\"\n",
+            "mounts: []\n",
+            "containerd:\n",
+            "  system: false\n",
+            "  user: false\n",
+            "cpus: 2\n",
+            "memory: \"4GiB\"\n",
+            "disk: \"12GiB\"\n",
+            "images:\n",
+            "  - location: \"{image}\"\n",
+            "    arch: \"{arch}\"\n"
+        ),
+        image = image_path.display(),
+        arch = image_arch.lima_template_value(),
+    );
+    fs::write(&template_path, template).map_err(io_error("write"))?;
+    Ok(template_path)
+}
+
+fn default_lima_image_filename(image_url: &str) -> String {
+    let file_name = url_file_name(image_url).unwrap_or_default();
+    if file_name.contains("-finalized.") {
+        default_lima_finalized_image_filename()
+    } else {
+        default_lima_seed_image_filename()
+    }
 }
 
 fn load_manifest(
@@ -753,15 +930,19 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::backend::BackendKind;
-    use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION};
+    use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION, ImageArch};
     use crate::error::{Error, Result};
     use crate::process::{CommandRunner, Output};
 
     use super::{
         ArtifactManagerConfig, DEFAULT_FIRECRACKER_KERNEL_FILENAME,
         DEFAULT_FIRECRACKER_ROOTFS_FILENAME, FIRECRACKER_ARTIFACT_MANIFEST_FILENAME,
-        compressed_artifact_extension, decompressed_file_name, io_error, resolve_cluster_spec,
+        LIMA_ARTIFACT_DIR, compressed_artifact_extension, decompressed_file_name,
+        default_lima_finalized_image_filename, default_lima_finalized_template_filename, io_error,
+        render_lima_template, resolve_cluster_spec,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Default)]
     struct FakeRunner {
@@ -855,12 +1036,19 @@ mod tests {
 
     #[test]
     fn resolve_cluster_spec_prefers_versioned_cache_artifacts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = temp_dir("versioned-cache");
+        let data_home = root.join("xdg-data");
+        let arch = super::detect_firecracker_artifact_arch().unwrap();
         let artifact_root = root
             .join("artifacts")
             .join("firecracker-node")
             .join("v1.13")
-            .join("x86_64");
+            .join(arch);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
         fs::create_dir_all(&artifact_root).unwrap();
         let kernel = artifact_root.join("vmlinux-6.1.141");
         let rootfs = artifact_root.join(DEFAULT_FIRECRACKER_ROOTFS_FILENAME);
@@ -883,6 +1071,7 @@ mod tests {
             Some(rootfs.as_path())
         );
 
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1024,6 +1213,145 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cluster_spec_rejects_generic_lima_default_template() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let original_lima_image_url = std::env::var_os("KALISTO_LIMA_IMAGE_URL");
+        let original_lima_image_filename = std::env::var_os("KALISTO_LIMA_IMAGE_FILENAME");
+        let root = temp_dir("lima-default-template");
+        let data_home = root.join("xdg-data");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+            std::env::remove_var("KALISTO_LIMA_IMAGE_URL");
+            std::env::remove_var("KALISTO_LIMA_IMAGE_FILENAME");
+        }
+        let mut spec = ClusterSpec::new("default".to_owned(), root.clone());
+        spec.backend = BackendKind::Lima;
+        spec.template = "template://default".to_owned();
+
+        let error = resolve_cluster_spec(&spec, &FakeRunner::default()).unwrap_err();
+        match error {
+            Error::InvalidArgs(message) => {
+                assert!(message.contains("no managed Lima template found"));
+                assert!(message.contains("~/.local/share/kalisto/artifacts/lima-node"));
+                assert!(message.contains("KALISTO_LIMA_IMAGE_URL"));
+                assert!(message.contains("--template"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        restore_env("KALISTO_LIMA_IMAGE_URL", original_lima_image_url);
+        restore_env("KALISTO_LIMA_IMAGE_FILENAME", original_lima_image_filename);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_cluster_spec_fetches_lima_image_and_renders_template() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_dir("lima-fetch");
+        let data_home = root.join("xdg-data");
+        let image_source = root.join(default_lima_finalized_image_filename());
+        fs::write(&image_source, "lima-image").unwrap();
+
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let original_lima_image_url = std::env::var_os("KALISTO_LIMA_IMAGE_URL");
+        let original_lima_image_filename = std::env::var_os("KALISTO_LIMA_IMAGE_FILENAME");
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+            std::env::set_var(
+                "KALISTO_LIMA_IMAGE_URL",
+                format!("file://{}", image_source.display()),
+            );
+            std::env::remove_var("KALISTO_LIMA_IMAGE_FILENAME");
+        }
+
+        let mut spec = ClusterSpec::new("default".to_owned(), root.join("workspace"));
+        spec.backend = BackendKind::Lima;
+        spec.template = "template://default".to_owned();
+        spec.image_arch = Some(ImageArch::Aarch64);
+
+        let runner = FakeRunner::default();
+        let resolved = resolve_cluster_spec(&spec, &runner).unwrap();
+        let template_path = PathBuf::from(&resolved.template);
+        let cached_image = data_home
+            .join("kalisto")
+            .join("artifacts")
+            .join("lima-node")
+            .join(default_lima_finalized_image_filename());
+
+        assert_eq!(
+            template_path,
+            data_home
+                .join("kalisto")
+                .join("artifacts")
+                .join("lima-node")
+                .join(default_lima_finalized_template_filename())
+        );
+        assert!(cached_image.is_file());
+        assert!(template_path.is_file());
+        let template = fs::read_to_string(&template_path).unwrap();
+        assert!(template.contains(&cached_image.display().to_string()));
+        assert_eq!(runner.downloads.lock().unwrap().len(), 1);
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        restore_env("KALISTO_LIMA_IMAGE_URL", original_lima_image_url);
+        restore_env("KALISTO_LIMA_IMAGE_FILENAME", original_lima_image_filename);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_cluster_spec_renders_workspace_lima_image_when_template_is_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = temp_dir("lima-workspace-image");
+        let data_home = root.join("xdg-data");
+        let workspace_root = root.join("workspace");
+        let image_root = workspace_root.join("artifacts").join(LIMA_ARTIFACT_DIR);
+        let image_path = image_root.join(default_lima_finalized_image_filename());
+        fs::create_dir_all(&image_root).unwrap();
+        fs::write(&image_path, "lima-image").unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let mut spec = ClusterSpec::new("default".to_owned(), workspace_root.clone());
+        spec.backend = BackendKind::Lima;
+        spec.template = "template://default".to_owned();
+        spec.image_arch = Some(ImageArch::X86_64);
+
+        let resolved = resolve_cluster_spec(&spec, &FakeRunner::default()).unwrap();
+        let template_path = PathBuf::from(&resolved.template);
+        let expected_template = image_root.join(default_lima_finalized_template_filename());
+        assert_eq!(template_path, expected_template);
+        assert!(template_path.is_file());
+        let template = fs::read_to_string(&template_path).unwrap();
+        assert!(template.contains(&image_path.display().to_string()));
+        assert!(template.contains("arch: \"x86_64\""));
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn render_lima_template_uses_explicit_arch() {
+        let root = temp_dir("lima-template-amd64");
+        let artifact_root = root.join(LIMA_ARTIFACT_DIR);
+        let image_path = artifact_root.join("ubuntu-24.04-minimal-k3s-amd64-finalized.qcow2");
+        fs::create_dir_all(&artifact_root).unwrap();
+        fs::write(&image_path, "lima-image").unwrap();
+
+        let template_path =
+            render_lima_template(&artifact_root, &image_path, ImageArch::X86_64).unwrap();
+        let template = fs::read_to_string(template_path).unwrap();
+        assert!(template.contains("arch: \"x86_64\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn compressed_rootfs_helpers_detect_suffixes() {
         assert_eq!(
             compressed_artifact_extension(Path::new("rootfs.raw.xz")),
@@ -1071,5 +1399,16 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
+        }
     }
 }

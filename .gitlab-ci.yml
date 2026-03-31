@@ -14,6 +14,7 @@ stages:
       - .cargo/git/
       - target/
   before_script:
+    - export CARGO_TARGET_DIR="$CI_PROJECT_DIR/target/$(printf '%s' "${CI_JOB_NAME:-job}" | tr ': /' '---')-$(uname -m)"
     - rustup component add rustfmt clippy
 
 fmt:
@@ -32,47 +33,124 @@ test:
   stage: validate
   extends: .rust-job
   script:
-    - cargo test
+    - cargo test -- --test-threads=1
 
 build:bin:
   stage: build
   extends: .rust-job
+  before_script:
+    - export CARGO_TARGET_DIR="$CI_PROJECT_DIR/target/$(printf '%s' "${CI_JOB_NAME:-job}" | tr ': /' '---')-$(uname -m)"
   script:
     - cargo build --release --bin kalisto
   artifacts:
     paths:
-      - target/release/kalisto
+      - target/*/release/kalisto
 
-build:lima-node-image:
+.build:lima-node-rootfs:
   stage: build
-  image: debian:bookworm-slim
-  variables:
-    APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
-    DEBIAN_FRONTEND: noninteractive
-    INITRD: "No"
-    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
-    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
-    LIBGUESTFS_BACKEND: direct
+  image: ubuntu:noble
   cache:
-    key: lima-node-image-v1
+    key: "lima-rootfs-${KALISTO_UBUNTU_ARCH}-v1"
     paths:
-      - .cache/apt/archives/
-      - .cache/apt/lists/
+      - .cache/buildkit/
+      - .cache/k3s/
+  before_script:
+    - apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+    - apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates curl runc tar
+  script:
+    - ./scripts/image/run_buildkit_container_build.sh
+    - tar -C "${KALISTO_BUILDKIT_OUTPUT_DIR}" -cf "${KALISTO_BUILDKIT_OUTPUT_DIR}/rootfs.tar" rootfs
+  artifacts:
+    paths:
+      - artifacts/lima-rootfs/*/rootfs.tar
+
+.build:lima-node-image:
+  stage: build
+  image: ubuntu:noble
+  cache:
+    key: "lima-node-image-${KALISTO_UBUNTU_ARCH}-v1"
+    paths:
       - .cache/k3s/
       - .cache/lima-node/work/
   before_script:
-    - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_IMAGE_WORK_DIR}"
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils xz-utils "linux-image-$(dpkg --print-architecture)"
+    - mkdir -p "${KALISTO_IMAGE_WORK_DIR}" "${KALISTO_IMAGE_SCRATCH_DIR}"
+    - chmod -R u+rwX,go+rwX "${CI_PROJECT_DIR}/.cache/k3s" "${CI_PROJECT_DIR}/.cache/lima-node" || true
+    - apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+    - apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates curl dosfstools gdisk grub-common ${KALISTO_HOST_GRUB_PACKAGE} mtools parted qemu-utils xz-utils
   script:
     - ./scripts/macos/build_lima_node_image.sh
   artifacts:
     paths:
       - artifacts/lima-node/
 
+build:lima-node-rootfs:arm64:
+  extends: .build:lima-node-rootfs
+  image:
+    name: ubuntu:noble
+    docker:
+      platform: linux/arm64/v8
+  variables:
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_UBUNTU_ARCH: arm64
+    KALISTO_BUILDKIT_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/lima-rootfs/arm64"
+
+build:lima-node-rootfs:amd64:
+  extends: .build:lima-node-rootfs
+  image:
+    name: ubuntu:noble
+    docker:
+      platform: linux/amd64
+  variables:
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_UBUNTU_ARCH: amd64
+    KALISTO_BUILDKIT_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/lima-rootfs/amd64"
+
+build:lima-node-image:arm64:
+  extends: .build:lima-node-image
+  needs:
+    - job: build:lima-node-rootfs:arm64
+      artifacts: true
+  image:
+    name: ubuntu:noble
+    docker:
+      platform: linux/arm64/v8
+  variables:
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
+    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-lima-node-arm64"
+    LIBGUESTFS_BACKEND: direct
+    KALISTO_HOST_GRUB_PACKAGE: grub-efi-arm64-bin
+    KALISTO_UBUNTU_ARCH: arm64
+    KALISTO_IMAGE_BASENAME: ubuntu-24.04-minimal-k3s-arm64
+  script:
+    - KALISTO_PREBUILT_ROOTFS_ARCHIVE="$CI_PROJECT_DIR/artifacts/lima-rootfs/arm64/rootfs.tar" ./scripts/macos/build_lima_node_image.sh
+
+build:lima-node-image:amd64:
+  extends: .build:lima-node-image
+  needs:
+    - job: build:lima-node-rootfs:amd64
+      artifacts: true
+  image:
+    name: ubuntu:noble
+    docker:
+      platform: linux/amd64
+  variables:
+    KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
+    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
+    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-lima-node-amd64"
+    LIBGUESTFS_BACKEND: direct
+    KALISTO_HOST_GRUB_PACKAGE: grub-efi-amd64-bin
+    KALISTO_UBUNTU_ARCH: amd64
+    KALISTO_IMAGE_BASENAME: ubuntu-24.04-minimal-k3s-amd64
+  script:
+    - KALISTO_PREBUILT_ROOTFS_ARCHIVE="$CI_PROJECT_DIR/artifacts/lima-rootfs/amd64/rootfs.tar" ./scripts/macos/build_lima_node_image.sh
+
 build:firecracker-kernel:
   stage: build
-  image: debian:bookworm-slim
+  image:
+    name: debian:bookworm-slim
+    docker:
+      platform: linux/amd64
   variables:
     APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
     DEBIAN_FRONTEND: noninteractive
@@ -92,8 +170,9 @@ build:firecracker-kernel:
       - .cache/firecracker-node/work/kernel/
   before_script:
     - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_FIRECRACKER_KERNEL_WORK_DIR}"
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends bc build-essential ca-certificates curl file flex bison libelf-dev libssl-dev rsync xz-utils
+    - chmod -R u+rwX,go+rwX "${CI_PROJECT_DIR}/.cache/apt" "${CI_PROJECT_DIR}/.cache/firecracker-node" || true
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends bc build-essential ca-certificates curl file flex bison libelf-dev libssl-dev rsync xz-utils
   script:
     - ./scripts/linux/build_firecracker_kernel.sh
   artifacts:
@@ -102,7 +181,10 @@ build:firecracker-kernel:
 
 build:firecracker-rootfs:
   stage: build
-  image: debian:bookworm-slim
+  image:
+    name: debian:bookworm-slim
+    docker:
+      platform: linux/amd64
   variables:
     APT_CACHE_DIR: "$CI_PROJECT_DIR/.cache/apt"
     DEBIAN_FRONTEND: noninteractive
@@ -123,8 +205,9 @@ build:firecracker-rootfs:
       - .cache/firecracker-node/work/
   before_script:
     - mkdir -p "${APT_CACHE_DIR}/archives/partial" "${APT_CACHE_DIR}/lists/partial" "${KALISTO_FIRECRACKER_WORK_DIR}"
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" update
-    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils xz-utils "linux-image-$(dpkg --print-architecture)"
+    - chmod -R u+rwX,go+rwX "${CI_PROJECT_DIR}/.cache/apt" "${CI_PROJECT_DIR}/.cache/k3s" "${CI_PROJECT_DIR}/.cache/firecracker-node" || true
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+    - apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" -o dir::state::lists="${APT_CACHE_DIR}/lists" -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates curl libguestfs-tools qemu-utils xz-utils "linux-image-$(dpkg --print-architecture)"
   script:
     - ./scripts/linux/build_firecracker_rootfs.sh
   artifacts:
@@ -133,7 +216,10 @@ build:firecracker-rootfs:
 
 publish:firecracker-artifacts:
   stage: build
-  image: debian:bookworm-slim
+  image:
+    name: debian:bookworm-slim
+    docker:
+      platform: linux/amd64
   variables:
     KALISTO_IMAGE_BASENAME: "ubuntu-24.04-minimal-k3s-amd64"
     KALISTO_FIRECRACKER_VERSION: "v1.13.1"

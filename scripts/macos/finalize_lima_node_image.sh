@@ -4,7 +4,7 @@ set -eu
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 RENDER_SCRIPT="${ROOT_DIR}/scripts/macos/render_lima_artifact_template.sh"
 INPUT_IMAGE_PATH="${1:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2}"
-OUTPUT_IMAGE_PATH="${2:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.img}"
+OUTPUT_IMAGE_PATH="${2:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2}"
 OUTPUT_TEMPLATE_PATH="${3:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml}"
 OUTPUT_MANIFEST_PATH="${OUTPUT_IMAGE_PATH%.*}.manifest"
 WORK_DIR="${KALISTO_FINALIZE_WORK_DIR:-${ROOT_DIR}/target/finalize-lima-image}"
@@ -23,7 +23,7 @@ if [ ! -f "${RENDER_SCRIPT}" ]; then
   exit 1
 fi
 
-for REQUIRED in limactl cp du wc awk tr; do
+for REQUIRED in limactl du wc awk tr qemu-img; do
   if ! command -v "${REQUIRED}" >/dev/null 2>&1; then
     echo "${REQUIRED} is required" >&2
     exit 1
@@ -69,6 +69,19 @@ while :; do
   sleep 5
 done
 
+echo "cleaning finalized guest before export"
+limactl shell --tty=false "${INSTANCE_NAME}" sudo sh -lc '
+  set -eu
+  apt-get clean || true
+  rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* || true
+  rm -rf /var/log/apt/* /var/log/installer/* || true
+  find /var/log -type f \( -name "*.log" -o -name "*.err" -o -name "*.out" \) -exec truncate -s 0 {} \; 2>/dev/null || true
+  truncate -s 0 /var/log/wtmp /var/log/btmp /var/log/lastlog 2>/dev/null || true
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+  fstrim -av >/dev/null 2>&1 || true
+'
+
 INSTANCE_DIR="$(limactl list --format '{{ .Dir }}' "${INSTANCE_NAME}" | tr -d '\r')"
 if [ -z "${INSTANCE_DIR}" ]; then
   echo "failed to resolve Lima instance directory for ${INSTANCE_NAME}" >&2
@@ -85,14 +98,11 @@ echo "stopping temporary Lima instance ${INSTANCE_NAME}"
 limactl shell --tty=false "${INSTANCE_NAME}" sudo sync >/dev/null 2>&1 || true
 limactl stop --tty=false "${INSTANCE_NAME}" || limactl stop --tty=false --force "${INSTANCE_NAME}"
 
-rm -f "${OUTPUT_IMAGE_PATH}" "${OUTPUT_MANIFEST_PATH}" "${OUTPUT_TEMPLATE_PATH}"
+rm -f "${OUTPUT_IMAGE_PATH}" "${OUTPUT_MANIFEST_PATH}" "${OUTPUT_TEMPLATE_PATH}" "${OUTPUT_IMAGE_PATH}.tmp"
 
-echo "exporting finalized disk to ${OUTPUT_IMAGE_PATH}"
-if cp -c "${SOURCE_DISK_PATH}" "${OUTPUT_IMAGE_PATH}" 2>/dev/null; then
-  :
-else
-  cp "${SOURCE_DISK_PATH}" "${OUTPUT_IMAGE_PATH}"
-fi
+echo "exporting finalized disk to compact qcow2 ${OUTPUT_IMAGE_PATH}"
+qemu-img convert -f raw -O qcow2 -c "${SOURCE_DISK_PATH}" "${OUTPUT_IMAGE_PATH}.tmp"
+mv "${OUTPUT_IMAGE_PATH}.tmp" "${OUTPUT_IMAGE_PATH}"
 
 ROSETTA_ENABLED="${ROSETTA_ENABLED}" sh "${RENDER_SCRIPT}" "${OUTPUT_IMAGE_PATH}" "${OUTPUT_TEMPLATE_PATH}"
 

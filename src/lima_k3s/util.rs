@@ -13,7 +13,7 @@ pub fn initial_readiness_command(server_mode: ServerMode, kubeconfig_path: &Path
             shell_escape(kubeconfig_path.as_os_str().to_string_lossy().as_ref())
         ),
         ServerMode::Agentless => format!(
-            "KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/readyz",
+            "KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/livez",
             shell_escape(kubeconfig_path.as_os_str().to_string_lossy().as_ref())
         ),
     }
@@ -77,10 +77,10 @@ mod tests {
     };
 
     #[test]
-    fn agentless_mode_uses_readyz_check() {
+    fn agentless_mode_uses_livez_check() {
         let command =
             initial_readiness_command(ServerMode::Agentless, Path::new("/tmp/kubeconfig.yaml"));
-        assert!(command.contains("kubectl get --raw=/readyz"));
+        assert!(command.contains("kubectl get --raw=/livez"));
     }
 
     #[test]

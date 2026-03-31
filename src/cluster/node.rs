@@ -63,7 +63,7 @@ pub struct K3sBootstrapConfig {
     pub component_toggles: ComponentToggles,
 }
 
-struct BootstrapCommandSpec<'a> {
+struct K3sCommandSpec<'a> {
     config: &'a K3sBootstrapConfig,
     artifact_dir: &'a Path,
     node: &'a Instance,
@@ -97,19 +97,22 @@ pub fn bootstrap_server(
 ) -> Result<Output> {
     let artifact_dir =
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
-    let command = build_bootstrap_command(BootstrapCommandSpec {
+    ensure_guest_bootstrap_prereqs(backend, runner, control_plane, &artifact_dir)?;
+    if k3s_process_running(backend, runner, control_plane, &artifact_dir)? {
+        sync_control_plane_runtime_artifacts(backend, runner, control_plane, &artifact_dir)?;
+        return Ok(Output {
+            stdout: "k3s server already running\n".to_owned(),
+            stderr: String::new(),
+        });
+    }
+    let command = build_k3s_command(&K3sCommandSpec {
         config,
         artifact_dir: &artifact_dir,
         node: control_plane,
         tls_sans,
         join: None,
     })?;
-    backend.guest_sudo_shell(
-        runner,
-        &control_plane.name,
-        &control_plane.artifacts.root,
-        &command,
-    )
+    launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)
 }
 
 pub fn bootstrap_worker(
@@ -120,14 +123,21 @@ pub fn bootstrap_worker(
     join: JoinConfig<'_>,
 ) -> Result<Output> {
     let artifact_dir = backend.guest_artifact_root(&worker.name, &worker.artifacts.root)?;
-    let command = build_bootstrap_command(BootstrapCommandSpec {
+    ensure_guest_bootstrap_prereqs(backend, runner, worker, &artifact_dir)?;
+    if k3s_process_running(backend, runner, worker, &artifact_dir)? {
+        return Ok(Output {
+            stdout: "k3s agent already running\n".to_owned(),
+            stderr: String::new(),
+        });
+    }
+    let command = build_k3s_command(&K3sCommandSpec {
         config,
         artifact_dir: &artifact_dir,
         node: worker,
         tls_sans: &[],
         join: Some(join),
     })?;
-    backend.guest_sudo_shell(runner, &worker.name, &worker.artifacts.root, &command)
+    launch_k3s_process(backend, runner, worker, &artifact_dir, &command)
 }
 
 pub fn start_node_instance(
@@ -209,36 +219,138 @@ pub fn start_worker_instances(
     Ok(started_workers)
 }
 
-fn build_bootstrap_command(spec: BootstrapCommandSpec<'_>) -> Result<String> {
-    build_direct_bootstrap_command(spec)
-}
-
-fn build_direct_bootstrap_command(spec: BootstrapCommandSpec<'_>) -> Result<String> {
-    let artifact_dir = shell_escape(spec.artifact_dir.as_os_str().to_string_lossy().as_ref());
-    let stdout_log_path = spec.artifact_dir.join("k3s.stdout.log");
-    let stderr_log_path = spec.artifact_dir.join("k3s.stderr.log");
-    let stdout_log = shell_escape(stdout_log_path.as_os_str().to_string_lossy().as_ref());
-    let stderr_log = shell_escape(stderr_log_path.as_os_str().to_string_lossy().as_ref());
-    let k3s_command = build_k3s_command(&spec)?;
-    let running_check = running_check(spec.node.role);
-
-    Ok(format!(
-        concat!(
-            "mkdir -p {artifact_dir} /etc/rancher/k3s /var/lib/rancher/k3s; ",
-            "test -f /etc/kalisto/node-image.env; ",
-            "test -x /usr/local/bin/k3s; ",
-            "if {running_check}; then exit 0; fi; ",
-            "nohup /bin/sh -lc {k3s_command} >{stdout_log} 2>{stderr_log} </dev/null &"
+fn ensure_guest_bootstrap_prereqs(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    node: &Instance,
+    artifact_dir: &Path,
+) -> Result<Output> {
+    let artifact_dir = shell_escape(artifact_dir.as_os_str().to_string_lossy().as_ref());
+    backend.guest_sudo_shell(
+        runner,
+        &node.name,
+        &node.artifacts.root,
+        &format!(
+            "mkdir -p {artifact_dir} /etc/rancher/k3s /var/lib/rancher/k3s",
+            artifact_dir = artifact_dir,
         ),
-        artifact_dir = artifact_dir,
-        running_check = running_check,
-        k3s_command = shell_escape(&k3s_command),
-        stdout_log = stdout_log,
-        stderr_log = stderr_log,
-    ))
+    )
 }
 
-fn build_k3s_command(spec: &BootstrapCommandSpec<'_>) -> Result<String> {
+fn k3s_process_running(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    node: &Instance,
+    artifact_dir: &Path,
+) -> Result<bool> {
+    match backend.guest_shell(
+        runner,
+        &node.name,
+        &node.artifacts.root,
+        &running_check_command(artifact_dir, node.role),
+    ) {
+        Ok(_) => Ok(true),
+        Err(Error::CommandFailed { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn launch_k3s_process(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    node: &Instance,
+    artifact_dir: &Path,
+    k3s_command: &str,
+) -> Result<Output> {
+    backend.guest_sudo_shell(
+        runner,
+        &node.name,
+        &node.artifacts.root,
+        &launch_k3s_process_command(artifact_dir, k3s_command),
+    )
+}
+
+fn launch_k3s_process_command(artifact_dir: &Path, k3s_command: &str) -> String {
+    let stdout_log_path = artifact_dir.join("k3s.stdout.log");
+    let stderr_log_path = artifact_dir.join("k3s.stderr.log");
+    let pid_file_path = pid_file_path(artifact_dir);
+    format!(
+        "rm -f {pid_file}; nohup /bin/sh -lc {command} >{stdout_log} 2>{stderr_log} </dev/null & printf '%s\\n' $! > {pid_file}",
+        pid_file = shell_escape(pid_file_path.as_os_str().to_string_lossy().as_ref()),
+        command = shell_escape(k3s_command),
+        stdout_log = shell_escape(stdout_log_path.as_os_str().to_string_lossy().as_ref()),
+        stderr_log = shell_escape(stderr_log_path.as_os_str().to_string_lossy().as_ref()),
+    )
+}
+
+fn pid_file_path(artifact_dir: &Path) -> PathBuf {
+    artifact_dir.join("k3s.pid")
+}
+
+fn running_check_command(artifact_dir: &Path, role: NodeRole) -> String {
+    let pid_file = shell_escape(
+        pid_file_path(artifact_dir)
+            .as_os_str()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    let ps_fallback = match role {
+        NodeRole::ControlPlane => {
+            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])server([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
+        }
+        NodeRole::Worker => {
+            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])agent([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
+        }
+    };
+    format!(
+        "if [ -s {pid_file} ]; then pid=$(cat {pid_file}); test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null && exit 0; fi; if command -v ps >/dev/null 2>&1; then {ps_fallback}; fi; exit 1",
+        pid_file = pid_file,
+        ps_fallback = ps_fallback,
+    )
+}
+
+fn sync_control_plane_runtime_artifacts(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    artifact_dir: &Path,
+) -> Result<Output> {
+    backend.guest_sudo_shell(
+        runner,
+        &control_plane.name,
+        &control_plane.artifacts.root,
+        &control_plane_runtime_artifact_sync_command(artifact_dir),
+    )
+}
+
+fn control_plane_runtime_artifact_sync_command(artifact_dir: &Path) -> String {
+    let kubeconfig_path = shell_escape(
+        artifact_dir
+            .join("kubeconfig.yaml")
+            .as_os_str()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    let token_path = shell_escape(
+        artifact_dir
+            .join("node-token")
+            .as_os_str()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    format!(
+        concat!(
+            "cp /etc/rancher/k3s/k3s.yaml {kubeconfig_path}; ",
+            "if [ -s /var/lib/rancher/k3s/server/node-token ]; then ",
+            "cp /var/lib/rancher/k3s/server/node-token {token_path}; ",
+            "fi"
+        ),
+        kubeconfig_path = kubeconfig_path,
+        token_path = token_path,
+    )
+}
+
+fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
     let server_mode = match spec.node.role {
         NodeRole::ControlPlane => spec.config.server_mode,
         NodeRole::Worker => ServerMode::Standard,
@@ -318,17 +430,6 @@ fn build_k3s_command(spec: &BootstrapCommandSpec<'_>) -> Result<String> {
         .join(" "))
 }
 
-fn running_check(role: NodeRole) -> &'static str {
-    match role {
-        NodeRole::ControlPlane => {
-            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])server([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
-        }
-        NodeRole::Worker => {
-            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])agent([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -336,12 +437,13 @@ mod tests {
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
 
     use super::{
-        Artifacts, BootstrapCommandSpec, Instance, K3sBootstrapConfig, build_bootstrap_command,
-        build_k3s_command, start_worker_instances,
+        Artifacts, Instance, K3sBootstrapConfig, K3sCommandSpec, build_k3s_command,
+        control_plane_runtime_artifact_sync_command, launch_k3s_process_command,
+        start_worker_instances,
     };
 
     #[test]
-    fn worker_bootstrap_command_runs_k3s_directly() {
+    fn worker_launch_command_runs_k3s_directly() {
         let config = K3sBootstrapConfig {
             k3s_version: "v1.33.5+k3s1".to_owned(),
             server_mode: ServerMode::Standard,
@@ -353,7 +455,7 @@ mod tests {
             artifacts: Artifacts::new(PathBuf::from("/tmp/kalisto-w0-test")),
         };
 
-        let command = build_bootstrap_command(BootstrapCommandSpec {
+        let command = build_k3s_command(&K3sCommandSpec {
             config: &config,
             artifact_dir: Path::new("/tmp/kalisto-w0-test"),
             node: &worker,
@@ -365,11 +467,9 @@ mod tests {
         })
         .unwrap();
 
-        assert!(command.contains("nohup /bin/sh -lc"));
         assert!(command.contains("/usr/local/bin/k3s"));
         assert!(command.contains("https://cp.example.test:6443"));
         assert!(command.contains("secret"));
-        assert!(command.contains("mkdir -p '/tmp/kalisto-w0-test'"));
     }
 
     #[test]
@@ -385,7 +485,7 @@ mod tests {
             artifacts: Artifacts::new(PathBuf::from("/tmp/kalisto-cp-test")),
         };
 
-        let command = build_k3s_command(&BootstrapCommandSpec {
+        let command = build_k3s_command(&K3sCommandSpec {
             config: &config,
             artifact_dir: Path::new("/tmp/kalisto-cp-test"),
             node: &control_plane,
@@ -421,5 +521,31 @@ mod tests {
 
         assert!(output.is_empty());
         assert!(started.is_empty());
+    }
+
+    #[test]
+    fn control_plane_bootstrap_command_mirrors_node_token_into_artifacts() {
+        let command = launch_k3s_process_command(
+            Path::new("/tmp/kalisto-cp-test"),
+            "/usr/local/bin/k3s server --write-kubeconfig /tmp/kalisto-cp-test/kubeconfig.yaml",
+        );
+
+        assert!(command.contains("nohup /bin/sh -lc"));
+        assert!(command.contains("/tmp/kalisto-cp-test/k3s.stdout.log"));
+        assert!(command.contains("/tmp/kalisto-cp-test/k3s.stderr.log"));
+        assert!(command.contains("/tmp/kalisto-cp-test/k3s.pid"));
+        assert!(command.contains("write-kubeconfig"));
+        assert!(!command.contains("&;"));
+    }
+
+    #[test]
+    fn sync_control_plane_runtime_artifacts_command_targets_runtime_files() {
+        let command =
+            control_plane_runtime_artifact_sync_command(Path::new("/tmp/kalisto-cp-test"));
+
+        assert!(command.contains("/etc/rancher/k3s/k3s.yaml"));
+        assert!(command.contains("/tmp/kalisto-cp-test/kubeconfig.yaml"));
+        assert!(command.contains("/var/lib/rancher/k3s/server/node-token"));
+        assert!(command.contains("/tmp/kalisto-cp-test/node-token"));
     }
 }

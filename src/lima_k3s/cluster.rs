@@ -229,7 +229,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
     }
 
     let stable_ready_check = format!(
-        "ps -ef | grep -F '[k]3s server' >/dev/null && KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/readyz",
+        "KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/livez",
         shell_escape(
             control_plane
                 .artifacts
@@ -261,7 +261,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
         }
     }
 
-    let api_check = format!("https://127.0.0.1:{}/readyz", config.api_port);
+    let api_check = format!("https://127.0.0.1:{}/livez", config.api_port);
     match wait_for_host_http(runner, &api_check, Duration::from_secs(90)) {
         Ok(output) => results.push(ProbeResult::pass(
             "k3s.apiserver.hostport",

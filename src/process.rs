@@ -20,6 +20,10 @@ pub trait CommandRunner {
     fn run_live(&self, program: &str, args: &[String]) -> Result<Output> {
         self.run(program, args)
     }
+
+    fn system_runner(&self) -> Option<SystemRunner> {
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -32,6 +36,10 @@ impl CommandRunner for SystemRunner {
 
     fn run_live(&self, program: &str, args: &[String]) -> Result<Output> {
         run_command(program, args, raw_streams_enabled())
+    }
+
+    fn system_runner(&self) -> Option<SystemRunner> {
+        Some(*self)
     }
 }
 

@@ -186,6 +186,33 @@ pub fn wait_for_stable_guest_success_with_tail(
     }
 }
 
+pub fn wait_for_stable_guest_success(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    wait: GuestWait<'_>,
+) -> Result<Output> {
+    let started = SystemTime::now();
+    let mut successful_checks = 0usize;
+    loop {
+        match backend.guest_sudo_shell(runner, wait.instance_name, wait.runtime_root, wait.command)
+        {
+            Ok(output) => {
+                successful_checks += 1;
+                if successful_checks >= wait.consecutive_successes {
+                    return Ok(output);
+                }
+            }
+            Err(error) => {
+                successful_checks = 0;
+                if started.elapsed().unwrap_or_default() >= wait.timeout {
+                    return Err(error);
+                }
+            }
+        }
+        thread::sleep(wait.interval);
+    }
+}
+
 pub fn wait_for_host_http_with_tail(
     runner: &dyn CommandRunner,
     url: &str,
@@ -238,13 +265,25 @@ pub fn wait_for_worker_process(
     instance_name: &str,
     runtime_root: &Path,
 ) -> Result<Output> {
+    let artifact_dir = backend.guest_artifact_root(instance_name, runtime_root)?;
+    let pid_file = shell_escape(
+        artifact_dir
+            .join("k3s.pid")
+            .as_os_str()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    let command = format!(
+        "test -s {pid_file} && pid=$(cat {pid_file}) && test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null",
+        pid_file = pid_file,
+    );
     wait_for_stable_guest_success(
         backend,
         runner,
         GuestWait {
             instance_name,
             runtime_root,
-            command: "ps -ef | grep -F '[k]3s agent' >/dev/null",
+            command: &command,
             timeout: Duration::from_secs(60),
             consecutive_successes: 1,
             interval: Duration::from_secs(2),
@@ -282,31 +321,4 @@ pub fn wait_for_node_ready(
             interval: Duration::from_secs(3),
         },
     )
-}
-
-fn wait_for_stable_guest_success(
-    backend: &dyn ClusterBackend,
-    runner: &dyn CommandRunner,
-    wait: GuestWait<'_>,
-) -> Result<Output> {
-    let started = SystemTime::now();
-    let mut successful_checks = 0usize;
-    loop {
-        match backend.guest_sudo_shell(runner, wait.instance_name, wait.runtime_root, wait.command)
-        {
-            Ok(output) => {
-                successful_checks += 1;
-                if successful_checks >= wait.consecutive_successes {
-                    return Ok(output);
-                }
-            }
-            Err(error) => {
-                successful_checks = 0;
-                if started.elapsed().unwrap_or_default() >= wait.timeout {
-                    return Err(error);
-                }
-            }
-        }
-        thread::sleep(wait.interval);
-    }
 }

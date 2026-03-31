@@ -5,8 +5,16 @@ K3S_VERSION="${K3S_VERSION:-v1.33.5+k3s1}"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl iptables kmod openssh-server procps socat
+apt_retry() {
+  apt-get \
+    -o Acquire::Retries=5 \
+    -o Acquire::http::Timeout=30 \
+    -o Acquire::https::Timeout=30 \
+    "$@"
+}
+
+apt_retry update
+apt_retry install -y --no-install-recommends iptables procps socat
 
 mkdir -p /etc/modules-load.d /etc/sysctl.d /etc/kalisto /usr/local/lib/kalisto
 mkdir -p /var/lib/kalisto
@@ -22,24 +30,6 @@ net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 EOF
 
-modprobe overlay || true
-modprobe br_netfilter || true
-sysctl --system || true
-
-ARCH="$(uname -m)"
-case "${ARCH}" in
-  aarch64|arm64)
-    CANDIDATES="k3s-arm64 k3s-aarch64 k3s"
-    ;;
-  x86_64|amd64)
-    CANDIDATES="k3s k3s-amd64 k3s-x86_64"
-    ;;
-  *)
-    echo "unsupported architecture: ${ARCH}" >&2
-    exit 1
-    ;;
-esac
-
 TMP_K3S=/tmp/k3s
 rm -f "${TMP_K3S}"
 
@@ -54,22 +44,36 @@ if [ -x /usr/local/lib/kalisto/cache/k3s ]; then
 fi
 
 if [ ! -x /usr/local/bin/k3s ]; then
-  for ASSET in ${CANDIDATES}; do
-    URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/${ASSET}"
-    if curl -fsSL "${URL}" -o "${TMP_K3S}"; then
-      chmod 0755 "${TMP_K3S}"
-      if "${TMP_K3S}" --version >/dev/null 2>&1; then
-        mv "${TMP_K3S}" /usr/local/bin/k3s
-        break
-      fi
-    fi
-    rm -f "${TMP_K3S}"
-  done
+  echo "k3s binary was not staged into /usr/local/lib/kalisto/cache/k3s" >&2
+  exit 1
 fi
 
-if [ ! -x /usr/local/bin/k3s ]; then
-  echo "k3s binary was not installed for ${ARCH}" >&2
-  exit 1
+rm -f /usr/local/lib/kalisto/cache/k3s /usr/local/lib/kalisto/provision_lima_node.sh
+rmdir /usr/local/lib/kalisto/cache 2>/dev/null || true
+rmdir /usr/local/lib/kalisto 2>/dev/null || true
+
+PURGE_PACKAGES=
+for PACKAGE in \
+  apport \
+  bash-completion \
+  byobu \
+  groff-base \
+  man-db \
+  motd-news-config \
+  multipath-tools \
+  open-iscsi \
+  pollinate \
+  rsyslog \
+  snapd \
+  ubuntu-advantage-tools \
+  update-manager-core
+do
+  if dpkg -s "${PACKAGE}" >/dev/null 2>&1; then
+    PURGE_PACKAGES="${PURGE_PACKAGES} ${PACKAGE}"
+  fi
+done
+if [ -n "${PURGE_PACKAGES}" ]; then
+  apt_retry purge -y --auto-remove ${PURGE_PACKAGES}
 fi
 
 cat > /etc/kalisto/node-image.env <<EOF
@@ -79,6 +83,6 @@ EOF
 
 date -u +"%Y-%m-%dT%H:%M:%SZ" > /var/lib/kalisto/image-ready
 
-apt-get autoremove -y
+apt_retry autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/*

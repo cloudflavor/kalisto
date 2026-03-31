@@ -6,7 +6,8 @@ use tracing::Level;
 
 use crate::backend::BackendKind;
 use crate::cluster::addon::CniPlugin;
-use crate::cluster::spec::ClusterSpec;
+use crate::cluster::spec::{ClusterSpec, ImageArch, parse_image_arch};
+use crate::config::load_project_config;
 use crate::k3s::ServerMode;
 use crate::paths::{default_cluster_name, default_project_root, selected_cluster_name};
 
@@ -28,10 +29,12 @@ pub enum Command {
     Destroy(ClusterLookupArgs),
     Logs(NodeLogsArgs),
     Addon(AddonArgs),
+    Plugin(AddonArgs),
     Use(NamedClusterArgs),
     Scale(ScaleArgs),
     Completions(CompletionsArgs),
-    Ls,
+    #[structopt(name = "list", alias = "ls")]
+    List,
     Stats(StatsArgs),
     Status(ClusterLookupArgs),
     Kubeconfig(ClusterLookupArgs),
@@ -69,6 +72,7 @@ impl NodeLogsArgs {
 #[structopt(rename_all = "kebab")]
 pub enum AddonCommand {
     Install(AddonInstallArgs),
+    Ls(AddonListArgs),
 }
 
 #[derive(Debug, StructOpt)]
@@ -89,6 +93,21 @@ impl AddonInstallArgs {
 }
 
 #[derive(Debug, StructOpt)]
+pub struct AddonListArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+}
+
+impl AddonListArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
 pub struct UpArgs {
     #[structopt(long, parse(from_os_str))]
     pub project_root: Option<PathBuf>,
@@ -98,6 +117,8 @@ pub struct UpArgs {
     pub backend: Option<BackendKind>,
     #[structopt(long)]
     pub template: Option<String>,
+    #[structopt(long = "arch", parse(try_from_str = parse_image_arch))]
+    pub image_arch: Option<ImageArch>,
     #[structopt(long, parse(from_os_str))]
     pub firecracker_kernel: Option<PathBuf>,
     #[structopt(long, parse(from_os_str))]
@@ -134,21 +155,36 @@ pub struct UpArgs {
 
 impl UpArgs {
     pub fn into_cluster_spec(self) -> crate::error::Result<ClusterSpec> {
-        let project_root = default_project_root(self.project_root)?;
-        let name = self
-            .name
+        let project_root = default_project_root(self.project_root.clone())?;
+        let config = load_project_config(&project_root)?;
+        let cli_name = self.name.clone();
+        let name = cli_name
+            .clone()
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.cluster.name.clone())
+            })
             .unwrap_or(default_cluster_name(Some(&project_root))?);
         let mut spec = ClusterSpec::new(name, project_root);
+        if let Some(config) = &config {
+            config.apply_to_cluster_spec(&mut spec)?;
+        }
+        if let Some(name) = cli_name {
+            spec.name = name;
+        }
         if let Some(backend) = self.backend {
             spec.backend = backend;
         }
         if let Some(template) = self.template {
             spec.template = template;
         }
+        spec.image_arch = self.image_arch;
         spec.firecracker_kernel = self.firecracker_kernel;
         spec.firecracker_rootfs = self.firecracker_rootfs;
         if let Some(workers) = self.workers {
             spec.worker_count = workers;
+            spec.requested_worker_count = Some(workers);
             if spec.backend == BackendKind::Lima && workers > 0 && spec.network == "vzNAT" {
                 spec.network = "lima:user-v2".to_owned();
             }
@@ -291,6 +327,8 @@ pub struct BenchArgs {
     pub backend: Option<BackendKind>,
     #[structopt(long)]
     pub template: Option<String>,
+    #[structopt(long = "arch", parse(try_from_str = parse_image_arch))]
+    pub image_arch: Option<ImageArch>,
     #[structopt(long, parse(from_os_str))]
     pub firecracker_kernel: Option<PathBuf>,
     #[structopt(long, parse(from_os_str))]
@@ -335,6 +373,7 @@ impl BenchArgs {
             name: self.name,
             backend: self.backend,
             template: self.template,
+            image_arch: self.image_arch,
             firecracker_kernel: self.firecracker_kernel,
             firecracker_rootfs: self.firecracker_rootfs,
             workers: self.workers,
@@ -394,9 +433,12 @@ pub struct MacosLimaK3sArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use structopt::StructOpt;
 
     use crate::cluster::addon::CniPlugin;
+    use crate::cluster::spec::ImageArch;
 
     use super::{Cli, Command};
 
@@ -507,6 +549,16 @@ mod tests {
     }
 
     #[test]
+    fn up_command_parses_image_arch_flag() {
+        let cli = Cli::from_iter_safe(["kalisto", "up", "--arch", "amd64"]).expect("parse");
+
+        match cli.command {
+            Command::Up(args) => assert_eq!(args.image_arch, Some(ImageArch::X86_64)),
+            other => panic!("expected up command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn addon_install_command_parses_catalog_id() {
         let cli =
             Cli::from_iter_safe(["kalisto", "addon", "install", "lb/metallb"]).expect("parse");
@@ -517,9 +569,117 @@ mod tests {
                     assert!(args.name.is_none());
                     assert_eq!(args.addon, "lb/metallb");
                 }
+                other => panic!("expected addon install command, got {other:?}"),
             },
             other => panic!("expected addon command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn addon_ls_command_parses_optional_cluster_name() {
+        let cli = Cli::from_iter_safe(["kalisto", "addon", "ls", "--name", "dev"]).expect("parse");
+
+        match cli.command {
+            Command::Addon(args) => match args.command {
+                super::AddonCommand::Ls(args) => assert_eq!(args.name.as_deref(), Some("dev")),
+                other => panic!("expected addon ls command, got {other:?}"),
+            },
+            other => panic!("expected addon command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_alias_command_parses_ls_subcommand() {
+        let cli = Cli::from_iter_safe(["kalisto", "plugin", "ls"]).expect("parse");
+
+        match cli.command {
+            Command::Plugin(args) => match args.command {
+                super::AddonCommand::Ls(args) => assert!(args.name.is_none()),
+                other => panic!("expected plugin ls command, got {other:?}"),
+            },
+            other => panic!("expected plugin command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn up_command_loads_kalisto_toml_into_cluster_spec() {
+        let root = std::env::temp_dir().join(format!("kalisto-cli-config-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("kalisto.toml"),
+            r#"
+[cluster]
+name = "from-config"
+backend = "lima"
+api_port = 17443
+
+[plugins.cilium]
+enabled = true
+version = "1.19.2"
+"#,
+        )
+        .unwrap();
+
+        let cli = Cli::from_iter_safe(["kalisto", "up", "--project-root", root.to_str().unwrap()])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                let spec = args.into_cluster_spec().unwrap();
+                assert_eq!(spec.name, "from-config");
+                assert_eq!(spec.api_port, 17443);
+                assert_eq!(spec.cni_plugin, CniPlugin::Cilium);
+                assert_eq!(spec.cilium_version, "1.19.2");
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn up_command_cli_flags_override_kalisto_toml() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-cli-override-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("kalisto.toml"),
+            r#"
+[cluster]
+name = "from-config"
+api_port = 17443
+
+[plugins.cilium]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "up",
+            "--project-root",
+            root.to_str().unwrap(),
+            "--name",
+            "from-cli",
+            "--api-port",
+            "18443",
+            "--cni",
+            "flannel",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                let spec = args.into_cluster_spec().unwrap();
+                assert_eq!(spec.name, "from-cli");
+                assert_eq!(spec.api_port, 18443);
+                assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -558,5 +718,14 @@ mod tests {
     #[test]
     fn remove_command_is_rejected() {
         assert!(Cli::from_iter_safe(["kalisto", "remove", "--name", "dev"]).is_err());
+    }
+
+    #[test]
+    fn list_command_accepts_ls_alias() {
+        let cli = Cli::from_iter_safe(["kalisto", "ls"]).expect("parse");
+        match cli.command {
+            Command::List => {}
+            other => panic!("expected list command, got {other:?}"),
+        }
     }
 }

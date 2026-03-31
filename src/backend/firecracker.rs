@@ -487,6 +487,7 @@ impl NetworkConfig {
         let third = 1 + ((hash >> 8) % 254) as u8;
         let fourth = 2 + (hash % 253) as u8;
         let host_ip = BRIDGE_HOST_IP.to_owned();
+        // TODO: make this configurable, do not hardcode
         let guest_ip = format!("172.31.{third}.{fourth}");
         let guest_mac = format!(
             "06:00:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -517,6 +518,7 @@ fn build_config_json(
 ) -> String {
     let mem_size_mib = u32::from(instance.memory_gib) * 1024;
     format!(
+        // TODO: change this garbage to a struct and json
         concat!(
             "{{\n",
             "  \"boot-source\": {{\n",
@@ -565,6 +567,7 @@ fn write_cloud_init_files(
 
     write_file(
         &runtime.user_data,
+        // TODO: change this garbage to a struct and yaml serializer
         &format!(
             concat!(
                 "#cloud-config\n",
@@ -641,6 +644,8 @@ fn inject_nocloud_seed(
     write_file(
         &command_file,
         &format!(
+            // TODO: why is this garbage not a dedicated function that executes commands on
+            // the gues
             concat!(
                 "mkdir /var/lib/cloud\n",
                 "mkdir /var/lib/cloud/seed\n",

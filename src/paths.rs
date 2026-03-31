@@ -178,8 +178,8 @@ mod tests {
 
     use super::{
         artifacts_root, clear_default_cluster_name_if_matches, config_root, data_root,
-        default_cluster_file, default_cluster_name, read_default_cluster_name,
-        selected_cluster_name, write_default_cluster_name,
+        default_cluster_name, read_default_cluster_name, selected_cluster_name,
+        write_default_cluster_name,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -283,7 +283,8 @@ mod tests {
         );
 
         clear_default_cluster_name_if_matches("profile-dev").unwrap();
-        assert!(!default_cluster_file().unwrap().exists());
+        assert_eq!(read_default_cluster_name().unwrap(), None);
+        assert_eq!(selected_cluster_name().unwrap(), None);
 
         restore_env("HOME", original_home);
         restore_env("XDG_CONFIG_HOME", original_xdg_config_home);

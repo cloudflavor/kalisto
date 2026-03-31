@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tracing::{info, info_span, warn};
 
 use crate::artifact::resolve_cluster_spec;
@@ -11,16 +12,16 @@ use crate::cluster::addon::{
     AddonId, CniPlugin, install_catalog_addon_with_cilium_version, install_post_ready_addons,
 };
 use crate::cluster::node::{
-    Instance, JoinConfig, K3sBootstrapConfig, bootstrap_server, bootstrap_worker,
-    start_worker_instances,
+    Instance, JoinConfig, K3sBootstrapConfig, StartedWorker, bootstrap_server, bootstrap_worker,
+    start_node_instance, start_worker_instances,
 };
 use crate::cluster::spec::ClusterSpec;
 use crate::cluster::state::{ClusterState, NodeState};
 use crate::cluster::util::{format_duration, initial_readiness_command};
 use crate::cluster::wait::{
     GuestFileCopy, GuestWait, LiveLogTail, wait_for_guest_text_file_copy,
-    wait_for_host_http_with_tail, wait_for_node_ready, wait_for_path_with_tail,
-    wait_for_stable_guest_success_with_tail, wait_for_worker_process,
+    wait_for_host_http_with_tail, wait_for_node_ready, wait_for_stable_guest_success_with_tail,
+    wait_for_worker_process,
 };
 use crate::error::{Error, Result};
 use crate::k3s::NodeRole;
@@ -150,11 +151,12 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
     ensure_path_exists(&resolved_spec.workspace_root)?;
     let workspace_root = canonicalize_path(&resolved_spec.workspace_root)?;
     let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &resolved_spec.name);
-    fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
-    fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
 
     let backend = backend_for(resolved_spec.backend);
     backend.check_available(runner)?;
+
+    fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
+    fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
 
     let state = cluster_state_from_spec(&resolved_spec, workspace_root.clone(), &state_root);
     let instance_names = state
@@ -186,10 +188,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.exists() {
-        return Err(Error::InvalidArgs(format!(
-            "cluster `{}` is not created; run `kalisto create --name {}` first",
-            spec.name, spec.name
-        )));
+        create_with_runner(spec, runner)?;
     }
     let state = ClusterState::load(&state_root)?;
     if cluster_has_running_nodes(runner, &state)? {
@@ -198,9 +197,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
             state.name
         )));
     }
-    let mut resolved_spec = cluster_spec_from_state(&state);
-    resolved_spec.keep_failed_runtime = spec.keep_failed_runtime;
-    resolved_spec.stream_vm_logs = spec.stream_vm_logs;
+    let resolved_spec = resolve_up_spec(&state, spec);
     let spec = &resolved_spec;
     let up_span = info_span!(
         "cluster_up",
@@ -217,6 +214,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let workspace_root = canonicalize_path(&spec.workspace_root)?;
 
     let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+
+    let backend = backend_for(spec.backend);
+    backend.check_available(runner)?;
+
     fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
     fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
     info!(
@@ -226,9 +227,6 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         runtime_root = %runtime_root.display(),
         "resolved cluster paths"
     );
-
-    let backend = backend_for(spec.backend);
-    backend.check_available(runner)?;
 
     let base_config = BackendConfig {
         template: spec.template.clone(),
@@ -296,12 +294,8 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let control_plane_guest_artifacts =
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
-    let control_plane_guest_token = match spec.backend {
-        BackendKind::Firecracker => {
-            Path::new("/var/lib/rancher/k3s/server/node-token").to_path_buf()
-        }
-        BackendKind::Lima => control_plane_guest_artifacts.join("node-token"),
-    };
+    let control_plane_guest_token =
+        Path::new("/var/lib/rancher/k3s/server/node-token").to_path_buf();
 
     let k3s_config = K3sBootstrapConfig {
         k3s_version: spec.k3s_version.clone(),
@@ -409,7 +403,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
 
     let stable_ready_check = format!(
-        "ps -ef | grep -F '[k]3s server' >/dev/null && KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/readyz",
+        "KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/livez",
         shell_escape(
             control_plane_guest_kubeconfig
                 .as_os_str()
@@ -441,7 +435,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
-    let api_check = format!("https://{api_endpoint}/readyz");
+    let api_check = format!("https://{api_endpoint}/livez");
     info!(url = %api_check, "waiting for control-plane API on the host");
     if let Err(error) = wait_for_host_http_with_tail(
         runner,
@@ -879,9 +873,10 @@ fn scale_at_root(
         .iter()
         .map(|worker| worker.name.clone())
         .collect::<Vec<_>>();
+    cleanup_scale_target_instances(backend, runner, &new_workers);
     backend.prepare_cluster_network(runner, &new_worker_names)?;
 
-    start_and_join_workers(
+    if let Err(error) = start_and_join_workers(
         backend,
         runner,
         WorkerJoinContext {
@@ -896,8 +891,11 @@ fn scale_at_root(
         },
         &new_workers,
         &mut state.nodes,
-        true,
-    )?;
+        state.cni_plugin != CniPlugin::None,
+    ) {
+        cleanup_scale_target_instances(backend, runner, &new_workers);
+        return Err(error);
+    }
 
     let added_workers = new_workers
         .iter()
@@ -970,6 +968,7 @@ fn install_addon_at_root(
     let addon_id = AddonId::parse(addon)
         .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
     let mut state = ClusterState::load(state_root)?;
+    validate_addon_install_allowed(&state, addon_id)?;
     let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
     let backend = backend_for(state.backend);
     let control_plane_state = state
@@ -1007,48 +1006,6 @@ fn install_addon_at_root(
         "installing cluster add-on"
     );
     let desired_state_changed = record_desired_addon_state(&mut state, addon_id);
-    let flannel_interface_present = if addon_id == AddonId::CniCilium {
-        backend
-            .guest_shell(
-                runner,
-                &control_plane.name,
-                &control_plane.artifacts.root,
-                "ip link show flannel.1 >/dev/null 2>&1",
-            )
-            .is_ok()
-    } else {
-        false
-    };
-    let recycle_required = should_recycle_cluster_for_addon(
-        addon_id,
-        desired_state_changed,
-        flannel_interface_present,
-    );
-    if desired_state_changed {
-        state.save(state_root)?;
-        if let Err(error) =
-            handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root)
-        {
-            warn!(
-                error = %error,
-                state_root = %state_root.display(),
-                runtime_root = %runtime_root.display(),
-                "failed to hand off cluster files to invoking user"
-            );
-        }
-    }
-
-    if recycle_required {
-        info!(
-            cluster = %state.name,
-            addon = addon_id.as_str(),
-            desired_state_changed,
-            flannel_interface_present,
-            "restarting cluster to apply add-on runtime changes"
-        );
-        down_at_root(state_root, name, false, runner)?;
-        up_with_runner(&cluster_spec_from_state(&state), runner)?;
-    }
 
     install_catalog_addon_with_cilium_version(
         backend,
@@ -1079,16 +1036,17 @@ fn install_addon_at_root(
     })
 }
 
-fn should_recycle_cluster_for_addon(
-    addon_id: AddonId,
-    desired_state_changed: bool,
-    flannel_interface_present: bool,
-) -> bool {
-    match addon_id {
-        AddonId::CniCilium => desired_state_changed || flannel_interface_present,
-        AddonId::CniFlannel => desired_state_changed,
-        AddonId::LbServiceLb => desired_state_changed,
-        _ => false,
+fn validate_addon_install_allowed(state: &ClusterState, addon_id: AddonId) -> Result<()> {
+    match (state.cni_plugin, addon_id) {
+        (CniPlugin::Cilium, AddonId::CniFlannel) | (CniPlugin::Flannel, AddonId::CniCilium) => {
+            Err(Error::InvalidArgs(format!(
+                "cannot install `{}` on cluster `{}` because it is already configured with CNI `{}`; CNI add-ons are mutually exclusive",
+                addon_id.as_str(),
+                state.name,
+                state.cni_plugin.as_str(),
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1201,7 +1159,8 @@ pub fn stats_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<Clust
                 state.worker_resources.memory_gib,
             ),
         };
-        let host_metrics = load_host_node_metrics(runner, state.backend, &node.artifacts_root);
+        let host_metrics =
+            load_host_node_metrics(runner, state.backend, &node.name, &node.artifacts_root);
         nodes.push(NodeStats {
             name: node.name.clone(),
             role: node.role,
@@ -1293,12 +1252,107 @@ struct HostNodeMetrics {
 fn load_host_node_metrics(
     runner: &dyn CommandRunner,
     backend: BackendKind,
+    instance_name: &str,
     artifacts_root: &Path,
 ) -> HostNodeMetrics {
     match backend {
         BackendKind::Firecracker => load_firecracker_host_metrics(runner, artifacts_root),
-        BackendKind::Lima => HostNodeMetrics::default(),
+        BackendKind::Lima => load_lima_host_metrics(runner, instance_name),
     }
+}
+
+fn load_lima_host_metrics(runner: &dyn CommandRunner, instance_name: &str) -> HostNodeMetrics {
+    let mut metrics = query_lima_instance_metrics(runner, instance_name).unwrap_or_default();
+    if let Some(pid) = metrics.pid
+        && let Ok((rss_bytes, vsz_bytes)) = read_process_memory_bytes(runner, pid)
+    {
+        metrics.rss_bytes = rss_bytes;
+        let _ = vsz_bytes;
+        metrics.vsz_bytes = None;
+    }
+    if let Ok((guest_ip, rx_bytes, tx_bytes)) =
+        query_lima_guest_network_metrics(runner, instance_name)
+    {
+        metrics.guest_ip = guest_ip.or(metrics.guest_ip);
+        metrics.rx_bytes = rx_bytes;
+        metrics.tx_bytes = tx_bytes;
+    }
+    metrics
+}
+
+fn query_lima_instance_metrics(
+    runner: &dyn CommandRunner,
+    instance_name: &str,
+) -> Result<HostNodeMetrics> {
+    let output = runner.run(
+        "limactl",
+        &[
+            "list".to_owned(),
+            "--format".to_owned(),
+            "{{ .Name }}\t{{ .Dir }}\t{{ .HostAgentPID }}\t{{ .DriverPID }}\t{{ .Disk }}"
+                .to_owned(),
+            instance_name.to_owned(),
+        ],
+    )?;
+    parse_lima_instance_metrics(&output.stdout, instance_name)
+}
+
+fn parse_lima_instance_metrics(output: &str, instance_name: &str) -> Result<HostNodeMetrics> {
+    let line = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| Error::InvalidArgs(format!("no Lima stats found for `{instance_name}`")))?;
+    let parts = line.split('\t').collect::<Vec<_>>();
+    if parts.len() < 5 {
+        return Err(Error::InvalidArgs(format!(
+            "unexpected Lima stats output for `{instance_name}`: {line}"
+        )));
+    }
+
+    let host_agent_pid = parse_optional_u32(parts[2]);
+    let driver_pid = parse_optional_u32(parts[3]);
+    Ok(HostNodeMetrics {
+        pid: host_agent_pid.or(driver_pid),
+        guest_ip: None,
+        rss_bytes: None,
+        vsz_bytes: None,
+        rootfs_bytes: parse_optional_u64(parts[4]),
+        rx_bytes: None,
+        tx_bytes: None,
+    })
+}
+
+fn query_lima_guest_network_metrics(
+    runner: &dyn CommandRunner,
+    instance_name: &str,
+) -> Result<(Option<String>, Option<u64>, Option<u64>)> {
+    let output = runner.run(
+        "limactl",
+        &[
+            "-y".to_owned(),
+            "shell".to_owned(),
+            instance_name.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            concat!(
+                "iface=$(ip route show default 2>/dev/null | awk 'NR==1 {print $5}'); ",
+                "ip=$(ip -o -4 addr show scope global 2>/dev/null | awk 'NR==1 {sub(/\\/.*/, \"\", $4); print $4}'); ",
+                "printf '%s\\n' \"$ip\"; ",
+                "if [ -n \"$iface\" ] && [ -r \"/sys/class/net/$iface/statistics/rx_bytes\" ]; then cat \"/sys/class/net/$iface/statistics/rx_bytes\"; else echo; fi; ",
+                "if [ -n \"$iface\" ] && [ -r \"/sys/class/net/$iface/statistics/tx_bytes\" ]; then cat \"/sys/class/net/$iface/statistics/tx_bytes\"; else echo; fi"
+            )
+            .to_owned(),
+        ],
+    )?;
+    Ok(parse_lima_guest_network_metrics(&output.stdout))
+}
+
+fn parse_lima_guest_network_metrics(output: &str) -> (Option<String>, Option<u64>, Option<u64>) {
+    let mut lines = output.lines();
+    let guest_ip = lines.next().and_then(non_empty_string);
+    let rx_bytes = lines.next().and_then(parse_optional_u64);
+    let tx_bytes = lines.next().and_then(parse_optional_u64);
+    (guest_ip, rx_bytes, tx_bytes)
 }
 
 fn load_firecracker_host_metrics(
@@ -1377,6 +1431,33 @@ fn read_optional_trimmed(path: &Path) -> Option<String> {
     }
 }
 
+fn parse_optional_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "-" || trimmed == "0" {
+        None
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+fn parse_optional_u64(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        None
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn read_optional_u32(path: &Path) -> Option<u32> {
     read_optional_trimmed(path)?.parse::<u32>().ok()
 }
@@ -1445,6 +1526,22 @@ fn cleanup_instances(
     delete_instances(backend, runner, nodes);
 }
 
+fn cleanup_scale_target_instances(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    workers: &[Instance],
+) {
+    let nodes = workers
+        .iter()
+        .map(|worker| NodeState {
+            name: worker.name.clone(),
+            role: worker.role,
+            artifacts_root: worker.artifacts.root.clone(),
+        })
+        .collect::<Vec<_>>();
+    cleanup_instances(backend, runner, &nodes);
+}
+
 fn stop_instances(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -1474,13 +1571,24 @@ fn delete_instances(backend: &dyn ClusterBackend, runner: &dyn CommandRunner, no
 }
 
 fn start_and_join_workers(
-    backend: &dyn ClusterBackend,
+    backend: &'static dyn ClusterBackend,
     runner: &dyn CommandRunner,
     context: WorkerJoinContext<'_>,
     worker_instances: &[Instance],
     instances: &mut Vec<NodeState>,
     wait_for_ready: bool,
 ) -> Result<()> {
+    if let Some(system_runner) = runner.system_runner() {
+        return start_and_join_workers_parallel(
+            backend,
+            system_runner,
+            context,
+            worker_instances,
+            instances,
+            wait_for_ready,
+        );
+    }
+
     let started_workers = start_worker_instances(
         backend,
         runner,
@@ -1528,6 +1636,134 @@ fn start_and_join_workers(
     Ok(())
 }
 
+fn start_and_join_workers_parallel(
+    backend: &'static dyn ClusterBackend,
+    runner: SystemRunner,
+    context: WorkerJoinContext<'_>,
+    worker_instances: &[Instance],
+    instances: &mut Vec<NodeState>,
+    wait_for_ready: bool,
+) -> Result<()> {
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(io_error("tokio-runtime-build"))?;
+
+    let base_config = context.base_config.clone();
+    let worker_cpus = context.worker_cpus;
+    let worker_memory_gib = context.worker_memory_gib;
+    let workers = worker_instances.to_vec();
+
+    let mut started_workers = runtime.block_on(async move {
+        let mut joins = Vec::with_capacity(workers.len());
+        for worker in workers {
+            let base_config = base_config.clone();
+            joins.push(tokio::task::spawn_blocking(
+                move || -> Result<StartedWorker> {
+                    fs::create_dir_all(&worker.artifacts.root)
+                        .map_err(io_error("create_dir_all"))?;
+                    let boot_started = Instant::now();
+                    info!(
+                        node = %worker.name,
+                        cpus = worker_cpus,
+                        memory_gib = worker_memory_gib,
+                        "starting worker VM"
+                    );
+                    start_node_instance(
+                        backend,
+                        &runner,
+                        &base_config,
+                        &worker,
+                        None,
+                        worker_cpus,
+                        worker_memory_gib,
+                    )
+                    .map_err(|error| Error::InvalidArgs(format!("{}: {error}", worker.name)))?;
+                    info!(node = %worker.name, "worker VM started");
+                    Ok(StartedWorker {
+                        node: worker,
+                        boot_started,
+                    })
+                },
+            ));
+        }
+
+        let mut started = Vec::new();
+        for join in joins {
+            let started_worker = join.await.map_err(|error| {
+                Error::InvalidArgs(format!("worker start task failed: {error}"))
+            })??;
+            started.push(started_worker);
+        }
+        Ok::<Vec<StartedWorker>, Error>(started)
+    })?;
+
+    for started_worker in &started_workers {
+        instances.push(NodeState {
+            name: started_worker.node.name.clone(),
+            role: started_worker.node.role,
+            artifacts_root: started_worker.node.artifacts.root.clone(),
+        });
+    }
+
+    let k3s_config = context.k3s_config.clone();
+    let control_plane = context.control_plane.clone();
+    let control_plane_guest_kubeconfig = context.control_plane_guest_kubeconfig.to_path_buf();
+    let server_url = context.server_url.to_owned();
+    let server_token = context.server_token.to_owned();
+
+    runtime.block_on(async move {
+        let mut joins = Vec::with_capacity(started_workers.len());
+        for started_worker in started_workers.drain(..) {
+            let k3s_config = k3s_config.clone();
+            let control_plane = control_plane.clone();
+            let control_plane_guest_kubeconfig = control_plane_guest_kubeconfig.clone();
+            let server_url = server_url.clone();
+            let server_token = server_token.clone();
+            joins.push(tokio::task::spawn_blocking(move || -> Result<()> {
+                let worker = started_worker.node;
+                info!(node = %worker.name, "bootstrapping worker");
+                bootstrap_worker(
+                    backend,
+                    &runner,
+                    &k3s_config,
+                    &worker,
+                    JoinConfig {
+                        server_url: &server_url,
+                        token: &server_token,
+                    },
+                )?;
+                info!(node = %worker.name, "waiting for worker process");
+                wait_for_worker_process(backend, &runner, &worker.name, &worker.artifacts.root)?;
+                if wait_for_ready {
+                    info!(node = %worker.name, "waiting for worker readiness");
+                    wait_for_node_ready(
+                        backend,
+                        &runner,
+                        &control_plane.name,
+                        &control_plane.artifacts.root,
+                        &control_plane_guest_kubeconfig,
+                        &worker.name,
+                    )?;
+                    info!(
+                        node = %worker.name,
+                        ready_after = %format_duration(started_worker.boot_started.elapsed()),
+                        "worker is ready"
+                    );
+                }
+                Ok(())
+            }));
+        }
+
+        for join in joins {
+            join.await.map_err(|error| {
+                Error::InvalidArgs(format!("worker bootstrap task failed: {error}"))
+            })??;
+        }
+        Ok::<(), Error>(())
+    })
+}
+
 fn instance_status_is_running(status: &str) -> bool {
     status.split_whitespace().any(|token| token == "Running")
 }
@@ -1549,10 +1785,12 @@ fn cluster_spec_from_state(state: &ClusterState) -> ClusterSpec {
         backend: state.backend,
         workspace_root: state.workspace_root.clone(),
         template: state.template.clone(),
+        image_arch: None,
         firecracker_kernel: state.firecracker_kernel.clone(),
         firecracker_rootfs: state.firecracker_rootfs.clone(),
         api_port: state.api_port,
         worker_count: state.worker_count,
+        requested_worker_count: None,
         control_plane_resources: state.control_plane_resources,
         worker_resources: state.worker_resources,
         enable_rosetta: state.enable_rosetta,
@@ -1566,6 +1804,17 @@ fn cluster_spec_from_state(state: &ClusterState) -> ClusterSpec {
         keep_failed_runtime: false,
         stream_vm_logs: false,
     }
+}
+
+fn resolve_up_spec(state: &ClusterState, requested: &ClusterSpec) -> ClusterSpec {
+    let mut resolved_spec = cluster_spec_from_state(state);
+    if let Some(workers) = requested.requested_worker_count {
+        resolved_spec.worker_count = workers;
+        resolved_spec.requested_worker_count = Some(workers);
+    }
+    resolved_spec.keep_failed_runtime = requested.keep_failed_runtime;
+    resolved_spec.stream_vm_logs = requested.stream_vm_logs;
+    resolved_spec
 }
 
 fn cluster_state_from_spec(
@@ -1708,21 +1957,18 @@ fn sync_control_plane_artifact(
     timeout: Duration,
     tail: &mut LiveLogTail,
 ) -> Result<()> {
-    match backend.kind() {
-        BackendKind::Lima => wait_for_path_with_tail(host_path, timeout, tail),
-        BackendKind::Firecracker => wait_for_guest_text_file_copy(
-            backend,
-            runner,
-            GuestFileCopy {
-                instance_name: &control_plane.name,
-                runtime_root: &control_plane.artifacts.root,
-                guest_path,
-                host_path,
-                timeout,
-            },
-            tail,
-        ),
-    }
+    wait_for_guest_text_file_copy(
+        backend,
+        runner,
+        GuestFileCopy {
+            instance_name: &control_plane.name,
+            runtime_root: &control_plane.artifacts.root,
+            guest_path,
+            host_path,
+            timeout,
+        },
+        tail,
+    )
 }
 
 fn persist_kubeconfig(source: &Path, destination: &Path, api_endpoint: &str) -> Result<()> {
@@ -1814,15 +2060,17 @@ mod tests {
 
     use crate::backend::BackendKind;
     use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION};
-    use crate::cluster::spec::NodeResources;
+    use crate::cluster::node::Instance;
+    use crate::cluster::spec::{ClusterSpec, NodeResources};
     use crate::cluster::state::{ClusterState, NodeState};
     use crate::error::Error;
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
     use crate::process::{CommandRunner, Output};
 
     use super::{
-        down_at_root, list_at_root, logs_at_root, record_desired_addon_state, scale_at_root,
-        should_recycle_cluster_for_addon,
+        cleanup_scale_target_instances, down_at_root, install_addon_at_root, list_at_root,
+        logs_at_root, parse_lima_guest_network_metrics, parse_lima_instance_metrics,
+        record_desired_addon_state, resolve_up_spec, scale_at_root, validate_addon_install_allowed,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1830,6 +2078,8 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         statuses: HashMap<String, String>,
+        fail_limactl_version: bool,
+        fail_on_arg_substring: Option<String>,
         invocations: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     }
 
@@ -1840,6 +2090,32 @@ mod tests {
                     .into_iter()
                     .map(|(name, status)| (name.to_owned(), status.to_owned()))
                     .collect(),
+                fail_limactl_version: false,
+                fail_on_arg_substring: None,
+                invocations: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_limactl_version_failure() -> Self {
+            Self {
+                statuses: HashMap::new(),
+                fail_limactl_version: true,
+                fail_on_arg_substring: None,
+                invocations: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_invocation_failure_containing(
+            statuses: impl IntoIterator<Item = (&'static str, &'static str)>,
+            needle: &str,
+        ) -> Self {
+            Self {
+                statuses: statuses
+                    .into_iter()
+                    .map(|(name, status)| (name.to_owned(), status.to_owned()))
+                    .collect(),
+                fail_limactl_version: false,
+                fail_on_arg_substring: Some(needle.to_owned()),
                 invocations: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -1851,6 +2127,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((program.to_owned(), args.to_vec()));
+            if self.fail_limactl_version
+                && program == "limactl"
+                && args == [String::from("--version")]
+            {
+                return Err(Error::CommandFailed {
+                    program: program.to_owned(),
+                    args: args.to_vec(),
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "limactl: must not run as the root user".to_owned(),
+                });
+            }
             if program == "limactl"
                 && args.first().map(String::as_str) == Some("list")
                 && args.last().is_some()
@@ -1864,6 +2152,18 @@ mod tests {
                 return Ok(Output {
                     stdout: format!("{instance_name} {status} vz\n"),
                     stderr: String::new(),
+                });
+            }
+            if let Some(needle) = &self.fail_on_arg_substring
+                && program == "limactl"
+                && args.iter().any(|arg| arg.contains(needle))
+            {
+                return Err(Error::CommandFailed {
+                    program: program.to_owned(),
+                    args: args.to_vec(),
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!("simulated invocation failure for `{needle}`"),
                 });
             }
 
@@ -1972,6 +2272,110 @@ mod tests {
     }
 
     #[test]
+    fn scale_with_runner_skips_worker_readiness_when_cluster_has_no_cni() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-scale-no-cni-{}", std::process::id()));
+        let workspace_root = root.join("workspace");
+        let state_root = workspace_root.join(".kalisto").join("clusters").join("dev");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![
+                ("kalisto-dev-cp", NodeRole::ControlPlane),
+                ("kalisto-dev-w0", NodeRole::Worker),
+            ],
+        );
+        fs::write(state_root.join("node-token"), "secret\n").unwrap();
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        state.cni_plugin = CniPlugin::None;
+        CniPlugin::None.apply_component_defaults(&mut state.component_toggles);
+        state.save(&state_root).unwrap();
+
+        let runner = FakeRunner::with_invocation_failure_containing(
+            [("kalisto-dev-cp", "Running")],
+            "kubectl get node",
+        );
+        let outcome = scale_at_root(&state_root, "dev", 2, &runner).unwrap();
+
+        assert_eq!(outcome.previous_workers, 1);
+        assert_eq!(outcome.current_workers, 2);
+        assert_eq!(outcome.added_workers, vec!["kalisto-dev-w1".to_owned()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_scale_target_instances_deletes_target_workers() {
+        let runner = FakeRunner::default();
+        let workers = vec![
+            Instance::new(
+                "kalisto-dev-w1".to_owned(),
+                NodeRole::Worker,
+                Path::new("/tmp/kalisto-dev-w1").to_path_buf(),
+            ),
+            Instance::new(
+                "kalisto-dev-w2".to_owned(),
+                NodeRole::Worker,
+                Path::new("/tmp/kalisto-dev-w2").to_path_buf(),
+            ),
+        ];
+
+        cleanup_scale_target_instances(&crate::backend::lima::BACKEND, &runner, &workers);
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert!(invocations.iter().any(|(program, args)| {
+            program == "limactl"
+                && args
+                    == &vec![
+                        "-y".to_owned(),
+                        "delete".to_owned(),
+                        "--force".to_owned(),
+                        "kalisto-dev-w2".to_owned(),
+                    ]
+        }));
+        assert!(invocations.iter().any(|(program, args)| {
+            program == "limactl"
+                && args
+                    == &vec![
+                        "-y".to_owned(),
+                        "delete".to_owned(),
+                        "--force".to_owned(),
+                        "kalisto-dev-w1".to_owned(),
+                    ]
+        }));
+    }
+
+    #[test]
+    fn up_with_runner_respects_requested_worker_count_for_existing_cluster() {
+        let root = std::env::temp_dir().join(format!("kalisto-up-workers-{}", std::process::id()));
+        let workspace_root = root.join("workspace");
+        let state_root = workspace_root.join(".kalisto").join("clusters").join("dev");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![
+                ("kalisto-dev-cp", NodeRole::ControlPlane),
+                ("kalisto-dev-w0", NodeRole::Worker),
+            ],
+        );
+
+        let mut spec = ClusterSpec::new("dev".to_owned(), workspace_root.clone());
+        spec.worker_count = 5;
+        spec.requested_worker_count = Some(5);
+        let state = ClusterState::load(&state_root).unwrap();
+
+        let resolved = resolve_up_spec(&state, &spec);
+
+        assert_eq!(resolved.worker_count, 5);
+        assert_eq!(resolved.requested_worker_count, Some(5));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn record_desired_cilium_state_updates_cluster_networking_mode() {
         let root = std::env::temp_dir().join(format!("kalisto-addon-state-{}", std::process::id()));
         let state_root = root.join("cluster");
@@ -2044,52 +2448,163 @@ mod tests {
     }
 
     #[test]
-    fn addon_recycle_rules_match_runtime_requirements() {
-        assert!(should_recycle_cluster_for_addon(
-            AddonId::CniCilium,
-            true,
-            false
+    fn addon_installs_do_not_require_cluster_recycle() {
+        let mut state = fixture_cluster_state("dev");
+
+        assert!(record_desired_addon_state(&mut state, AddonId::CniCilium));
+        assert!(record_desired_addon_state(&mut state, AddonId::LbServiceLb));
+        assert!(record_desired_addon_state(
+            &mut state,
+            AddonId::StorageLocalPath
         ));
-        assert!(should_recycle_cluster_for_addon(
-            AddonId::CniCilium,
-            false,
-            true
-        ));
-        assert!(!should_recycle_cluster_for_addon(
-            AddonId::CniCilium,
-            false,
-            false
-        ));
-        assert!(should_recycle_cluster_for_addon(
-            AddonId::CniFlannel,
-            true,
-            false
-        ));
-        assert!(!should_recycle_cluster_for_addon(
-            AddonId::CniFlannel,
-            false,
-            true
-        ));
-        assert!(should_recycle_cluster_for_addon(
-            AddonId::LbServiceLb,
-            true,
-            false
-        ));
-        assert!(!should_recycle_cluster_for_addon(
-            AddonId::LbServiceLb,
-            false,
-            true
-        ));
-        assert!(!should_recycle_cluster_for_addon(
-            AddonId::StorageLocalPath,
-            true,
-            true
-        ));
-        assert!(!should_recycle_cluster_for_addon(
-            AddonId::IngressTraefik,
-            true,
-            true
-        ));
+    }
+
+    #[test]
+    fn install_addon_rejects_flannel_when_cluster_uses_cilium() {
+        let mut state = fixture_cluster_state("dev");
+        state.cni_plugin = CniPlugin::Cilium;
+
+        let error = validate_addon_install_allowed(&state, AddonId::CniFlannel).unwrap_err();
+
+        match error {
+            Error::InvalidArgs(message) => {
+                assert!(message.contains("cni/flannel"));
+                assert!(message.contains("cilium"));
+                assert!(message.contains("mutually exclusive"));
+            }
+            other => panic!("expected invalid args error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_addon_rejects_cilium_when_cluster_uses_flannel() {
+        let mut state = fixture_cluster_state("dev");
+        state.cni_plugin = CniPlugin::Flannel;
+
+        let error = validate_addon_install_allowed(&state, AddonId::CniCilium).unwrap_err();
+
+        match error {
+            Error::InvalidArgs(message) => {
+                assert!(message.contains("cni/cilium"));
+                assert!(message.contains("flannel"));
+                assert!(message.contains("mutually exclusive"));
+            }
+            other => panic!("expected invalid args error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_addon_allows_non_conflicting_cni_selection() {
+        let mut state = fixture_cluster_state("dev");
+        state.cni_plugin = CniPlugin::None;
+
+        assert!(validate_addon_install_allowed(&state, AddonId::CniCilium).is_ok());
+        assert!(validate_addon_install_allowed(&state, AddonId::CniFlannel).is_ok());
+    }
+
+    #[test]
+    fn parse_lima_instance_metrics_extracts_pid_and_disk() {
+        let metrics = parse_lima_instance_metrics(
+            "kalisto-default-cp\t/Users/example/.lima/kalisto-default-cp\t65023\t65023\t12884901888\n",
+            "kalisto-default-cp",
+        )
+        .unwrap();
+
+        assert_eq!(metrics.pid, Some(65023));
+        assert_eq!(metrics.rootfs_bytes, Some(12_884_901_888));
+    }
+
+    #[test]
+    fn parse_lima_guest_network_metrics_extracts_ip_and_counters() {
+        let (guest_ip, rx_bytes, tx_bytes) =
+            parse_lima_guest_network_metrics("192.168.5.2\n1024\n2048\n");
+
+        assert_eq!(guest_ip.as_deref(), Some("192.168.5.2"));
+        assert_eq!(rx_bytes, Some(1024));
+        assert_eq!(tx_bytes, Some(2048));
+    }
+
+    #[test]
+    fn install_addon_at_root_applies_cilium_without_restarting_cluster() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-addon-install-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        state.cni_plugin = CniPlugin::None;
+        CniPlugin::None.apply_component_defaults(&mut state.component_toggles);
+        state.save(&state_root).unwrap();
+
+        unsafe {
+            std::env::remove_var("KALISTO_WAIT_FOR_ADDONS");
+        }
+
+        let runner = FakeRunner::with_statuses([("kalisto-dev-cp", "Running")]);
+        let outcome = install_addon_at_root(&state_root, "dev", "cni/cilium", &runner).unwrap();
+
+        assert_eq!(outcome.cluster, "dev");
+        assert_eq!(outcome.addon, "cni/cilium");
+
+        let state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(state.cni_plugin, CniPlugin::Cilium);
+
+        let invocations = runner.invocations.lock().unwrap().clone();
+        assert!(invocations.iter().any(|(program, args)| {
+            program == "limactl"
+                && args.iter().any(|arg| arg == "shell")
+                && args.iter().any(|arg| arg.contains("kalisto-cilium.yaml"))
+        }));
+        assert!(!invocations.iter().any(|(program, args)| {
+            program == "limactl" && args.iter().any(|arg| arg == "stop" || arg == "start")
+        }));
+
+        restore_env("KALISTO_WAIT_FOR_ADDONS", original_wait_for_addons);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_addon_at_root_does_not_persist_cilium_state_when_apply_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-addon-install-fail-{}", std::process::id()));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        state.cni_plugin = CniPlugin::None;
+        CniPlugin::None.apply_component_defaults(&mut state.component_toggles);
+        state.save(&state_root).unwrap();
+
+        unsafe {
+            std::env::remove_var("KALISTO_WAIT_FOR_ADDONS");
+        }
+
+        let runner = FakeRunner::with_invocation_failure_containing(
+            [("kalisto-dev-cp", "Running")],
+            "kalisto-cilium.yaml",
+        );
+        let error = install_addon_at_root(&state_root, "dev", "cni/cilium", &runner).unwrap_err();
+        assert!(matches!(error, Error::CommandFailed { .. }));
+
+        let state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(state.cni_plugin, CniPlugin::None);
+
+        restore_env("KALISTO_WAIT_FOR_ADDONS", original_wait_for_addons);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2178,6 +2693,84 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn create_with_runner_checks_backend_before_creating_cluster_roots() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-create-preflight-{}", std::process::id()));
+        let workspace_root = root.join("workspace");
+        let data_home = root.join("xdg-data");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let mut spec =
+            crate::cluster::spec::ClusterSpec::new("default".to_owned(), workspace_root.clone());
+        spec.backend = BackendKind::Lima;
+        let template_root = workspace_root.join("artifacts").join("lima-node");
+        fs::create_dir_all(&template_root).unwrap();
+        let template = template_root.join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
+        fs::write(&template, "vmType: vz\n").unwrap();
+        spec.template = template.display().to_string();
+
+        let state_root = ClusterSpec::state_root_for(&spec.name).unwrap();
+        let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+
+        let error = super::create_with_runner(&spec, &FakeRunner::with_limactl_version_failure())
+            .unwrap_err();
+        assert!(matches!(error, Error::CommandFailed { .. }));
+        assert!(!state_root.exists());
+        assert!(!runtime_root.exists());
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn up_with_runner_creates_missing_cluster_definition_before_starting_instances() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-up-autocreate-{}", std::process::id()));
+        let workspace_root = root.join("workspace");
+        let data_home = root.join("xdg-data");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let mut spec =
+            crate::cluster::spec::ClusterSpec::new("default".to_owned(), workspace_root.clone());
+        spec.backend = BackendKind::Lima;
+        let template_root = workspace_root.join("artifacts").join("lima-node");
+        fs::create_dir_all(&template_root).unwrap();
+        let template = template_root.join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
+        fs::write(&template, "vmType: vz\n").unwrap();
+        spec.template = template.display().to_string();
+
+        let state_root = ClusterSpec::state_root_for(&spec.name).unwrap();
+        let state_file = ClusterState::state_file(&state_root);
+        let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+
+        let runner = FakeRunner::with_invocation_failure_containing([], "start");
+        let error = super::up_with_runner(&spec, &runner).unwrap_err();
+        assert!(matches!(error, Error::CommandFailed { .. }));
+        assert!(state_root.exists());
+        assert!(state_file.exists());
+        assert!(runtime_root.exists());
+
+        let state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(state.name, spec.name);
+        assert_eq!(state.worker_count, spec.worker_count);
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn save_state(root: &std::path::Path, name: &str, nodes: Vec<(&str, NodeRole)>) {
         let state = ClusterState {
             name: name.to_owned(),
@@ -2219,6 +2812,38 @@ mod tests {
                 .collect(),
         };
         state.save(root).unwrap();
+    }
+
+    fn fixture_cluster_state(name: &str) -> ClusterState {
+        ClusterState {
+            name: name.to_owned(),
+            backend: BackendKind::Lima,
+            workspace_root: Path::new(".").to_path_buf(),
+            template: "template://default".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            api_port: 16443,
+            worker_count: 0,
+            control_plane_resources: NodeResources {
+                cpus: 4,
+                memory_gib: 6,
+            },
+            worker_resources: NodeResources {
+                cpus: 2,
+                memory_gib: 4,
+            },
+            enable_rosetta: true,
+            network: "lima:user-v2".to_owned(),
+            k3s_version: "v1.33.5+k3s1".to_owned(),
+            cni_plugin: CniPlugin::None,
+            cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
+            addons: Vec::new(),
+            server_mode: ServerMode::Standard,
+            component_toggles: ComponentToggles::default(),
+            kubeconfig_path: Path::new("kubeconfig.yaml").to_path_buf(),
+            token_path: Path::new("node-token").to_path_buf(),
+            nodes: Vec::new(),
+        }
     }
 
     #[test]

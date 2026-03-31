@@ -87,12 +87,87 @@ Finalize it on macOS:
 sh scripts/macos/finalize_lima_node_image.sh
 ```
 
+Prerequisites for the macOS finalization step:
+
+- `limactl`
+- `qemu-img`
+- `sha256sum` or `shasum`
+
+If `qemu-img` is not already installed on macOS, install it before running the
+finalization script, for example with Homebrew:
+
+```bash
+brew install qemu
+```
+
 Default artifacts:
 
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.img`
+- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
+- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+
+## Releasing Lima images
+
+For a usable Kalisto Lima release, the important runtime artifact is the finalized
+disk image. Kalisto can render the matching Lima template locally from that image,
+so the minimum published artifact set is:
+
+- required:
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
+- recommended:
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+- optional intermediate seed artifacts:
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
+  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
+
+Build and finalize the release image with these scripts:
+
+```bash
+./scripts/macos/build_lima_node_image.sh
+sh scripts/macos/finalize_lima_node_image.sh
+```
+
+The finalize step requires `qemu-img` because Kalisto now exports the warmed
+Lima VM disk as a compact finalized `qcow2` artifact instead of publishing the
+raw sparse disk directly.
+
+The first script produces the seed image and manifest. The second script boots
+that seed once under Lima, waits for the guest to contain the Kalisto node-image
+marker and working `k3s` binary, then exports the finalized image, template, and
+manifest.
+
+To install a release artifact into Kalisto's managed XDG cache locally:
+
+```bash
+mkdir -p ~/.local/share/kalisto/artifacts/lima-node
+cp artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/lima-node/
+sh scripts/macos/render_lima_artifact_template.sh \
+  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
+```
+
+Kalisto now looks in this XDG cache first:
+
+```text
+~/.local/share/kalisto/artifacts/lima-node/
+```
+
+If you publish the finalized image at a stable URL, Kalisto can fetch it on miss
+into that cache when these environment variables are set:
+
+```bash
+export KALISTO_LIMA_IMAGE_URL=<published-url>/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2
+export KALISTO_LIMA_IMAGE_SHA256=<sha256>
+```
+
+`KALISTO_LIMA_IMAGE_FILENAME` is also supported if the published file name differs
+from the default finalized image name.
 
 ## Firecracker artifact pipeline
 

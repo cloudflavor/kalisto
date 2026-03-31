@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::backend::BackendKind;
 use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
 use crate::k3s::{ComponentToggles, ServerMode};
-use crate::paths::{config_root, data_root};
+use crate::paths::{artifacts_root, config_root, data_root};
 
 pub const DEFAULT_K3S_VERSION: &str = "v1.33.5+k3s1";
 pub const DEFAULT_CONTROL_PLANE_CPUS: u8 = 4;
@@ -17,16 +17,55 @@ pub struct NodeResources {
     pub memory_gib: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageArch {
+    Aarch64,
+    X86_64,
+}
+
+impl ImageArch {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "arm64" | "aarch64" => Some(Self::Aarch64),
+            "amd64" | "x86_64" => Some(Self::X86_64),
+            _ => None,
+        }
+    }
+
+    pub fn host_default() -> Self {
+        match std::env::consts::ARCH {
+            "x86_64" | "amd64" => Self::X86_64,
+            _ => Self::Aarch64,
+        }
+    }
+
+    pub fn lima_template_value(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "aarch64",
+            Self::X86_64 => "x86_64",
+        }
+    }
+
+    pub fn lima_artifact_suffix(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "arm64",
+            Self::X86_64 => "amd64",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
     pub name: String,
     pub backend: BackendKind,
     pub workspace_root: PathBuf,
     pub template: String,
+    pub image_arch: Option<ImageArch>,
     pub firecracker_kernel: Option<PathBuf>,
     pub firecracker_rootfs: Option<PathBuf>,
     pub api_port: u16,
     pub worker_count: usize,
+    pub requested_worker_count: Option<usize>,
     pub control_plane_resources: NodeResources,
     pub worker_resources: NodeResources,
     pub enable_rosetta: bool,
@@ -50,10 +89,12 @@ impl ClusterSpec {
         Self {
             backend,
             template: default_template(&workspace_root),
+            image_arch: None,
             firecracker_kernel: None,
             firecracker_rootfs: None,
             api_port: 16443,
             worker_count: 1,
+            requested_worker_count: None,
             control_plane_resources: NodeResources {
                 cpus: DEFAULT_CONTROL_PLANE_CPUS,
                 memory_gib: DEFAULT_CONTROL_PLANE_MEMORY_GIB,
@@ -137,45 +178,71 @@ fn default_network(backend: BackendKind) -> String {
     }
 }
 
+fn default_lima_image_arch_suffix() -> &'static str {
+    ImageArch::host_default().lima_artifact_suffix()
+}
+
+pub fn parse_image_arch(value: &str) -> std::result::Result<ImageArch, String> {
+    ImageArch::parse(value).ok_or_else(|| {
+        format!("unsupported arch `{value}`; expected one of: amd64, x86_64, arm64, aarch64")
+    })
+}
+
+fn default_lima_finalized_template_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}-finalized.yaml",
+        default_lima_image_arch_suffix()
+    )
+}
+
+fn default_lima_seed_template_filename() -> String {
+    format!(
+        "ubuntu-24.04-minimal-k3s-{}.yaml",
+        default_lima_image_arch_suffix()
+    )
+}
+
 pub fn default_template(workspace_root: &Path) -> String {
-    if let Ok(config_root) = config_root() {
-        let configured = config_root
-            .join("lima-node")
-            .join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
-        if configured.is_file() {
-            return configured.display().to_string();
-        }
-
-        let configured_seed = config_root
-            .join("lima-node")
-            .join("ubuntu-24.04-minimal-k3s-arm64.yaml");
-        if configured_seed.is_file() {
-            return configured_seed.display().to_string();
-        }
+    if let Some(template) = lima_template_under(artifacts_root().ok().as_deref()) {
+        return template;
     }
 
-    let finalized = workspace_root
-        .join("artifacts")
-        .join("lima-node")
-        .join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
-    if finalized.is_file() {
-        return finalized.display().to_string();
+    if let Some(template) = lima_template_under(Some(&workspace_root.join("artifacts"))) {
+        return template;
     }
 
-    let seeded = workspace_root
-        .join("artifacts")
-        .join("lima-node")
-        .join("ubuntu-24.04-minimal-k3s-arm64.yaml");
-    if seeded.is_file() {
-        return seeded.display().to_string();
+    if let Ok(config_root) = config_root()
+        && let Some(template) = lima_template_under(Some(&config_root))
+    {
+        return template;
     }
 
     "template://default".to_owned()
 }
 
+fn lima_template_under(root: Option<&Path>) -> Option<String> {
+    let root = root?;
+    let finalized = root
+        .join("lima-node")
+        .join(default_lima_finalized_template_filename());
+    if finalized.is_file() {
+        return Some(finalized.display().to_string());
+    }
+
+    let seeded = root
+        .join("lima-node")
+        .join(default_lima_seed_template_filename());
+    if seeded.is_file() {
+        return Some(seeded.display().to_string());
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
 
     use crate::backend::BackendKind;
 
@@ -185,6 +252,8 @@ mod tests {
         ClusterSpec, DEFAULT_CONTROL_PLANE_CPUS, DEFAULT_CONTROL_PLANE_MEMORY_GIB,
         DEFAULT_WORKER_CPUS, DEFAULT_WORKER_MEMORY_GIB, NodeResources, default_template,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_name_uses_workspace_basename() {
@@ -196,16 +265,58 @@ mod tests {
 
     #[test]
     fn default_template_prefers_finalized_artifact() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = std::env::temp_dir().join(format!("kalisto-spec-{}", std::process::id()));
+        let data_home = root.join("xdg-data");
         let finalized = root
             .join("artifacts")
             .join("lima-node")
-            .join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
+            .join(super::default_lima_finalized_template_filename());
         fs::create_dir_all(finalized.parent().unwrap()).unwrap();
         fs::write(&finalized, "vmType: vz\n").unwrap();
 
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
         assert_eq!(default_template(&root), finalized.display().to_string());
 
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_template_prefers_xdg_artifact_root_over_workspace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = std::env::temp_dir().join(format!("kalisto-spec-xdg-{}", std::process::id()));
+        let data_home = root.join("xdg-data");
+        let workspace_root = root.join("workspace");
+        let workspace_template = workspace_root
+            .join("artifacts")
+            .join("lima-node")
+            .join(super::default_lima_finalized_template_filename());
+        let xdg_template = data_home
+            .join("kalisto")
+            .join("artifacts")
+            .join("lima-node")
+            .join(super::default_lima_finalized_template_filename());
+        fs::create_dir_all(workspace_template.parent().unwrap()).unwrap();
+        fs::create_dir_all(xdg_template.parent().unwrap()).unwrap();
+        fs::write(&workspace_template, "workspace\n").unwrap();
+        fs::write(&xdg_template, "xdg\n").unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        assert_eq!(
+            default_template(&workspace_root),
+            xdg_template.display().to_string()
+        );
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -242,6 +353,17 @@ mod tests {
             assert!(spec.network.is_empty());
         } else {
             assert_eq!(spec.network, "lima:user-v2");
+        }
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
         }
     }
 }

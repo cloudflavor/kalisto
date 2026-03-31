@@ -1,0 +1,20 @@
+ARG UBUNTU_BASE_IMAGE=ubuntu:noble
+FROM ${UBUNTU_BASE_IMAGE}
+
+ARG UBUNTU_MIRROR
+ARG PACKAGE_LIST
+ARG K3S_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY build_lima_rootfs_in_container.sh /usr/local/bin/build_lima_rootfs_in_container.sh
+COPY provision_lima_node.sh /usr/local/lib/kalisto/provision_lima_node.sh
+COPY k3s /usr/local/lib/kalisto/cache/k3s
+
+RUN chmod 0755 /usr/local/bin/build_lima_rootfs_in_container.sh \
+    /usr/local/lib/kalisto/provision_lima_node.sh \
+    /usr/local/lib/kalisto/cache/k3s \
+ && UBUNTU_MIRROR="${UBUNTU_MIRROR}" \
+    PACKAGE_LIST="${PACKAGE_LIST}" \
+    K3S_VERSION="${K3S_VERSION}" \
+    /usr/local/bin/build_lima_rootfs_in_container.sh

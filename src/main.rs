@@ -7,22 +7,25 @@ use std::time::Duration;
 use structopt::StructOpt;
 
 use kalisto::cli::{
-    AddonArgs, AddonCommand, AddonInstallArgs, BenchArgs, Cli, ClusterLookupArgs, Command,
-    CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs,
-    StatsArgs, UpArgs,
+    AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
+    Command, CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, NamedClusterArgs, NodeLogsArgs,
+    ScaleArgs, StatsArgs, UpArgs,
 };
+use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
     benchmark as cluster_benchmark, create as cluster_create, destroy as cluster_destroy,
     down as cluster_down, install_addon as cluster_install_addon,
     kubeconfig_path as cluster_kubeconfig_path, list as cluster_list, logs as cluster_logs,
     scale as cluster_scale, stats as cluster_stats, status as cluster_status, up as cluster_up,
 };
+use kalisto::cluster::state::ClusterState;
 use kalisto::error::{Error, Result};
 use kalisto::k3s::ServerMode as K3sServerMode;
 use kalisto::paths::{
     clear_default_cluster_name_if_matches, handoff_default_cluster_file_to_invoking_user,
     read_default_cluster_name, write_default_cluster_name,
 };
+use kalisto::plugin::{PluginSpec, built_in_catalog};
 use kalisto::probe::macos_lima::{
     ProbeConfig as MacosLimaProbeConfig, run as run_macos_lima_probe,
 };
@@ -52,10 +55,11 @@ fn real_main() -> Result<()> {
         Command::Destroy(args) => run_destroy(args),
         Command::Logs(args) => run_logs(args),
         Command::Addon(args) => run_addon(args),
+        Command::Plugin(args) => run_addon(args),
         Command::Use(args) => run_use(args),
         Command::Scale(args) => run_scale(args),
         Command::Completions(args) => run_completions(args),
-        Command::Ls => run_list(),
+        Command::List => run_list(),
         Command::Stats(args) => run_stats(args),
         Command::Status(args) => run_status(args),
         Command::Kubeconfig(args) => run_kubeconfig(args),
@@ -112,6 +116,7 @@ fn run_destroy(args: ClusterLookupArgs) -> Result<()> {
 fn run_addon(args: AddonArgs) -> Result<()> {
     match args.command {
         AddonCommand::Install(args) => run_addon_install(args),
+        AddonCommand::Ls(args) => run_addon_list(args),
     }
 }
 
@@ -120,6 +125,42 @@ fn run_addon_install(args: AddonInstallArgs) -> Result<()> {
     let outcome = cluster_install_addon(&name, &args.addon)?;
     println!("cluster: {}", outcome.cluster);
     println!("installed add-on: {}", outcome.addon);
+    Ok(())
+}
+
+fn run_addon_list(args: AddonListArgs) -> Result<()> {
+    let selected_cluster = args.cluster_name()?;
+    let cluster_state = selected_cluster
+        .as_deref()
+        .map(load_cluster_state_if_present)
+        .transpose()?;
+    let catalog = built_in_catalog()?;
+
+    if let Some(state) = &cluster_state {
+        println!("cluster: {}", state.name);
+        println!();
+    }
+
+    let mut rows = vec![vec![
+        "PLUGIN".to_owned(),
+        "CATEGORY".to_owned(),
+        "INSTALL".to_owned(),
+        "STATUS".to_owned(),
+        "CONFLICTS".to_owned(),
+        "DESCRIPTION".to_owned(),
+    ]];
+    for plugin in catalog {
+        rows.push(vec![
+            plugin.id.clone(),
+            plugin.category.clone(),
+            plugin.install_kind.clone(),
+            plugin_status(cluster_state.as_ref(), &plugin),
+            render_conflicts(&plugin.conflicts),
+            plugin.description.clone(),
+        ]);
+    }
+
+    print_table(&rows);
     Ok(())
 }
 
@@ -571,6 +612,40 @@ fn require_selected_cluster_name(name: Option<String>) -> Result<String> {
     })
 }
 
+fn load_cluster_state_if_present(name: &str) -> Result<ClusterState> {
+    let state_root = kalisto::cluster::spec::ClusterSpec::state_root_for(name)?;
+    let state_file = ClusterState::state_file(&state_root);
+    if !state_file.is_file() {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{name}` not found at {}",
+            state_root.display()
+        )));
+    }
+    ClusterState::load(&state_root)
+}
+
+fn plugin_status(state: Option<&ClusterState>, plugin: &PluginSpec) -> String {
+    let Some(state) = state else {
+        return "available".to_owned();
+    };
+
+    match plugin.id.as_str() {
+        "cni/flannel" if state.cni_plugin == CniPlugin::Flannel => "installed".to_owned(),
+        "cni/cilium" if state.cni_plugin == CniPlugin::Cilium => "installed".to_owned(),
+        "lb/servicelb" if !state.component_toggles.disable_servicelb => "installed".to_owned(),
+        _ if state.addons.iter().any(|installed| installed == &plugin.id) => "installed".to_owned(),
+        _ => "available".to_owned(),
+    }
+}
+
+fn render_conflicts(conflicts: &[String]) -> String {
+    if conflicts.is_empty() {
+        String::new()
+    } else {
+        conflicts.join(", ")
+    }
+}
+
 fn node_state_label(backend_status: &str) -> String {
     match node_health(backend_status) {
         NodeHealth::Up => "up".to_owned(),
@@ -706,5 +781,79 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit_index])
     } else {
         format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use kalisto::backend::BackendKind;
+    use kalisto::cluster::addon::CniPlugin;
+    use kalisto::cluster::spec::NodeResources;
+    use kalisto::cluster::state::ClusterState;
+    use kalisto::k3s::{ComponentToggles, NodeRole, ServerMode};
+    use kalisto::plugin::PluginSpec;
+
+    use super::{plugin_status, render_conflicts};
+
+    #[test]
+    fn plugin_status_marks_selected_cni_as_installed() {
+        let mut state = fixture_cluster_state();
+        state.cni_plugin = CniPlugin::Cilium;
+
+        let plugin = PluginSpec {
+            id: "cni/cilium".to_owned(),
+            category: "cni".to_owned(),
+            install_kind: "manifest".to_owned(),
+            conflicts: vec!["cni/flannel".to_owned()],
+            description: "Cilium networking".to_owned(),
+        };
+
+        assert_eq!(plugin_status(Some(&state), &plugin), "installed");
+    }
+
+    #[test]
+    fn render_conflicts_joins_entries() {
+        assert_eq!(
+            render_conflicts(&["cni/flannel".to_owned(), "lb/servicelb".to_owned()]),
+            "cni/flannel, lb/servicelb"
+        );
+    }
+
+    fn fixture_cluster_state() -> ClusterState {
+        ClusterState {
+            name: "dev".to_owned(),
+            backend: BackendKind::Lima,
+            workspace_root: PathBuf::from("."),
+            template: "template://default".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            api_port: 16443,
+            worker_count: 0,
+            control_plane_resources: NodeResources {
+                cpus: 4,
+                memory_gib: 6,
+            },
+            worker_resources: NodeResources {
+                cpus: 2,
+                memory_gib: 4,
+            },
+            enable_rosetta: true,
+            network: "lima:user-v2".to_owned(),
+            k3s_version: "v1.33.5+k3s1".to_owned(),
+            cni_plugin: CniPlugin::None,
+            cilium_version: "1.19.1".to_owned(),
+            addons: Vec::new(),
+            server_mode: ServerMode::Standard,
+            component_toggles: ComponentToggles::default(),
+            kubeconfig_path: PathBuf::from("kubeconfig.yaml"),
+            token_path: PathBuf::from("node-token"),
+            nodes: vec![kalisto::cluster::state::NodeState {
+                name: "kalisto-dev-cp".to_owned(),
+                role: NodeRole::ControlPlane,
+                artifacts_root: PathBuf::from("control-plane"),
+            }],
+        }
     }
 }

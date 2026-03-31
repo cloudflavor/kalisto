@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::backend::ClusterBackend;
 use crate::cluster::node::Instance;
-use crate::cluster::wait::{GuestWait, LiveLogTail, wait_for_stable_guest_success_with_tail};
+use crate::cluster::wait::{GuestWait, wait_for_stable_guest_success};
 use crate::error::{Error, Result};
 use crate::k3s::ComponentToggles;
 use crate::process::CommandRunner;
@@ -112,7 +112,6 @@ impl AddonId {
 
 struct RemoteYamlAddonSpec<'a> {
     addon: AddonId,
-    label: &'a str,
     url: &'a str,
     wait_command_template: &'a str,
     timeout: Duration,
@@ -232,7 +231,6 @@ fn install_addon(
             guest_kubeconfig,
             RemoteYamlAddonSpec {
                 addon,
-                label: "metallb",
                 url: METALLB_MANIFEST_URL,
                 wait_command_template: METALLB_WAIT_COMMAND,
                 timeout: Duration::from_secs(300),
@@ -245,7 +243,6 @@ fn install_addon(
             guest_kubeconfig,
             RemoteYamlAddonSpec {
                 addon,
-                label: "longhorn",
                 url: LONGHORN_MANIFEST_URL,
                 wait_command_template: LONGHORN_WAIT_COMMAND,
                 timeout: Duration::from_secs(600),
@@ -258,7 +255,6 @@ fn install_addon(
             guest_kubeconfig,
             RemoteYamlAddonSpec {
                 addon,
-                label: "local-path",
                 url: LOCAL_PATH_MANIFEST_URL,
                 wait_command_template: LOCAL_PATH_WAIT_COMMAND,
                 timeout: Duration::from_secs(300),
@@ -302,7 +298,6 @@ fn install_cilium(
             runner,
             control_plane,
             &wait_command,
-            "cilium",
             Duration::from_secs(600),
         )
         .map_err(|error| {
@@ -359,7 +354,6 @@ fn install_traefik(
             runner,
             control_plane,
             &wait_command,
-            "traefik",
             Duration::from_secs(300),
         )
         .map_err(|error| {
@@ -403,21 +397,14 @@ fn install_remote_yaml_addon(
             "{kubeconfig}",
             shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()).as_str(),
         );
-        wait_for_guest_rollout(
-            backend,
-            runner,
-            control_plane,
-            &wait_command,
-            spec.label,
-            spec.timeout,
-        )
-        .map_err(|error| {
-            Error::InvalidArgs(format!(
-                "failed to install add-on {} on cluster control-plane {}: {error}",
-                spec.addon.as_str(),
-                control_plane.name
-            ))
-        })?;
+        wait_for_guest_rollout(backend, runner, control_plane, &wait_command, spec.timeout)
+            .map_err(|error| {
+                Error::InvalidArgs(format!(
+                    "failed to install add-on {} on cluster control-plane {}: {error}",
+                    spec.addon.as_str(),
+                    control_plane.name
+                ))
+            })?;
         info!(
             node = %control_plane.name,
             addon = spec.addon.as_str(),
@@ -478,14 +465,9 @@ fn wait_for_guest_rollout(
     runner: &dyn CommandRunner,
     control_plane: &Instance,
     command: &str,
-    label: &str,
     timeout: Duration,
 ) -> Result<()> {
-    let mut tail = LiveLogTail::new(
-        &control_plane.artifacts.stderr_log,
-        format!("{}:{label}", control_plane.name),
-    );
-    wait_for_stable_guest_success_with_tail(
+    wait_for_stable_guest_success(
         backend,
         runner,
         GuestWait {
@@ -496,7 +478,6 @@ fn wait_for_guest_rollout(
             consecutive_successes: 1,
             interval: Duration::from_secs(5),
         },
-        &mut tail,
     )?;
     Ok(())
 }
