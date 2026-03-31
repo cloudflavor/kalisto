@@ -110,6 +110,19 @@ else
   ROOTFS_SOURCE_DIR="${ROOTFS_DIR}"
 fi
 
+SPECIAL_PERMISSIONS_MANIFEST="${ROOTFS_SOURCE_DIR}/etc/kalisto/rootfs-special-permissions.manifest"
+if [ -f "${SPECIAL_PERMISSIONS_MANIFEST}" ]; then
+  while read -r MODE OWNER GROUP ABSOLUTE_PATH; do
+    [ -n "${ABSOLUTE_PATH}" ] || continue
+    TARGET_PATH="${ROOTFS_SOURCE_DIR}${ABSOLUTE_PATH}"
+    if [ ! -e "${TARGET_PATH}" ] || [ -L "${TARGET_PATH}" ]; then
+      continue
+    fi
+    chown "${OWNER}:${GROUP}" "${TARGET_PATH}"
+    chmod "${MODE}" "${TARGET_PATH}"
+  done < "${SPECIAL_PERMISSIONS_MANIFEST}"
+fi
+
 qemu-img create -f raw "${RAW_IMAGE_PATH}" "${IMAGE_SIZE}" >/dev/null
 
 parted -s "${RAW_IMAGE_PATH}" mklabel gpt
