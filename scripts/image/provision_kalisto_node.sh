@@ -57,6 +57,10 @@ for PACKAGE in \
   apport \
   bash-completion \
   byobu \
+  grub-common \
+  grub2-common \
+  grub-efi-amd64-bin \
+  grub-efi-arm64-bin \
   groff-base \
   man-db \
   motd-news-config \
