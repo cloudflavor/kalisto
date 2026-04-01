@@ -50,6 +50,7 @@ fn default_env_filter() -> Result<EnvFilter> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::env_lock;
     use tracing::Level;
 
     use super::{
@@ -72,6 +73,7 @@ mod tests {
 
     #[test]
     fn cli_log_level_is_used_when_rust_log_is_unset() {
+        let _guard = env_lock();
         let original = std::env::var_os("RUST_LOG");
         unsafe { std::env::remove_var("RUST_LOG") };
         let filter = env_filter(Some(Level::DEBUG)).expect("debug log level should parse");

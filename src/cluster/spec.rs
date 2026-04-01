@@ -242,9 +242,9 @@ fn lima_template_under(root: Option<&Path>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Mutex;
 
     use crate::backend::BackendKind;
+    use crate::test_support::env_lock;
 
     use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
 
@@ -252,8 +252,6 @@ mod tests {
         ClusterSpec, DEFAULT_CONTROL_PLANE_CPUS, DEFAULT_CONTROL_PLANE_MEMORY_GIB,
         DEFAULT_WORKER_CPUS, DEFAULT_WORKER_MEMORY_GIB, NodeResources, default_template,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_name_uses_workspace_basename() {
@@ -265,7 +263,7 @@ mod tests {
 
     #[test]
     fn default_template_prefers_finalized_artifact() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = std::env::temp_dir().join(format!("kalisto-spec-{}", std::process::id()));
         let data_home = root.join("xdg-data");
@@ -288,7 +286,7 @@ mod tests {
 
     #[test]
     fn default_template_prefers_xdg_artifact_root_over_workspace() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = std::env::temp_dir().join(format!("kalisto-spec-xdg-{}", std::process::id()));
         let data_home = root.join("xdg-data");

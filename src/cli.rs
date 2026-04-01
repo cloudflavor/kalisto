@@ -25,6 +25,7 @@ pub struct Cli {
 pub enum Command {
     Create(UpArgs),
     Up(UpArgs),
+    Mcp(McpArgs),
     Down(ClusterLookupArgs),
     Destroy(ClusterLookupArgs),
     Logs(NodeLogsArgs),
@@ -227,6 +228,12 @@ impl UpArgs {
         spec.enable_rosetta = !self.no_rosetta;
         Ok(spec)
     }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct McpArgs {
+    #[structopt(long, parse(from_os_str))]
+    pub project_root: Option<PathBuf>,
 }
 
 fn parse_cni_plugin(value: &str) -> std::result::Result<CniPlugin, String> {

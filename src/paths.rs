@@ -174,15 +174,13 @@ fn sudo_invoking_user_home() -> Option<PathBuf> {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use super::{
         artifacts_root, clear_default_cluster_name_if_matches, config_root, data_root,
         default_cluster_name, read_default_cluster_name, selected_cluster_name,
         write_default_cluster_name,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::env_lock;
 
     #[test]
     fn default_cluster_name_uses_current_directory() {
@@ -199,7 +197,7 @@ mod tests {
 
     #[test]
     fn data_root_prefers_invoking_user_home_under_sudo() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_home = std::env::var_os("HOME");
         let original_sudo_user = std::env::var_os("SUDO_USER");
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
@@ -225,7 +223,7 @@ mod tests {
 
     #[test]
     fn xdg_data_home_still_overrides_sudo_user_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_home = std::env::var_os("HOME");
         let original_sudo_user = std::env::var_os("SUDO_USER");
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
@@ -245,7 +243,7 @@ mod tests {
 
     #[test]
     fn default_cluster_name_prefers_profile_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_home = std::env::var_os("HOME");
         let original_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
@@ -296,7 +294,7 @@ mod tests {
 
     #[test]
     fn stale_default_cluster_profile_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let config_home =

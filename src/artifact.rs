@@ -933,6 +933,7 @@ mod tests {
     use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION, ImageArch};
     use crate::error::{Error, Result};
     use crate::process::{CommandRunner, Output};
+    use crate::test_support::env_lock;
 
     use super::{
         ArtifactManagerConfig, DEFAULT_FIRECRACKER_KERNEL_FILENAME,
@@ -941,8 +942,6 @@ mod tests {
         default_lima_finalized_image_filename, default_lima_finalized_template_filename, io_error,
         render_lima_template, resolve_cluster_spec,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Default)]
     struct FakeRunner {
@@ -1036,7 +1035,7 @@ mod tests {
 
     #[test]
     fn resolve_cluster_spec_prefers_versioned_cache_artifacts() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = temp_dir("versioned-cache");
         let data_home = root.join("xdg-data");
@@ -1214,7 +1213,7 @@ mod tests {
 
     #[test]
     fn resolve_cluster_spec_rejects_generic_lima_default_template() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let original_lima_image_url = std::env::var_os("KALISTO_LIMA_IMAGE_URL");
         let original_lima_image_filename = std::env::var_os("KALISTO_LIMA_IMAGE_FILENAME");
@@ -1248,7 +1247,7 @@ mod tests {
 
     #[test]
     fn resolve_cluster_spec_fetches_lima_image_and_renders_template() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_dir("lima-fetch");
         let data_home = root.join("xdg-data");
         let image_source = root.join(default_lima_finalized_image_filename());
@@ -1303,7 +1302,7 @@ mod tests {
 
     #[test]
     fn resolve_cluster_spec_renders_workspace_lima_image_when_template_is_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root = temp_dir("lima-workspace-image");
         let data_home = root.join("xdg-data");

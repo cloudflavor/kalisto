@@ -8,8 +8,8 @@ use structopt::StructOpt;
 
 use kalisto::cli::{
     AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
-    Command, CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, NamedClusterArgs, NodeLogsArgs,
-    ScaleArgs, StatsArgs, UpArgs,
+    Command, CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, McpArgs, NamedClusterArgs,
+    NodeLogsArgs, ScaleArgs, StatsArgs, UpArgs,
 };
 use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
@@ -21,6 +21,7 @@ use kalisto::cluster::manager::{
 use kalisto::cluster::state::ClusterState;
 use kalisto::error::{Error, Result};
 use kalisto::k3s::ServerMode as K3sServerMode;
+use kalisto::mcp::run as run_mcp_server;
 use kalisto::paths::{
     clear_default_cluster_name_if_matches, handoff_default_cluster_file_to_invoking_user,
     read_default_cluster_name, write_default_cluster_name,
@@ -51,6 +52,7 @@ fn real_main() -> Result<()> {
     match cli.command {
         Command::Create(args) => run_create(args),
         Command::Up(args) => run_up(args),
+        Command::Mcp(args) => run_mcp(args),
         Command::Down(args) => run_down(args),
         Command::Destroy(args) => run_destroy(args),
         Command::Logs(args) => run_logs(args),
@@ -67,6 +69,10 @@ fn real_main() -> Result<()> {
         Command::ProbeMacosLima(args) => run_lima_probe(args),
         Command::ProbeMacosLimaK3s(args) => run_lima_k3s_probe(args),
     }
+}
+
+fn run_mcp(args: McpArgs) -> Result<()> {
+    run_mcp_server(args.project_root)
 }
 
 fn run_create(args: UpArgs) -> Result<()> {

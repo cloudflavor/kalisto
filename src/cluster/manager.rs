@@ -2056,7 +2056,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use crate::backend::BackendKind;
     use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION};
@@ -2066,14 +2065,13 @@ mod tests {
     use crate::error::Error;
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
     use crate::process::{CommandRunner, Output};
+    use crate::test_support::env_lock;
 
     use super::{
         cleanup_scale_target_instances, down_at_root, install_addon_at_root, list_at_root,
         logs_at_root, parse_lima_guest_network_metrics, parse_lima_instance_metrics,
         record_desired_addon_state, resolve_up_spec, scale_at_root, validate_addon_install_allowed,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Default)]
     struct FakeRunner {
@@ -2526,7 +2524,7 @@ mod tests {
 
     #[test]
     fn install_addon_at_root_applies_cilium_without_restarting_cluster() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
         let root =
             std::env::temp_dir().join(format!("kalisto-addon-install-{}", std::process::id()));
@@ -2572,7 +2570,7 @@ mod tests {
 
     #[test]
     fn install_addon_at_root_does_not_persist_cilium_state_when_apply_fails() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
         let root =
             std::env::temp_dir().join(format!("kalisto-addon-install-fail-{}", std::process::id()));
@@ -2635,7 +2633,7 @@ mod tests {
 
     #[test]
     fn handoff_cluster_paths_to_invoking_user_runs_recursive_chown_under_sudo() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_sudo_uid = std::env::var_os("SUDO_UID");
         let original_sudo_gid = std::env::var_os("SUDO_GID");
         let root = std::env::temp_dir().join(format!("kalisto-handoff-{}", std::process::id()));
@@ -2668,7 +2666,7 @@ mod tests {
 
     #[test]
     fn handoff_cluster_paths_to_invoking_user_is_noop_without_sudo_ids() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_sudo_uid = std::env::var_os("SUDO_UID");
         let original_sudo_gid = std::env::var_os("SUDO_GID");
         let root =
@@ -2695,7 +2693,7 @@ mod tests {
 
     #[test]
     fn create_with_runner_checks_backend_before_creating_cluster_roots() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root =
             std::env::temp_dir().join(format!("kalisto-create-preflight-{}", std::process::id()));
@@ -2731,7 +2729,7 @@ mod tests {
 
     #[test]
     fn up_with_runner_creates_missing_cluster_definition_before_starting_instances() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         let root =
             std::env::temp_dir().join(format!("kalisto-up-autocreate-{}", std::process::id()));
