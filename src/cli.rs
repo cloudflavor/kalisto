@@ -26,6 +26,8 @@ pub enum Command {
     Create(UpArgs),
     Up(UpArgs),
     Mcp(McpArgs),
+    #[structopt(name = "mcp-task-runner")]
+    McpTaskRunner(McpTaskRunnerArgs),
     Down(ClusterLookupArgs),
     Destroy(ClusterLookupArgs),
     Logs(NodeLogsArgs),
@@ -234,6 +236,14 @@ impl UpArgs {
 pub struct McpArgs {
     #[structopt(long, parse(from_os_str))]
     pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, StructOpt)]
+pub struct McpTaskRunnerArgs {
+    #[structopt(long, parse(from_os_str))]
+    pub manifest: PathBuf,
+    #[structopt(long, parse(from_os_str))]
+    pub exit_path: PathBuf,
 }
 
 fn parse_cni_plugin(value: &str) -> std::result::Result<CniPlugin, String> {
