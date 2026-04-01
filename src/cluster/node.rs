@@ -8,7 +8,10 @@ use tracing::info;
 use crate::backend::{BackendConfig, ClusterBackend, InstanceConfig};
 use crate::cluster::state::NodeState;
 use crate::error::{Error, Result};
-use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
+use crate::k3s::{
+    ComponentToggles, KUBELET_RESOLV_CONF_PATH, NodeRole, ServerMode, kubelet_resolv_conf_arg,
+    kubelet_resolv_conf_contents,
+};
 use crate::process::{CommandRunner, Output};
 use crate::shell::shell_escape;
 
@@ -226,13 +229,25 @@ fn ensure_guest_bootstrap_prereqs(
     artifact_dir: &Path,
 ) -> Result<Output> {
     let artifact_dir = shell_escape(artifact_dir.as_os_str().to_string_lossy().as_ref());
+    let kubelet_resolv_conf = shell_escape(KUBELET_RESOLV_CONF_PATH);
     backend.guest_sudo_shell(
         runner,
         &node.name,
         &node.artifacts.root,
         &format!(
-            "mkdir -p {artifact_dir} /etc/rancher/k3s /var/lib/rancher/k3s",
+            concat!(
+                "mkdir -p {artifact_dir} /etc/kalisto /etc/rancher/k3s /var/lib/rancher/k3s\n",
+                "cat <<'EOF' > {kubelet_resolv_conf}\n",
+                "{kubelet_resolv_contents}",
+                "EOF\n",
+                "rm -f /etc/resolv.conf\n",
+                "cat <<'EOF' > /etc/resolv.conf\n",
+                "{kubelet_resolv_contents}",
+                "EOF"
+            ),
             artifact_dir = artifact_dir,
+            kubelet_resolv_conf = kubelet_resolv_conf,
+            kubelet_resolv_contents = kubelet_resolv_conf_contents(),
         ),
     )
 }
@@ -423,6 +438,8 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
         }
     }
     args.push("--prefer-bundled-bin".to_owned());
+    args.push("--kubelet-arg".to_owned());
+    args.push(kubelet_resolv_conf_arg());
     Ok(args
         .into_iter()
         .map(|arg| shell_escape(&arg))
@@ -470,6 +487,8 @@ mod tests {
         assert!(command.contains("/usr/local/bin/k3s"));
         assert!(command.contains("https://cp.example.test:6443"));
         assert!(command.contains("secret"));
+        assert!(command.contains("--kubelet-arg"));
+        assert!(command.contains("resolv-conf=/etc/kalisto/kubelet-resolv.conf"));
     }
 
     #[test]
@@ -495,6 +514,8 @@ mod tests {
         .unwrap();
 
         assert!(!command.contains("--node-taint"));
+        assert!(command.contains("--kubelet-arg"));
+        assert!(command.contains("resolv-conf=/etc/kalisto/kubelet-resolv.conf"));
     }
 
     #[test]

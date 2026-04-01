@@ -18,11 +18,9 @@ HOST_ARCH="$(dpkg --print-architecture)"
 case "${UBUNTU_ARCH}" in
   arm64)
     DEFAULT_UBUNTU_MIRROR="http://ftp.fau.de/ubuntu-ports"
-    GRUB_EFI_PACKAGE="grub-efi-arm64-bin"
     ;;
   amd64)
     DEFAULT_UBUNTU_MIRROR="http://ch.archive.ubuntu.com/ubuntu"
-    GRUB_EFI_PACKAGE="grub-efi-amd64-bin"
     ;;
   *)
     echo "unsupported Ubuntu target architecture: ${UBUNTU_ARCH}" >&2
@@ -31,7 +29,7 @@ case "${UBUNTU_ARCH}" in
 esac
 
 UBUNTU_MIRROR="${KALISTO_UBUNTU_MIRROR:-${DEFAULT_UBUNTU_MIRROR}}"
-PACKAGE_LIST="${KALISTO_UBUNTU_PACKAGE_LIST:-systemd-sysv cloud-init openssh-server sudo iptables kmod socat linux-image-virtual grub-common grub2-common ${GRUB_EFI_PACKAGE}}"
+PACKAGE_LIST="${KALISTO_UBUNTU_PACKAGE_LIST:-systemd-sysv cloud-init openssh-server sudo iptables kmod socat linux-image-virtual}"
 
 if [ ! -f "${PROVISION_SCRIPT}" ]; then
   echo "missing provision script: ${PROVISION_SCRIPT}" >&2

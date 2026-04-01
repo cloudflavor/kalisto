@@ -13,6 +13,7 @@ KALISTO_K3S_NODE_NAME="${KALISTO_K3S_NODE_NAME:-}"
 KALISTO_K3S_SERVER_URL="${KALISTO_K3S_SERVER_URL:-}"
 KALISTO_K3S_TOKEN="${KALISTO_K3S_TOKEN:-}"
 KALISTO_K3S_TLS_SANS="${KALISTO_K3S_TLS_SANS:-}"
+KALISTO_K3S_KUBELET_RESOLV_CONF="${KALISTO_K3S_KUBELET_RESOLV_CONF:-/etc/kalisto/kubelet-resolv.conf}"
 KALISTO_K3S_DISABLE_AGENT="${KALISTO_K3S_DISABLE_AGENT:-0}"
 KALISTO_K3S_USE_SYSTEMD="${KALISTO_K3S_USE_SYSTEMD:-0}"
 KALISTO_K3S_DISABLE_TRAEFIK="${KALISTO_K3S_DISABLE_TRAEFIK:-1}"
@@ -24,7 +25,18 @@ KALISTO_K3S_DISABLE_NETWORK_POLICY="${KALISTO_K3S_DISABLE_NETWORK_POLICY:-1}"
 KALISTO_K3S_DISABLE_KUBE_PROXY="${KALISTO_K3S_DISABLE_KUBE_PROXY:-0}"
 KALISTO_K3S_FLANNEL_BACKEND_NONE="${KALISTO_K3S_FLANNEL_BACKEND_NONE:-0}"
 
-mkdir -p "${ARTIFACT_DIR}" /etc/rancher/k3s /var/lib/rancher/k3s
+mkdir -p "${ARTIFACT_DIR}" /etc/kalisto /etc/rancher/k3s /var/lib/rancher/k3s
+
+cat > "${KALISTO_K3S_KUBELET_RESOLV_CONF}" <<'EOF'
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111
+EOF
+
+rm -f /etc/resolv.conf
+cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111
+EOF
 
 ensure_runtime_dependencies() {
   if [ -f /etc/kalisto/node-image.env ] && [ -x /usr/local/bin/k3s ] && /usr/local/bin/k3s --version >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
@@ -95,6 +107,8 @@ set -eu
 
 export K3S_KUBECONFIG_MODE=0644
 
+KUBELET_ARGS="--kubelet-arg=resolv-conf=\${KALISTO_K3S_KUBELET_RESOLV_CONF:-/etc/kalisto/kubelet-resolv.conf}"
+
 tls_san_args() {
   if [ -z "\${KALISTO_K3S_TLS_SANS:-}" ]; then
     return 0
@@ -150,6 +164,7 @@ case "\${KALISTO_K3S_NODE_ROLE:-server}" in
     --disable-agent \
     --write-kubeconfig ${KUBECONFIG_PATH} \
     --write-kubeconfig-mode 0644 \
+    \${KUBELET_ARGS} \
     \${TLS_SAN_ARGS} \
     --prefer-bundled-bin \${EXTRA_ARGS}"
     fi
@@ -158,6 +173,7 @@ case "\${KALISTO_K3S_NODE_ROLE:-server}" in
   \${NODE_NAME_ARGS} \
   --write-kubeconfig ${KUBECONFIG_PATH} \
   --write-kubeconfig-mode 0644 \
+  \${KUBELET_ARGS} \
   \${TLS_SAN_ARGS} \
   --prefer-bundled-bin \${EXTRA_ARGS}"
     ;;
@@ -171,6 +187,7 @@ case "\${KALISTO_K3S_NODE_ROLE:-server}" in
   \${NODE_NAME_ARGS} \
   --server \${KALISTO_K3S_SERVER_URL} \
   --token \${KALISTO_K3S_TOKEN} \
+  \${KUBELET_ARGS} \
   --prefer-bundled-bin"
     ;;
   *)
@@ -213,6 +230,7 @@ Environment=KALISTO_K3S_NODE_NAME=${KALISTO_K3S_NODE_NAME}
 Environment=KALISTO_K3S_SERVER_URL=${KALISTO_K3S_SERVER_URL}
 Environment=KALISTO_K3S_TOKEN=${KALISTO_K3S_TOKEN}
 Environment=KALISTO_K3S_TLS_SANS=${KALISTO_K3S_TLS_SANS}
+Environment=KALISTO_K3S_KUBELET_RESOLV_CONF=${KALISTO_K3S_KUBELET_RESOLV_CONF}
 Environment=KALISTO_K3S_DISABLE_AGENT=${KALISTO_K3S_DISABLE_AGENT}
 Environment=KALISTO_K3S_DISABLE_KUBE_PROXY=${KALISTO_K3S_DISABLE_KUBE_PROXY}
 ExecStart=/bin/sh -lc '/usr/local/bin/kalisto-k3s-node >>"${STDOUT_LOG}" 2>>"${STDERR_LOG}"'

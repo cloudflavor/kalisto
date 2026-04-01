@@ -14,9 +14,6 @@ IMAGE_BASENAME="${KALISTO_IMAGE_BASENAME:-ubuntu-24.04-minimal-k3s-amd64}"
 K3S_VERSION="${K3S_VERSION:-v1.33.5+k3s1}"
 K3S_ASSET="${KALISTO_K3S_ASSET:-k3s}"
 LIBGUESTFS_BACKEND="${LIBGUESTFS_BACKEND:-libvirt}"
-LIBGUESTFS_TMPDIR="${KALISTO_FIRECRACKER_LIBGUESTFS_TMPDIR:-${WORK_DIR}/tmp/libguestfs}"
-LIBGUESTFS_CACHEDIR="${KALISTO_FIRECRACKER_LIBGUESTFS_CACHEDIR:-${WORK_DIR}/cache/libguestfs}"
-XDG_RUNTIME_DIR="${KALISTO_FIRECRACKER_XDG_RUNTIME_DIR:-${WORK_DIR}/run}"
 ROOTFS_SOURCE_PARTITION="${KALISTO_FIRECRACKER_ROOTFS_SOURCE_PARTITION:-/dev/sda1}"
 ROOTFS_TARGET_SIZE_MIB="${KALISTO_FIRECRACKER_ROOTFS_SIZE_MIB:-8192}"
 ROOTFS_ARCHIVE_FORMAT="${KALISTO_FIRECRACKER_ROOTFS_ARCHIVE_FORMAT:-xz}"
@@ -88,22 +85,51 @@ run_e2fsck() {
 mkdir -p \
   "${OUTPUT_DIR}" \
   "${WORK_DIR}" \
-  "${K3S_CACHE_DIR}" \
+  "${K3S_CACHE_DIR}"
+
+RUN_WORK_DIR="$(mktemp -d "${WORK_DIR}/run-XXXXXX")"
+LIBGUESTFS_TMPDIR="${KALISTO_FIRECRACKER_LIBGUESTFS_TMPDIR:-${RUN_WORK_DIR}/tmp/libguestfs}"
+LIBGUESTFS_CACHEDIR="${KALISTO_FIRECRACKER_LIBGUESTFS_CACHEDIR:-${RUN_WORK_DIR}/cache/libguestfs}"
+XDG_RUNTIME_DIR="${KALISTO_FIRECRACKER_XDG_RUNTIME_DIR:-${RUN_WORK_DIR}/run}"
+
+mkdir -p \
   "${LIBGUESTFS_TMPDIR}" \
   "${LIBGUESTFS_CACHEDIR}" \
   "${XDG_RUNTIME_DIR}"
 
 BASE_IMAGE_PATH="${WORK_DIR}/$(basename -- "${BASE_IMAGE_URL}")"
-WORKING_IMAGE_PATH="${WORK_DIR}/${IMAGE_BASENAME}.qcow2"
-ROOTFS_PATH="${OUTPUT_DIR}/${IMAGE_BASENAME}-rootfs.raw"
-MANIFEST_PATH="${OUTPUT_DIR}/${IMAGE_BASENAME}-rootfs.manifest"
-WHOLE_DISK_RAW_PATH="${WORK_DIR}/${IMAGE_BASENAME}-disk.raw"
+WORKING_IMAGE_PATH="${RUN_WORK_DIR}/${IMAGE_BASENAME}.qcow2"
+ROOTFS_PATH="${RUN_WORK_DIR}/${IMAGE_BASENAME}-rootfs.raw"
+MANIFEST_PATH="${RUN_WORK_DIR}/${IMAGE_BASENAME}-rootfs.manifest"
+WHOLE_DISK_RAW_PATH="${RUN_WORK_DIR}/${IMAGE_BASENAME}-disk.raw"
+FINAL_ROOTFS_PATH="${OUTPUT_DIR}/${IMAGE_BASENAME}-rootfs.raw"
+FINAL_MANIFEST_PATH="${OUTPUT_DIR}/${IMAGE_BASENAME}-rootfs.manifest"
 K3S_CACHE_PATH="${K3S_CACHE_DIR}/${K3S_VERSION}-${K3S_ASSET}"
 ROOT_DEVICE_HINT="${KALISTO_FIRECRACKER_ROOT_DEVICE_HINT:-/dev/vda}"
 
+cleanup() {
+  chmod -R u+w "${RUN_WORK_DIR}" 2>/dev/null || true
+  rm -rf "${RUN_WORK_DIR}"
+}
+trap cleanup EXIT INT TERM
+
+download_atomic() {
+  url="$1"
+  destination="$2"
+  tmp_path="${destination}.download.$$"
+  rm -f "${tmp_path}"
+  curl -fL "${url}" -o "${tmp_path}"
+  mv "${tmp_path}" "${destination}"
+}
+
+if [ -f "${BASE_IMAGE_PATH}" ] && ! qemu-img info "${BASE_IMAGE_PATH}" >/dev/null 2>&1; then
+  echo "cached base image is invalid, removing ${BASE_IMAGE_PATH}"
+  rm -f "${BASE_IMAGE_PATH}"
+fi
+
 if [ ! -f "${BASE_IMAGE_PATH}" ]; then
   echo "downloading base image to ${BASE_IMAGE_PATH}"
-  curl -fL "${BASE_IMAGE_URL}" -o "${BASE_IMAGE_PATH}"
+  download_atomic "${BASE_IMAGE_URL}" "${BASE_IMAGE_PATH}"
 else
   echo "reusing cached base image at ${BASE_IMAGE_PATH}"
 fi
@@ -112,7 +138,7 @@ cp "${BASE_IMAGE_PATH}" "${WORKING_IMAGE_PATH}"
 
 if [ ! -f "${K3S_CACHE_PATH}" ]; then
   echo "downloading k3s asset ${K3S_ASSET} to ${K3S_CACHE_PATH}"
-  curl -fL "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/${K3S_ASSET}" -o "${K3S_CACHE_PATH}"
+  download_atomic "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/${K3S_ASSET}" "${K3S_CACHE_PATH}"
 else
   echo "reusing cached k3s asset at ${K3S_CACHE_PATH}"
 fi
@@ -195,8 +221,10 @@ ROOTFS_VIRTUAL_SIZE="$(
 ROOTFS_ARCHIVE_PATH=
 ROOTFS_ARCHIVE_SHA256=
 ROOTFS_ARCHIVE_DISK_USAGE=
+FINAL_ROOTFS_ARCHIVE_PATH=
 if [ "${ROOTFS_ARCHIVE_FORMAT}" != "none" ]; then
   ROOTFS_ARCHIVE_PATH="${ROOTFS_PATH}.${ROOTFS_ARCHIVE_FORMAT}"
+  FINAL_ROOTFS_ARCHIVE_PATH="${FINAL_ROOTFS_PATH}.${ROOTFS_ARCHIVE_FORMAT}"
   rm -f "${ROOTFS_ARCHIVE_PATH}"
   case "${ROOTFS_ARCHIVE_FORMAT}" in
     xz)
@@ -215,6 +243,14 @@ if [ "${ROOTFS_ARCHIVE_FORMAT}" != "none" ]; then
     ROOTFS_ARCHIVE_SHA256="$(shasum -a 256 "${ROOTFS_ARCHIVE_PATH}" | awk '{print $1}')"
   fi
   ROOTFS_ARCHIVE_DISK_USAGE="$(du -h "${ROOTFS_ARCHIVE_PATH}" | awk '{print $1}')"
+fi
+
+rm -f "${FINAL_ROOTFS_PATH}" "${FINAL_MANIFEST_PATH}"
+mv "${ROOTFS_PATH}" "${FINAL_ROOTFS_PATH}"
+if [ -n "${ROOTFS_ARCHIVE_PATH}" ]; then
+  rm -f "${FINAL_ROOTFS_ARCHIVE_PATH}"
+  mv "${ROOTFS_ARCHIVE_PATH}" "${FINAL_ROOTFS_ARCHIVE_PATH}"
+  ROOTFS_ARCHIVE_PATH="${FINAL_ROOTFS_ARCHIVE_PATH}"
 fi
 
 cat > "${MANIFEST_PATH}" <<EOF
@@ -245,8 +281,10 @@ ROOTFS_ARCHIVE_SHA256=${ROOTFS_ARCHIVE_SHA256}
 ROOTFS_ARCHIVE_DISK_USAGE=${ROOTFS_ARCHIVE_DISK_USAGE}
 EOF
 
-echo "created ${ROOTFS_PATH}"
+mv "${MANIFEST_PATH}" "${FINAL_MANIFEST_PATH}"
+
+echo "created ${FINAL_ROOTFS_PATH}"
 if [ -n "${ROOTFS_ARCHIVE_PATH}" ]; then
   echo "created ${ROOTFS_ARCHIVE_PATH}"
 fi
-echo "wrote ${MANIFEST_PATH}"
+echo "wrote ${FINAL_MANIFEST_PATH}"

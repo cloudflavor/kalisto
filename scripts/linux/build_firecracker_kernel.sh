@@ -8,6 +8,7 @@ kalisto_detect_firecracker_context
 
 OUTPUT_DIR="${KALISTO_FIRECRACKER_OUTPUT_DIR:-${ROOT_DIR}/artifacts/firecracker-node/${KALISTO_FIRECRACKER_ARTIFACT_TRACK}/${KALISTO_FIRECRACKER_ARTIFACT_ARCH}}"
 WORK_DIR="${KALISTO_FIRECRACKER_KERNEL_WORK_DIR:-${ROOT_DIR}/artifacts/firecracker-node/work/kernel}"
+RUN_PARENT_DIR="${KALISTO_FIRECRACKER_KERNEL_TMP_DIR:-${TMPDIR:-/tmp}/kalisto-firecracker-kernel}"
 KERNEL_VERSION="${KALISTO_FIRECRACKER_KERNEL_VERSION:-6.19.9}"
 KERNEL_FILENAME="${KALISTO_FIRECRACKER_KERNEL_FILENAME:-kalisto-vmlinux}"
 KERNEL_CONFIG_FRAGMENT="${KALISTO_FIRECRACKER_KERNEL_CONFIG_FRAGMENT:-${ROOT_DIR}/scripts/linux/firecracker-k3s-x86_64.config}"
@@ -15,17 +16,14 @@ KERNEL_MAJOR="$(printf '%s' "${KERNEL_VERSION}" | cut -d. -f1)"
 KERNEL_SOURCE_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_SOURCE_URL="${KALISTO_FIRECRACKER_KERNEL_SOURCE_URL:-https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${KERNEL_SOURCE_TARBALL}}"
 SOURCE_ARCHIVE_PATH="${WORK_DIR}/${KERNEL_SOURCE_TARBALL}"
-SOURCE_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
-BUILD_DIR="${WORK_DIR}/build-${KERNEL_VERSION}-${KALISTO_FIRECRACKER_ARTIFACT_ARCH}"
-OPENSSL_COMPAT_INCLUDE_DIR="${WORK_DIR}/openssl-compat"
-KERNEL_OUTPUT_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}"
-KERNEL_CONFIG_OUTPUT_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}.config"
-MANIFEST_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}.manifest"
+FINAL_KERNEL_OUTPUT_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}"
+FINAL_KERNEL_CONFIG_OUTPUT_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}.config"
+FINAL_MANIFEST_PATH="${OUTPUT_DIR}/${KERNEL_FILENAME}.manifest"
 JOBS="${KALISTO_FIRECRACKER_KERNEL_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4')}"
 
 case "${KALISTO_FIRECRACKER_ARTIFACT_ARCH}" in
   x86_64)
-    KERNEL_ARCH="x86_64"
+    KERNEL_ARCH="x86"
     DEFCONFIG_TARGET="x86_64_defconfig"
     ;;
   *)
@@ -60,7 +58,20 @@ if [ ! -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
   exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}" "${WORK_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${WORK_DIR}" "${RUN_PARENT_DIR}"
+RUN_WORK_DIR="$(mktemp -d "${RUN_PARENT_DIR}/run-XXXXXX")"
+SOURCE_DIR="${RUN_WORK_DIR}/linux-${KERNEL_VERSION}"
+BUILD_DIR="${RUN_WORK_DIR}/build-${KERNEL_VERSION}-${KALISTO_FIRECRACKER_ARTIFACT_ARCH}"
+OPENSSL_COMPAT_INCLUDE_DIR="${RUN_WORK_DIR}/openssl-compat"
+KERNEL_OUTPUT_PATH="${RUN_WORK_DIR}/${KERNEL_FILENAME}"
+KERNEL_CONFIG_OUTPUT_PATH="${RUN_WORK_DIR}/${KERNEL_FILENAME}.config"
+MANIFEST_PATH="${RUN_WORK_DIR}/${KERNEL_FILENAME}.manifest"
+
+cleanup() {
+  chmod -R u+w "${RUN_WORK_DIR}" 2>/dev/null || true
+  rm -rf "${RUN_WORK_DIR}"
+}
+trap cleanup EXIT INT TERM
 
 if [ ! -f /usr/include/openssl/engine.h ]; then
   mkdir -p "${OPENSSL_COMPAT_INCLUDE_DIR}/openssl"
@@ -89,8 +100,14 @@ else
 fi
 
 if [ ! -d "${SOURCE_DIR}" ]; then
-  rm -rf "${SOURCE_DIR}"
-  tar -C "${WORK_DIR}" -xf "${SOURCE_ARCHIVE_PATH}"
+  tar \
+    --delay-directory-restore \
+    --no-same-owner \
+    --no-same-permissions \
+    --mode='u+rwX,go+rX,go-w' \
+    -C "${RUN_WORK_DIR}" \
+    -xf "${SOURCE_ARCHIVE_PATH}"
+  chmod -R u+rwX "${SOURCE_DIR}"
 fi
 
 if [ -n "${GCC_MAJOR}" ] && [ "${GCC_MAJOR}" -ge 15 ] 2>/dev/null; then
@@ -102,10 +119,10 @@ if [ -n "${GCC_MAJOR}" ] && [ "${GCC_MAJOR}" -ge 15 ] 2>/dev/null; then
   export HOSTCFLAGS="${HOSTCFLAGS:+${HOSTCFLAGS} }-std=gnu11"
 fi
 
-rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
 make -C "${SOURCE_DIR}" O="${BUILD_DIR}" ARCH="${KERNEL_ARCH}" "${DEFCONFIG_TARGET}"
+# Merge the fragment first, then run olddefconfig explicitly for this arch.
 "${SOURCE_DIR}/scripts/kconfig/merge_config.sh" -m -O "${BUILD_DIR}" "${BUILD_DIR}/.config" "${KERNEL_CONFIG_FRAGMENT}"
 make -C "${SOURCE_DIR}" O="${BUILD_DIR}" ARCH="${KERNEL_ARCH}" olddefconfig
 
@@ -181,6 +198,11 @@ KERNEL_CONFIG_SHA256=${CONFIG_SHA256}
 KERNEL_CONFIG_FRAGMENT=${KERNEL_CONFIG_FRAGMENT}
 EOF
 
-echo "created ${KERNEL_OUTPUT_PATH}"
-echo "wrote ${KERNEL_CONFIG_OUTPUT_PATH}"
-echo "wrote ${MANIFEST_PATH}"
+rm -f "${FINAL_KERNEL_OUTPUT_PATH}" "${FINAL_KERNEL_CONFIG_OUTPUT_PATH}" "${FINAL_MANIFEST_PATH}"
+mv "${KERNEL_OUTPUT_PATH}" "${FINAL_KERNEL_OUTPUT_PATH}"
+mv "${KERNEL_CONFIG_OUTPUT_PATH}" "${FINAL_KERNEL_CONFIG_OUTPUT_PATH}"
+mv "${MANIFEST_PATH}" "${FINAL_MANIFEST_PATH}"
+
+echo "created ${FINAL_KERNEL_OUTPUT_PATH}"
+echo "wrote ${FINAL_KERNEL_CONFIG_OUTPUT_PATH}"
+echo "wrote ${FINAL_MANIFEST_PATH}"

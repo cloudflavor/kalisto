@@ -13,7 +13,46 @@ apt_retry() {
     "$@"
 }
 
+collect_purge_packages() {
+  PURGE_PACKAGES=
+  for PACKAGE in \
+    apport \
+    bash-completion \
+    byobu \
+    grub-common \
+    grub2-common \
+    grub-efi-amd64 \
+    grub-efi-amd64-bin \
+    grub-efi-amd64-signed \
+    grub-efi-arm64 \
+    grub-efi-arm64-bin \
+    grub-efi-arm64-signed \
+    groff-base \
+    man-db \
+    motd-news-config \
+    multipath-tools \
+    open-iscsi \
+    pollinate \
+    rsyslog \
+    shim \
+    shim-signed \
+    shim-signed-common \
+    snapd \
+    ubuntu-advantage-tools \
+    update-manager-core
+  do
+    if dpkg -s "${PACKAGE}" >/dev/null 2>&1; then
+      PURGE_PACKAGES="${PURGE_PACKAGES} ${PACKAGE}"
+    fi
+  done
+}
+
 apt_retry update
+collect_purge_packages
+if [ -n "${PURGE_PACKAGES}" ]; then
+  apt_retry purge -y --allow-remove-essential ${PURGE_PACKAGES}
+fi
+
 apt_retry install -y --no-install-recommends iptables procps socat
 
 mkdir -p /etc/modules-load.d /etc/sysctl.d /etc/kalisto /usr/local/lib/kalisto
@@ -52,32 +91,9 @@ rm -f /usr/local/lib/kalisto/cache/k3s /usr/local/lib/kalisto/provision_lima_nod
 rmdir /usr/local/lib/kalisto/cache 2>/dev/null || true
 rmdir /usr/local/lib/kalisto 2>/dev/null || true
 
-PURGE_PACKAGES=
-for PACKAGE in \
-  apport \
-  bash-completion \
-  byobu \
-  grub-common \
-  grub2-common \
-  grub-efi-amd64-bin \
-  grub-efi-arm64-bin \
-  groff-base \
-  man-db \
-  motd-news-config \
-  multipath-tools \
-  open-iscsi \
-  pollinate \
-  rsyslog \
-  snapd \
-  ubuntu-advantage-tools \
-  update-manager-core
-do
-  if dpkg -s "${PACKAGE}" >/dev/null 2>&1; then
-    PURGE_PACKAGES="${PURGE_PACKAGES} ${PACKAGE}"
-  fi
-done
+collect_purge_packages
 if [ -n "${PURGE_PACKAGES}" ]; then
-  apt_retry purge -y --auto-remove ${PURGE_PACKAGES}
+  apt_retry purge -y --auto-remove --allow-remove-essential ${PURGE_PACKAGES}
 fi
 
 cat > /etc/kalisto/node-image.env <<EOF

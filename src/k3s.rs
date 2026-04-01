@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+pub const KUBELET_RESOLV_CONF_PATH: &str = "/etc/kalisto/kubelet-resolv.conf";
+pub const KUBELET_RESOLV_CONF_NAMESERVERS: [&str; 2] = ["1.1.1.1", "2606:4700:4700::1111"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerMode {
     Standard,
@@ -117,6 +120,10 @@ impl BootstrapSpec {
             ),
             format!("export KALISTO_K3S_NODE_NAME={}", escape(&self.node_name)),
             format!("export K3S_VERSION={}", escape(&self.k3s_version)),
+            format!(
+                "export KALISTO_K3S_KUBELET_RESOLV_CONF={}",
+                escape(KUBELET_RESOLV_CONF_PATH)
+            ),
             export_toggle("KALISTO_K3S_USE_SYSTEMD", self.use_systemd),
             export_toggle(
                 "KALISTO_K3S_DISABLE_AGENT",
@@ -143,6 +150,20 @@ impl BootstrapSpec {
 
         commands
     }
+}
+
+pub fn kubelet_resolv_conf_contents() -> String {
+    let mut contents = String::new();
+    for nameserver in KUBELET_RESOLV_CONF_NAMESERVERS {
+        contents.push_str("nameserver ");
+        contents.push_str(nameserver);
+        contents.push('\n');
+    }
+    contents
+}
+
+pub fn kubelet_resolv_conf_arg() -> String {
+    format!("resolv-conf={KUBELET_RESOLV_CONF_PATH}")
 }
 
 fn export_toggle(name: &str, enabled: bool) -> String {
@@ -191,6 +212,19 @@ mod tests {
         assert!(exports.contains("export KALISTO_K3S_TLS_SANS='127.0.0.1,cp.example.test'"));
         assert!(exports.contains("export KALISTO_K3S_SERVER_URL='https://cp.example.test:6443'"));
         assert!(exports.contains("export KALISTO_K3S_TOKEN='secret'"));
+        assert!(
+            exports.contains(
+                "export KALISTO_K3S_KUBELET_RESOLV_CONF='/etc/kalisto/kubelet-resolv.conf'"
+            )
+        );
         assert!(exports.contains("export KALISTO_K3S_DISABLE_COREDNS=0"));
+    }
+
+    #[test]
+    fn kubelet_resolv_conf_contents_render_cloudflare_dual_stack_defaults() {
+        let contents = super::kubelet_resolv_conf_contents();
+
+        assert!(contents.contains("nameserver 1.1.1.1"));
+        assert!(contents.contains("nameserver 2606:4700:4700::1111"));
     }
 }

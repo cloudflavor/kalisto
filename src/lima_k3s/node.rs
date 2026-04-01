@@ -312,5 +312,8 @@ mod tests {
         );
         assert!(command.contains("KALISTO_K3S_TOKEN='secret-token'"));
         assert!(command.contains("KALISTO_K3S_NODE_NAME='kalisto-w0-test'"));
+        assert!(
+            command.contains("KALISTO_K3S_KUBELET_RESOLV_CONF='/etc/kalisto/kubelet-resolv.conf'")
+        );
     }
 }

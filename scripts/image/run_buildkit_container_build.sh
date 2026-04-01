@@ -29,7 +29,7 @@ esac
 
 UBUNTU_MIRROR="${KALISTO_UBUNTU_MIRROR:-${DEFAULT_MIRROR}}"
 K3S_CACHE_PATH="${KALISTO_K3S_CACHE_PATH:-${DEFAULT_K3S_CACHE_PATH}}"
-PACKAGE_LIST="${KALISTO_UBUNTU_PACKAGE_LIST:-systemd-sysv cloud-init openssh-server sudo iptables kmod socat linux-image-virtual grub-common grub2-common grub-efi-${UBUNTU_ARCH}-bin}"
+PACKAGE_LIST="${KALISTO_UBUNTU_PACKAGE_LIST:-systemd-sysv cloud-init openssh-server sudo iptables kmod socat linux-image-virtual}"
 
 K3S_ASSET_URL="${KALISTO_K3S_ASSET_URL:-}"
 
