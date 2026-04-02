@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::k3s::NodeRole;
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
 use crate::shell::shell_escape;
+use crate::telemetry::raw_streams_enabled;
 
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
@@ -138,6 +139,11 @@ pub fn create(spec: &ClusterSpec) -> Result<CreateOutcome> {
 }
 
 pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<CreateOutcome> {
+    debug_feedback(format!(
+        "create: resolving cluster spec for `{}` ({})",
+        spec.name,
+        spec.backend.as_str()
+    ));
     let resolved_spec = resolve_cluster_spec(spec, runner)?;
     let state_root = ClusterSpec::state_root_for(&resolved_spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
@@ -154,10 +160,19 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
     let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &resolved_spec.name);
 
     let backend = backend_for(resolved_spec.backend);
+    debug_feedback(format!(
+        "create: checking backend availability for `{}`",
+        resolved_spec.backend.as_str()
+    ));
     backend.check_available(runner)?;
 
     fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
     fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
+    debug_feedback(format!(
+        "create: prepared state root `{}` and runtime root `{}`",
+        state_root.display(),
+        runtime_root.display()
+    ));
 
     let state = cluster_state_from_spec(&resolved_spec, workspace_root.clone(), &state_root);
     let base_config = BackendConfig {
@@ -174,6 +189,11 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         .iter()
         .map(|node| node.name.clone())
         .collect::<Vec<_>>();
+    debug_feedback(format!(
+        "create: preparing {} node network target(s) with network `{}`",
+        instance_names.len(),
+        resolved_spec.network
+    ));
     if let Err(error) = backend.prepare_cluster_network(runner, &base_config, &instance_names) {
         let _ = backend.cleanup_cluster_network(runner, &base_config, &instance_names);
         let _ = fs::remove_dir_all(&state_root);
@@ -181,6 +201,10 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         return Err(error);
     }
 
+    debug_feedback(format!(
+        "create: persisting cluster state to `{}`",
+        state_root.display()
+    ));
     state.save(&state_root)?;
     if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
         warn!(
@@ -198,6 +222,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.exists() {
+        debug_feedback(format!(
+            "up: cluster `{}` has no persisted definition, creating it first",
+            spec.name
+        ));
         create_with_runner(spec, runner)?;
     }
     let state = ClusterState::load(&state_root)?;
@@ -219,6 +247,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     );
     let _up_guard = up_span.enter();
     info!("starting cluster bring-up");
+    debug_feedback(format!(
+        "up: starting cluster `{}` with backend `{}` and {} worker(s)",
+        spec.name,
+        spec.backend.as_str(),
+        spec.worker_count
+    ));
 
     ensure_path_exists(&spec.workspace_root)?;
     let workspace_root = canonicalize_path(&spec.workspace_root)?;
@@ -237,6 +271,11 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         runtime_root = %runtime_root.display(),
         "resolved cluster paths"
     );
+    debug_feedback(format!(
+        "up: using state root `{}` and runtime root `{}`",
+        state_root.display(),
+        runtime_root.display()
+    ));
 
     let base_config = BackendConfig {
         template: spec.template.clone(),
@@ -264,6 +303,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         memory_gib = spec.control_plane_resources.memory_gib,
         "starting control-plane VM"
     );
+    debug_feedback(format!(
+        "up: starting control-plane VM `{}` ({} vCPU, {} GiB)",
+        control_plane.name,
+        spec.control_plane_resources.cpus,
+        spec.control_plane_resources.memory_gib
+    ));
     let control_plane_start = backend.start_instance(
         runner,
         &base_config,
@@ -292,6 +337,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         artifacts_root: control_plane.artifacts.root.clone(),
     });
     info!(node = %control_plane.name, "control-plane VM started");
+    debug_feedback(format!(
+        "up: control-plane VM `{}` started, bootstrapping k3s",
+        control_plane.name
+    ));
 
     let control_plane_host =
         backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root)?;
@@ -341,6 +390,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         format!("{}:k3s", control_plane.name),
     );
     info!(node = %control_plane.name, "waiting for control-plane kubeconfig and join token");
+    debug_feedback("up: waiting for control-plane kubeconfig and join token");
     if let Err(error) = sync_control_plane_artifact(
         backend,
         runner,
@@ -388,6 +438,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let initial_ready =
         initial_readiness_command(spec.server_mode, &control_plane_guest_kubeconfig);
     info!(node = %control_plane.name, "waiting for control-plane API in guest");
+    debug_feedback("up: waiting for control-plane API in guest");
     if let Err(error) = wait_for_stable_guest_success_with_tail(
         backend,
         runner,
@@ -447,6 +498,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     let api_check = format!("https://{api_endpoint}/livez");
     info!(url = %api_check, "waiting for control-plane API on the host");
+    debug_feedback(format!("up: waiting for control-plane API at {api_check}"));
     if let Err(error) = wait_for_host_http_with_tail(
         runner,
         &api_check,
@@ -469,6 +521,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         node = %control_plane.name,
         "control-plane is ready"
     );
+    debug_feedback(format!(
+        "up: control-plane ready in {}",
+        control_plane_ready
+    ));
 
     let server_token = fs::read_to_string(&control_plane.artifacts.token)
         .map_err(io_error("read_to_string"))?
@@ -485,6 +541,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     if !worker_instances.is_empty() {
         info!(workers = worker_instances.len(), "starting worker VMs");
+        debug_feedback(format!(
+            "up: starting {} worker VM(s)",
+            worker_instances.len()
+        ));
     }
     if let Err(error) = start_and_join_workers(
         backend,
@@ -614,6 +674,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         state_file = %ClusterState::state_file(&state_root).display(),
         "persisting cluster state"
     );
+    debug_feedback(format!(
+        "up: persisting cluster state to `{}`",
+        ClusterState::state_file(&state_root).display()
+    ));
     state.save(&state_root)?;
     if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
         warn!(
@@ -631,6 +695,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         cluster_ready = %cluster_ready,
         "cluster is ready"
     );
+    debug_feedback(format!("up: cluster ready in {}", cluster_ready));
 
     Ok(UpOutcome {
         state,
@@ -2091,6 +2156,12 @@ fn io_error(program: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::CommandIo {
         program: program.to_owned(),
         source,
+    }
+}
+
+fn debug_feedback(message: impl AsRef<str>) {
+    if raw_streams_enabled() {
+        eprintln!("[debug] {}", message.as_ref());
     }
 }
 
