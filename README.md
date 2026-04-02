@@ -186,6 +186,9 @@ Current shape:
 - prerequisites:
   - [docs/prerequisites-linux-firecracker.md](/home/runner/projects/rust/kalisto/docs/prerequisites-linux-firecracker.md)
 
+For rootless Linux Firecracker networking, install `slirp4netns` and use
+`--network slirp4netns`.
+
 Build the Firecracker kernel, rootfs, and unified manifest locally on Linux:
 
 ```bash

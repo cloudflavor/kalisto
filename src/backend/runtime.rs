@@ -126,6 +126,7 @@ pub trait ClusterBackend: Send + Sync {
     fn prepare_cluster_network(
         &self,
         _runner: &dyn CommandRunner,
+        _config: &BackendConfig,
         _instance_names: &[String],
     ) -> Result<()> {
         Ok(())
@@ -134,6 +135,7 @@ pub trait ClusterBackend: Send + Sync {
     fn cleanup_cluster_network(
         &self,
         _runner: &dyn CommandRunner,
+        _config: &BackendConfig,
         _instance_names: &[String],
     ) -> Result<()> {
         Ok(())

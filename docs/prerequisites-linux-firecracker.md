@@ -33,7 +33,12 @@ The Linux host must provide:
 - hardware virtualization support enabled in firmware and exposed to the host CPU
 - KVM available at `/dev/kvm`
 - Firecracker installed and runnable from `$PATH`
+- `debugfs` available for NoCloud seed injection into the Firecracker rootfs
 - `ip` available for Linux networking setup
+- `iptables` available for the bridge-backed Firecracker network mode
+- `sysctl` available for the bridge-backed Firecracker network mode
+- `slirp4netns` available for the rootless Firecracker network mode (`--network slirp4netns`)
+- `unshare` and `nsenter` available for the rootless Firecracker network mode
 - `curl` available for host-side API readiness checks
 - `nc` available for Unix socket / port checks when needed
 - `jq` available for JSON inspection and debugging when needed
@@ -41,7 +46,8 @@ The Linux host must provide:
 The user running Kalisto must be able to:
 
 - open `/dev/kvm`
-- create and manage the networking devices needed for Firecracker
+- create and manage the networking devices needed for the bridge-backed Firecracker network mode
+- create user and network namespaces for the rootless Firecracker network mode
 - create Unix sockets, runtime files, and logs under the Kalisto workspace/state roots
 
 ## Verified On The Current Host
@@ -56,7 +62,9 @@ The current host details already confirm these points:
 - KVM kernel modules loaded
 - CPU virtualization extensions visible
 - tools present:
+  - `/usr/bin/debugfs`
   - `/usr/bin/ip`
+  - `/usr/sbin/iptables`
   - `/usr/bin/curl`
   - `/usr/bin/nc`
   - `/usr/bin/jq`
@@ -145,7 +153,19 @@ That means:
 - no Lima template-driven port forwarding
 - Firecracker-specific network setup must be handled by the Linux backend
 
-The exact networking implementation is still to be defined, but the host must support the devices and privileges that implementation requires.
+Kalisto currently has two Linux Firecracker networking modes:
+
+- `bridge`:
+  - creates host bridge/TAP devices
+  - requires host-level networking privileges
+  - depends on `ip`, `iptables`, and `sysctl`
+- `slirp4netns`:
+  - runs Firecracker inside an unprivileged user+net namespace
+  - uses `slirp4netns` for egress and host port forwards
+  - depends on `slirp4netns`, `unshare`, and `nsenter`
+
+If you intend to use rootless Firecracker networking, install the `slirp4netns`
+tooling up front and start the cluster with `--network slirp4netns`.
 
 ## Operational Notes
 

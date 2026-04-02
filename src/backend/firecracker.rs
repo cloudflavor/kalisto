@@ -1,5 +1,8 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -10,6 +13,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::backend::runtime::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig};
@@ -25,6 +29,36 @@ const SSH_USER: &str = "ubuntu";
 const BRIDGE_NAME: &str = "kalistofc0";
 const BRIDGE_HOST_IP: &str = "172.31.0.1";
 const BRIDGE_CIDR_BITS: u8 = 16;
+const ROOTLESS_SLIRP_TAP_NAME: &str = "kfcslip0";
+const ROOTLESS_SLIRP_GATEWAY_IP: &str = "10.0.2.2";
+const ROOTLESS_SLIRP_CIDR_BITS: u8 = 24;
+const ROOTLESS_SSH_HOST: &str = "127.0.0.1";
+const ROOTLESS_NETWORK_DIR: &str = "firecracker-rootless-net";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirecrackerNetworkMode {
+    Bridge,
+    RootlessSlirp,
+}
+
+impl FirecrackerNetworkMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "" | "bridge" => Ok(Self::Bridge),
+            "slirp" | "slirp4netns" => Ok(Self::RootlessSlirp),
+            other => Err(Error::InvalidArgs(format!(
+                "unsupported firecracker network mode `{other}`; expected one of: bridge, slirp4netns"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bridge => "bridge",
+            Self::RootlessSlirp => "slirp4netns",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct FirecrackerBackend;
@@ -74,11 +108,21 @@ impl ClusterBackend for FirecrackerBackend {
         fs::create_dir_all(&instance.runtime_root).map_err(io_error("create_dir_all"))?;
 
         let runtime = RuntimeFiles::new(&instance.runtime_root);
-        let net = NetworkConfig::for_instance(&instance.name);
+        let network_mode = FirecrackerNetworkMode::parse(&config.network)?;
+        ensure_firecracker_network_tools(runner, network_mode)?;
+        let net = match network_mode {
+            FirecrackerNetworkMode::Bridge => {
+                let net = NetworkConfig::for_bridge_instance(&instance.name);
+                ensure_prepared_network(&net)?;
+                net
+            }
+            FirecrackerNetworkMode::RootlessSlirp => {
+                prepare_rootless_network(runner, instance, &runtime)?
+            }
+        };
         ensure_ssh_key(runner, &runtime.ssh_key)?;
         write_cloud_init_files(&runtime, &instance.name, &net)?;
         prepare_instance_rootfs(runner, rootfs, &runtime)?;
-        ensure_prepared_network(&net)?;
         write_file(
             &runtime.config,
             &build_config_json(kernel, instance, &runtime, &net),
@@ -104,15 +148,9 @@ impl ClusterBackend for FirecrackerBackend {
             "starting firecracker microvm"
         );
 
-        let mut child = Command::new("firecracker");
-        child
-            .arg("--id")
-            .arg(&instance.name)
-            .arg("--no-api")
-            .arg("--config-file")
-            .arg(&runtime.config)
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
+        let mut child = firecracker_command(instance, &runtime, &net);
+        child.stdout(Stdio::from(stdout_file));
+        child.stderr(Stdio::from(stderr_file));
 
         let mut child = child.spawn().map_err(|source| Error::CommandIo {
             program: "firecracker".to_owned(),
@@ -187,7 +225,7 @@ impl ClusterBackend for FirecrackerBackend {
             ));
         }
 
-        if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_ok() {
+        if run_ssh_command(runner, &runtime.ssh_key, &net, "true").is_ok() {
             Ok(format!(
                 "{instance_name} Running firecracker guest_ip={}",
                 net.guest_ip
@@ -234,26 +272,35 @@ impl ClusterBackend for FirecrackerBackend {
         &self,
         instance_name: &str,
         runtime_root: &Path,
-        _requested_port: u16,
+        requested_port: u16,
     ) -> Result<String> {
-        Ok(format!(
-            "{}:6443",
-            load_network_config(&RuntimeFiles::new(runtime_root), instance_name)?.guest_ip
-        ))
+        let net = load_network_config(&RuntimeFiles::new(runtime_root), instance_name)?;
+        Ok(match net.mode {
+            FirecrackerNetworkMode::Bridge => format!("{}:6443", net.guest_ip),
+            FirecrackerNetworkMode::RootlessSlirp => format!(
+                "{ROOTLESS_SSH_HOST}:{}",
+                net.api_port_forward.unwrap_or(requested_port)
+            ),
+        })
     }
 
     fn prepare_cluster_network(
         &self,
         runner: &dyn CommandRunner,
+        config: &BackendConfig,
         instance_names: &[String],
     ) -> Result<()> {
+        if FirecrackerNetworkMode::parse(&config.network)? == FirecrackerNetworkMode::RootlessSlirp
+        {
+            return Ok(());
+        }
         let bridge_net = instance_names
             .first()
-            .map(|name| NetworkConfig::for_instance(name))
-            .unwrap_or_else(|| NetworkConfig::for_instance("kalisto"));
+            .map(|name| NetworkConfig::for_bridge_instance(name))
+            .unwrap_or_else(|| NetworkConfig::for_bridge_instance("kalisto"));
         setup_bridge(runner, &bridge_net)?;
         for instance_name in instance_names {
-            setup_tap(runner, &NetworkConfig::for_instance(instance_name))?;
+            setup_tap(runner, &NetworkConfig::for_bridge_instance(instance_name))?;
         }
         Ok(())
     }
@@ -261,17 +308,22 @@ impl ClusterBackend for FirecrackerBackend {
     fn cleanup_cluster_network(
         &self,
         runner: &dyn CommandRunner,
+        config: &BackendConfig,
         instance_names: &[String],
     ) -> Result<()> {
+        if FirecrackerNetworkMode::parse(&config.network)? == FirecrackerNetworkMode::RootlessSlirp
+        {
+            return Ok(());
+        }
         for instance_name in instance_names {
-            let net = NetworkConfig::for_instance(instance_name);
+            let net = NetworkConfig::for_bridge_instance(instance_name);
             let _ = runner.run("ip", &["link".into(), "del".into(), net.tap_name]);
         }
 
         let bridge_net = instance_names
             .first()
-            .map(|name| NetworkConfig::for_instance(name))
-            .unwrap_or_else(|| NetworkConfig::for_instance("kalisto"));
+            .map(|name| NetworkConfig::for_bridge_instance(name))
+            .unwrap_or_else(|| NetworkConfig::for_bridge_instance("kalisto"));
         if runner
             .run(
                 "ip",
@@ -339,6 +391,9 @@ struct RuntimeFiles {
     guest_ip: PathBuf,
     host_ip: PathBuf,
     tap_name: PathBuf,
+    network_mode: PathBuf,
+    ssh_port: PathBuf,
+    api_port_forward: PathBuf,
 }
 
 #[derive(Debug)]
@@ -467,22 +522,28 @@ impl RuntimeFiles {
             guest_ip: runtime_root.join("guest-ip"),
             host_ip: runtime_root.join("host-ip"),
             tap_name: runtime_root.join("tap-name"),
+            network_mode: runtime_root.join("network-mode"),
+            ssh_port: runtime_root.join("ssh-port"),
+            api_port_forward: runtime_root.join("api-port-forward"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct NetworkConfig {
+    mode: FirecrackerNetworkMode,
     bridge_name: String,
     tap_name: String,
     host_ip: String,
     guest_ip: String,
     guest_mac: String,
     cidr_bits: u8,
+    ssh_port: Option<u16>,
+    api_port_forward: Option<u16>,
 }
 
 impl NetworkConfig {
-    fn for_instance(name: &str) -> Self {
+    fn for_bridge_instance(name: &str) -> Self {
         let hash = stable_hash(name);
         let third = 1 + ((hash >> 8) % 254) as u8;
         let fourth = 2 + (hash % 253) as u8;
@@ -500,14 +561,415 @@ impl NetworkConfig {
         let tap_name = tap_name.chars().take(15).collect();
 
         Self {
+            mode: FirecrackerNetworkMode::Bridge,
             bridge_name: BRIDGE_NAME.to_owned(),
             tap_name,
             host_ip,
             guest_ip,
             guest_mac,
             cidr_bits: BRIDGE_CIDR_BITS,
+            ssh_port: None,
+            api_port_forward: None,
         }
     }
+
+    fn for_rootless_instance(name: &str, ssh_port: u16, api_port_forward: Option<u16>) -> Self {
+        let hash = stable_hash(name);
+        let host_octet = 100 + (hash % 100) as u8;
+        let guest_ip = format!("10.0.2.{host_octet}");
+        let guest_mac = format!(
+            "06:00:{:02x}:{:02x}:{:02x}:{:02x}",
+            (hash >> 24) as u8,
+            (hash >> 16) as u8,
+            (hash >> 8) as u8,
+            hash as u8
+        );
+        let tap_name = format!("ktap{:08x}", hash);
+        let tap_name = tap_name.chars().take(15).collect();
+
+        Self {
+            mode: FirecrackerNetworkMode::RootlessSlirp,
+            bridge_name: BRIDGE_NAME.to_owned(),
+            tap_name,
+            host_ip: ROOTLESS_SLIRP_GATEWAY_IP.to_owned(),
+            guest_ip,
+            guest_mac,
+            cidr_bits: ROOTLESS_SLIRP_CIDR_BITS,
+            ssh_port: Some(ssh_port),
+            api_port_forward,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RootlessClusterNetwork {
+    anchor_pid: u32,
+    api_socket: PathBuf,
+}
+
+impl RootlessClusterNetwork {
+    fn from_runtime_root(runtime_root: &Path) -> Result<Self> {
+        let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
+        let anchor_pid = read_required_pid(&root.join("anchor.pid"), "rootless firecracker netns")?;
+        let _ = read_required_pid(&root.join("slirp4netns.pid"), "slirp4netns")?;
+        Ok(Self {
+            api_socket: root.join("slirp4netns.sock"),
+            anchor_pid,
+        })
+    }
+}
+
+fn cluster_runtime_root(runtime_root: &Path) -> Result<PathBuf> {
+    runtime_root.parent().map(PathBuf::from).ok_or_else(|| {
+        Error::InvalidArgs(format!(
+            "failed to derive cluster runtime root from {}",
+            runtime_root.display()
+        ))
+    })
+}
+
+fn ensure_firecracker_network_tools(
+    runner: &dyn CommandRunner,
+    mode: FirecrackerNetworkMode,
+) -> Result<()> {
+    if mode == FirecrackerNetworkMode::RootlessSlirp {
+        runner.run("unshare", &["--version".into()])?;
+        runner.run("nsenter", &["--version".into()])?;
+        runner.run("slirp4netns", &["--version".into()])?;
+    }
+    Ok(())
+}
+
+fn prepare_rootless_network(
+    runner: &dyn CommandRunner,
+    instance: &InstanceConfig,
+    runtime: &RuntimeFiles,
+) -> Result<NetworkConfig> {
+    let cluster_network = ensure_rootless_cluster_network(runner, &instance.runtime_root)?;
+    let ssh_port = reserve_host_port()?;
+    let api_port_forward = instance.host_port_forward;
+    let net = NetworkConfig::for_rootless_instance(&instance.name, ssh_port, api_port_forward);
+
+    ensure_rootless_tap(runner, cluster_network.anchor_pid, &net)?;
+    ensure_slirp_host_forward(&cluster_network.api_socket, ssh_port, &net.guest_ip, 22)?;
+    if let Some(host_port) = api_port_forward {
+        ensure_slirp_host_forward(&cluster_network.api_socket, host_port, &net.guest_ip, 6443)?;
+    }
+
+    write_file(&runtime.network_mode, &format!("{}\n", net.mode.as_str()))?;
+    write_file(&runtime.ssh_port, &format!("{ssh_port}\n"))?;
+    if let Some(host_port) = api_port_forward {
+        write_file(&runtime.api_port_forward, &format!("{host_port}\n"))?;
+    } else {
+        let _ = fs::remove_file(&runtime.api_port_forward);
+    }
+    Ok(net)
+}
+
+fn ensure_rootless_cluster_network(
+    runner: &dyn CommandRunner,
+    runtime_root: &Path,
+) -> Result<RootlessClusterNetwork> {
+    let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
+    fs::create_dir_all(&root).map_err(io_error("create_dir_all"))?;
+
+    let anchor_path = root.join("anchor.pid");
+    let slirp_path = root.join("slirp4netns.pid");
+    let socket_path = root.join("slirp4netns.sock");
+    if let (Some(anchor_pid), Some(slirp_pid)) = (read_pid(&anchor_path)?, read_pid(&slirp_path)?)
+        && process_exists(runner, anchor_pid)
+        && process_exists(runner, slirp_pid)
+        && socket_path.exists()
+    {
+        return Ok(RootlessClusterNetwork {
+            anchor_pid,
+            api_socket: socket_path,
+        });
+    }
+
+    let _ = fs::remove_file(&anchor_path);
+    let _ = fs::remove_file(&slirp_path);
+    let _ = fs::remove_file(&socket_path);
+
+    let anchor_child = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--net", "--fork", "sh", "-lc"])
+        .arg("trap : TERM INT; while :; do sleep 3600; done")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| Error::CommandIo {
+            program: "unshare".to_owned(),
+            source,
+        })?;
+    let anchor_pid = anchor_child.id();
+    write_file(&anchor_path, &format!("{anchor_pid}\n"))?;
+
+    let (readiness_read, readiness_write) =
+        std::os::unix::net::UnixStream::pair().map_err(io_error("unix_stream_pair"))?;
+    let mut slirp = Command::new("slirp4netns");
+    slirp
+        .arg("--mtu=65520")
+        .arg("--disable-host-loopback")
+        .arg("--api-socket")
+        .arg(&socket_path)
+        .arg("--ready-fd")
+        .arg(readiness_write.as_raw_fd().to_string())
+        .arg(anchor_pid.to_string())
+        .arg(ROOTLESS_SLIRP_TAP_NAME)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let slirp_child = slirp.spawn().map_err(|source| Error::CommandIo {
+        program: "slirp4netns".to_owned(),
+        source,
+    })?;
+    drop(readiness_write);
+    wait_for_slirp_ready(readiness_read)?;
+    write_file(&slirp_path, &format!("{}\n", slirp_child.id()))?;
+
+    let cluster = RootlessClusterNetwork {
+        anchor_pid,
+        api_socket: socket_path,
+    };
+    ensure_rootless_bridge(runner, cluster.anchor_pid)?;
+    Ok(cluster)
+}
+
+fn wait_for_slirp_ready(mut ready: UnixStream) -> Result<()> {
+    let mut buf = [0_u8; 1];
+    ready.read_exact(&mut buf).map_err(io_error("read_exact"))?;
+    if buf[0] == b'1' {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs(
+            "slirp4netns did not report readiness".to_owned(),
+        ))
+    }
+}
+
+fn ensure_rootless_bridge(runner: &dyn CommandRunner, anchor_pid: u32) -> Result<()> {
+    if run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "show", "dev", BRIDGE_NAME],
+    )
+    .is_err()
+    {
+        run_in_rootless_namespace(
+            runner,
+            anchor_pid,
+            &["ip", "link", "add", "name", BRIDGE_NAME, "type", "bridge"],
+        )?;
+    }
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &[
+            "ip",
+            "link",
+            "set",
+            "dev",
+            ROOTLESS_SLIRP_TAP_NAME,
+            "master",
+            BRIDGE_NAME,
+        ],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "set", "dev", ROOTLESS_SLIRP_TAP_NAME, "up"],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "set", "dev", BRIDGE_NAME, "up"],
+    )?;
+    Ok(())
+}
+
+fn ensure_rootless_tap(
+    runner: &dyn CommandRunner,
+    anchor_pid: u32,
+    net: &NetworkConfig,
+) -> Result<()> {
+    let _ = run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "del", net.tap_name.as_str()],
+    );
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &[
+            "ip",
+            "tuntap",
+            "add",
+            "dev",
+            net.tap_name.as_str(),
+            "mode",
+            "tap",
+        ],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &[
+            "ip",
+            "link",
+            "set",
+            "dev",
+            net.tap_name.as_str(),
+            "master",
+            BRIDGE_NAME,
+        ],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "set", "dev", net.tap_name.as_str(), "up"],
+    )?;
+    Ok(())
+}
+
+fn run_in_rootless_namespace(
+    runner: &dyn CommandRunner,
+    anchor_pid: u32,
+    command: &[&str],
+) -> Result<crate::process::Output> {
+    let mut args = vec![
+        "-t".into(),
+        anchor_pid.to_string(),
+        "--user".into(),
+        "--setuid".into(),
+        "0".into(),
+        "--setgid".into(),
+        "0".into(),
+        "--net".into(),
+    ];
+    args.extend(command.iter().map(|value| (*value).to_owned()));
+    runner.run("nsenter", &args)
+}
+
+fn ensure_slirp_host_forward(
+    api_socket: &Path,
+    host_port: u16,
+    guest_addr: &str,
+    guest_port: u16,
+) -> Result<()> {
+    if slirp_host_forward_exists(api_socket, host_port, guest_addr, guest_port)? {
+        return Ok(());
+    }
+
+    let response = slirp_api_request(
+        api_socket,
+        &json!({
+            "execute": "add_hostfwd",
+            "arguments": {
+                "proto": "tcp",
+                "host_addr": ROOTLESS_SSH_HOST,
+                "host_port": host_port,
+                "guest_addr": guest_addr,
+                "guest_port": guest_port
+            }
+        }),
+    )?;
+    if response.get("error").is_some() {
+        return Err(Error::InvalidArgs(format!(
+            "failed to add slirp4netns host forward {}:{} -> {}:{}: {}",
+            ROOTLESS_SSH_HOST, host_port, guest_addr, guest_port, response
+        )));
+    }
+    Ok(())
+}
+
+fn slirp_host_forward_exists(
+    api_socket: &Path,
+    host_port: u16,
+    guest_addr: &str,
+    guest_port: u16,
+) -> Result<bool> {
+    let response = slirp_api_request(api_socket, &json!({ "execute": "list_hostfwd" }))?;
+    let entries = response
+        .get("return")
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(entries.iter().any(|entry| {
+        entry.get("proto").and_then(Value::as_str) == Some("tcp")
+            && entry.get("host_addr").and_then(Value::as_str) == Some(ROOTLESS_SSH_HOST)
+            && entry.get("host_port").and_then(Value::as_u64) == Some(u64::from(host_port))
+            && entry.get("guest_addr").and_then(Value::as_str) == Some(guest_addr)
+            && entry.get("guest_port").and_then(Value::as_u64) == Some(u64::from(guest_port))
+    }))
+}
+
+fn remove_slirp_host_forward(
+    api_socket: &Path,
+    host_port: u16,
+    guest_addr: &str,
+    guest_port: u16,
+) -> Result<()> {
+    let response = slirp_api_request(api_socket, &json!({ "execute": "list_hostfwd" }))?;
+    let entries = response
+        .get("return")
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in entries {
+        let matches = entry.get("proto").and_then(Value::as_str) == Some("tcp")
+            && entry.get("host_addr").and_then(Value::as_str) == Some(ROOTLESS_SSH_HOST)
+            && entry.get("host_port").and_then(Value::as_u64) == Some(u64::from(host_port))
+            && entry.get("guest_addr").and_then(Value::as_str) == Some(guest_addr)
+            && entry.get("guest_port").and_then(Value::as_u64) == Some(u64::from(guest_port));
+        if matches && let Some(id) = entry.get("id").and_then(Value::as_u64) {
+            let _ = slirp_api_request(
+                api_socket,
+                &json!({
+                    "execute": "remove_hostfwd",
+                    "arguments": { "id": id }
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn slirp_api_request(api_socket: &Path, request: &Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(api_socket).map_err(io_error("unix_connect"))?;
+    let payload = serde_json::to_vec(request).map_err(|error| {
+        Error::InvalidArgs(format!(
+            "failed to serialize slirp4netns API request for {}: {error}",
+            api_socket.display()
+        ))
+    })?;
+    stream.write_all(&payload).map_err(io_error("write_all"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_error("shutdown"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(io_error("read_to_string"))?;
+    serde_json::from_str(&response).map_err(|error| {
+        Error::InvalidArgs(format!(
+            "failed to parse slirp4netns API response from {}: {error}",
+            api_socket.display()
+        ))
+    })
+}
+
+fn reserve_host_port() -> Result<u16> {
+    let listener = TcpListener::bind((ROOTLESS_SSH_HOST, 0)).map_err(io_error("tcp_bind"))?;
+    listener
+        .local_addr()
+        .map_err(io_error("local_addr"))
+        .map(|addr| addr.port())
+}
+
+fn read_required_pid(path: &Path, label: &str) -> Result<u32> {
+    read_pid(path)?
+        .ok_or_else(|| Error::InvalidArgs(format!("missing {label} pid at {}", path.display())))
 }
 
 fn build_config_json(
@@ -555,6 +1017,41 @@ fn build_config_json(
         json_escape(&net.tap_name),
         json_escape(&net.guest_mac),
     )
+}
+
+fn firecracker_command(
+    instance: &InstanceConfig,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+) -> Command {
+    let mut command = match net.mode {
+        FirecrackerNetworkMode::Bridge => Command::new("firecracker"),
+        FirecrackerNetworkMode::RootlessSlirp => {
+            let cluster_network = RootlessClusterNetwork::from_runtime_root(&instance.runtime_root)
+                .expect("rootless cluster network should exist before firecracker spawn");
+            let mut command = Command::new("nsenter");
+            command.args([
+                "-t".to_owned(),
+                cluster_network.anchor_pid.to_string(),
+                "--user".to_owned(),
+                "--setuid".to_owned(),
+                "0".to_owned(),
+                "--setgid".to_owned(),
+                "0".to_owned(),
+                "--net".to_owned(),
+                "firecracker".to_owned(),
+            ]);
+            command
+        }
+    };
+
+    command
+        .arg("--id")
+        .arg(&instance.name)
+        .arg("--no-api")
+        .arg("--config-file")
+        .arg(&runtime.config);
+    command
 }
 
 fn write_cloud_init_files(
@@ -803,13 +1300,24 @@ fn ensure_prepared_network(net: &NetworkConfig) -> Result<()> {
 }
 
 fn load_network_config(runtime: &RuntimeFiles, instance_name: &str) -> Result<NetworkConfig> {
-    let tap_name = read_trimmed(&runtime.tap_name)?
-        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).tap_name);
-    let host_ip = read_trimmed(&runtime.host_ip)?
-        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).host_ip);
-    let guest_ip = read_trimmed(&runtime.guest_ip)?
-        .unwrap_or_else(|| NetworkConfig::for_instance(instance_name).guest_ip);
-    let mut net = NetworkConfig::for_instance(instance_name);
+    let network_mode = read_trimmed(&runtime.network_mode)?
+        .map(|value| FirecrackerNetworkMode::parse(&value))
+        .transpose()?
+        .unwrap_or(FirecrackerNetworkMode::Bridge);
+    let default = match network_mode {
+        FirecrackerNetworkMode::Bridge => NetworkConfig::for_bridge_instance(instance_name),
+        FirecrackerNetworkMode::RootlessSlirp => NetworkConfig::for_rootless_instance(
+            instance_name,
+            read_trimmed(&runtime.ssh_port)?
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(22),
+            read_trimmed(&runtime.api_port_forward)?.and_then(|value| value.parse::<u16>().ok()),
+        ),
+    };
+    let tap_name = read_trimmed(&runtime.tap_name)?.unwrap_or_else(|| default.tap_name.clone());
+    let host_ip = read_trimmed(&runtime.host_ip)?.unwrap_or_else(|| default.host_ip.clone());
+    let guest_ip = read_trimmed(&runtime.guest_ip)?.unwrap_or_else(|| default.guest_ip.clone());
+    let mut net = default;
     net.tap_name = tap_name;
     net.host_ip = host_ip;
     net.guest_ip = guest_ip;
@@ -841,7 +1349,7 @@ fn wait_for_ssh(
             )));
         }
 
-        if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_ok() {
+        if run_ssh_command(runner, &runtime.ssh_key, net, "true").is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_secs(2));
@@ -910,36 +1418,47 @@ fn run_ssh(
 ) -> Result<Output> {
     let runtime = RuntimeFiles::new(runtime_root);
     let net = load_network_config(&runtime, instance_name)?;
-    run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, command)
+    run_ssh_command(runner, &runtime.ssh_key, &net, command)
 }
 
 fn run_ssh_command(
     runner: &dyn CommandRunner,
     ssh_key: &Path,
-    guest_ip: &str,
+    net: &NetworkConfig,
     command: &str,
 ) -> Result<Output> {
-    runner.run(
-        "ssh",
-        &[
-            "-F".into(),
-            "/dev/null".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            "-i".into(),
-            ssh_key.display().to_string(),
-            format!("{SSH_USER}@{guest_ip}"),
-            command.to_owned(),
-        ],
-    )
+    let (host, port) = match net.mode {
+        FirecrackerNetworkMode::Bridge => (net.guest_ip.as_str(), None),
+        FirecrackerNetworkMode::RootlessSlirp => (
+            ROOTLESS_SSH_HOST,
+            Some(net.ssh_port.ok_or_else(|| {
+                Error::InvalidArgs("missing rootless firecracker SSH host port".to_owned())
+            })?),
+        ),
+    };
+    let mut args = vec![
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        "-o".into(),
+        "ConnectTimeout=5".into(),
+        "-i".into(),
+        ssh_key.display().to_string(),
+    ];
+    if let Some(port) = port {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
+    args.push(format!("{SSH_USER}@{host}"));
+    args.push(command.to_owned());
+    runner.run("ssh", &args)
 }
 
 fn stop_process(
@@ -952,11 +1471,11 @@ fn stop_process(
         let _ = run_ssh_command(
             runner,
             &runtime.ssh_key,
-            &net.guest_ip,
+            net,
             "sudo shutdown -h now || sudo poweroff || true",
         );
         for _ in 0..30 {
-            if run_ssh_command(runner, &runtime.ssh_key, &net.guest_ip, "true").is_err() {
+            if run_ssh_command(runner, &runtime.ssh_key, net, "true").is_err() {
                 break;
             }
             thread::sleep(Duration::from_secs(1));
@@ -979,6 +1498,76 @@ fn stop_process(
     }
 
     let _ = fs::remove_file(&runtime.pid);
+    if net.mode == FirecrackerNetworkMode::RootlessSlirp {
+        cleanup_rootless_instance_network(runner, runtime, net)?;
+    }
+    Ok(())
+}
+
+fn cleanup_rootless_instance_network(
+    runner: &dyn CommandRunner,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+) -> Result<()> {
+    let cluster =
+        RootlessClusterNetwork::from_runtime_root(runtime.pid.parent().ok_or_else(|| {
+            Error::InvalidArgs("missing runtime root for rootless cleanup".to_owned())
+        })?)?;
+    if let Some(ssh_port) = net.ssh_port {
+        let _ = remove_slirp_host_forward(&cluster.api_socket, ssh_port, &net.guest_ip, 22);
+    }
+    if let Some(api_port_forward) = net.api_port_forward {
+        let _ =
+            remove_slirp_host_forward(&cluster.api_socket, api_port_forward, &net.guest_ip, 6443);
+    }
+    let _ = run_in_rootless_namespace(
+        runner,
+        cluster.anchor_pid,
+        &["ip", "link", "del", net.tap_name.as_str()],
+    );
+    let _ = fs::remove_file(&runtime.ssh_port);
+    let _ = fs::remove_file(&runtime.api_port_forward);
+    maybe_cleanup_rootless_cluster_network(runner, runtime)?;
+    Ok(())
+}
+
+fn maybe_cleanup_rootless_cluster_network(
+    runner: &dyn CommandRunner,
+    runtime: &RuntimeFiles,
+) -> Result<()> {
+    let cluster_root = cluster_runtime_root(runtime.pid.parent().ok_or_else(|| {
+        Error::InvalidArgs("missing runtime root for rootless cleanup".to_owned())
+    })?)?;
+    let mut active = false;
+    for entry in fs::read_dir(&cluster_root).map_err(io_error("read_dir"))? {
+        let entry = entry.map_err(io_error("read_dir"))?;
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(ROOTLESS_NETWORK_DIR)
+            || !path.is_dir()
+        {
+            continue;
+        }
+        if read_pid(&path.join("firecracker.pid"))?.is_some() {
+            active = true;
+            break;
+        }
+    }
+    if active {
+        return Ok(());
+    }
+
+    let network_root = cluster_root.join(ROOTLESS_NETWORK_DIR);
+    if let Some(slirp_pid) = read_pid(&network_root.join("slirp4netns.pid"))?
+        && process_exists(runner, slirp_pid)
+    {
+        let _ = signal(runner, "-TERM", slirp_pid);
+    }
+    if let Some(anchor_pid) = read_pid(&network_root.join("anchor.pid"))?
+        && process_exists(runner, anchor_pid)
+    {
+        let _ = signal(runner, "-TERM", anchor_pid);
+    }
+    let _ = fs::remove_dir_all(network_root);
     Ok(())
 }
 
@@ -1250,8 +1839,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        BACKEND, NetworkConfig, build_config_json, firecracker_subnet, nat_postrouting_rule_args,
-        parse_default_route_interface, stable_hash,
+        BACKEND, FirecrackerNetworkMode, NetworkConfig, build_config_json, firecracker_subnet,
+        nat_postrouting_rule_args, parse_default_route_interface, stable_hash,
     };
     use crate::backend::InstanceConfig;
     use crate::backend::runtime::ClusterBackend;
@@ -1273,7 +1862,7 @@ mod tests {
     fn firecracker_config_contains_required_sections() {
         let runtime_root = Path::new("/tmp/runtime");
         let runtime = super::RuntimeFiles::new(runtime_root);
-        let net = NetworkConfig::for_instance("vm");
+        let net = NetworkConfig::for_bridge_instance("vm");
         let json = build_config_json(
             Path::new("/tmp/vmlinux"),
             &InstanceConfig {
@@ -1310,13 +1899,13 @@ mod tests {
 
     #[test]
     fn firecracker_subnet_matches_bridge_network() {
-        let net = NetworkConfig::for_instance("vm");
+        let net = NetworkConfig::for_bridge_instance("vm");
         assert_eq!(firecracker_subnet(&net), "172.31.0.0/16");
     }
 
     #[test]
     fn nat_rule_targets_uplink_and_bridge_subnet() {
-        let net = NetworkConfig::for_instance("vm");
+        let net = NetworkConfig::for_bridge_instance("vm");
         let args = nat_postrouting_rule_args(&net, "eno1");
 
         assert_eq!(
@@ -1333,6 +1922,22 @@ mod tests {
                 "-j",
                 "MASQUERADE"
             ]
+        );
+    }
+
+    #[test]
+    fn parses_rootless_firecracker_network_mode_aliases() {
+        assert_eq!(
+            FirecrackerNetworkMode::parse("slirp").unwrap(),
+            FirecrackerNetworkMode::RootlessSlirp
+        );
+        assert_eq!(
+            FirecrackerNetworkMode::parse("slirp4netns").unwrap(),
+            FirecrackerNetworkMode::RootlessSlirp
+        );
+        assert_eq!(
+            FirecrackerNetworkMode::parse("").unwrap(),
+            FirecrackerNetworkMode::Bridge
         );
     }
 

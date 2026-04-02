@@ -159,13 +159,22 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
     fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
 
     let state = cluster_state_from_spec(&resolved_spec, workspace_root.clone(), &state_root);
+    let base_config = BackendConfig {
+        template: resolved_spec.template.clone(),
+        workspace_root: workspace_root.clone(),
+        enable_rosetta: resolved_spec.enable_rosetta,
+        network: resolved_spec.network.clone(),
+        firecracker_kernel: resolved_spec.firecracker_kernel.clone(),
+        firecracker_rootfs: resolved_spec.firecracker_rootfs.clone(),
+        stream_vm_logs: resolved_spec.stream_vm_logs,
+    };
     let instance_names = state
         .nodes
         .iter()
         .map(|node| node.name.clone())
         .collect::<Vec<_>>();
-    if let Err(error) = backend.prepare_cluster_network(runner, &instance_names) {
-        let _ = backend.cleanup_cluster_network(runner, &instance_names);
+    if let Err(error) = backend.prepare_cluster_network(runner, &base_config, &instance_names) {
+        let _ = backend.cleanup_cluster_network(runner, &base_config, &instance_names);
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&runtime_root);
         return Err(error);
@@ -676,13 +685,22 @@ fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) ->
     let state = ClusterState::load(state_root)?;
     let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
     let backend = backend_for(state.backend);
+    let base_config = BackendConfig {
+        template: state.template.clone(),
+        workspace_root: state.workspace_root.clone(),
+        enable_rosetta: state.enable_rosetta,
+        network: state.network.clone(),
+        firecracker_kernel: state.firecracker_kernel.clone(),
+        firecracker_rootfs: state.firecracker_rootfs.clone(),
+        stream_vm_logs: false,
+    };
     delete_instances(backend, runner, &state.nodes);
     let instance_names = state
         .nodes
         .iter()
         .map(|node| node.name.clone())
         .collect::<Vec<_>>();
-    backend.cleanup_cluster_network(runner, &instance_names)?;
+    backend.cleanup_cluster_network(runner, &base_config, &instance_names)?;
     fs::remove_dir_all(state_root).map_err(io_error("remove_dir_all"))?;
     if runtime_root.exists() {
         fs::remove_dir_all(&runtime_root).map_err(io_error("remove_dir_all"))?;
@@ -874,7 +892,7 @@ fn scale_at_root(
         .map(|worker| worker.name.clone())
         .collect::<Vec<_>>();
     cleanup_scale_target_instances(backend, runner, &new_workers);
-    backend.prepare_cluster_network(runner, &new_worker_names)?;
+    backend.prepare_cluster_network(runner, &base_config, &new_worker_names)?;
 
     if let Err(error) = start_and_join_workers(
         backend,
