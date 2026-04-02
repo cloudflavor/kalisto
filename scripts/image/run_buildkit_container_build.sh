@@ -50,9 +50,24 @@ if [ ! -f "${K3S_CACHE_PATH}" ]; then
   exit 1
 fi
 
-case "${UBUNTU_ARCH}" in
-  arm64) BUILDKIT_RELEASE_ARCH="arm64" ;;
-  amd64) BUILDKIT_RELEASE_ARCH="amd64" ;;
+BUILDKIT_HOST_ARCH="${KALISTO_BUILDKIT_HOST_ARCH:-}"
+if [ -z "${BUILDKIT_HOST_ARCH}" ]; then
+  case "$(uname -m)" in
+    x86_64 | amd64) BUILDKIT_HOST_ARCH="amd64" ;;
+    aarch64 | arm64) BUILDKIT_HOST_ARCH="arm64" ;;
+    *)
+      echo "unsupported host architecture for BuildKit: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+case "${BUILDKIT_HOST_ARCH}" in
+  amd64 | arm64) BUILDKIT_RELEASE_ARCH="${BUILDKIT_HOST_ARCH}" ;;
+  *)
+    echo "unsupported KALISTO_BUILDKIT_HOST_ARCH: ${BUILDKIT_HOST_ARCH}" >&2
+    exit 1
+    ;;
 esac
 
 BUILDKIT_BIN_DIR="${CACHE_DIR}/bin"

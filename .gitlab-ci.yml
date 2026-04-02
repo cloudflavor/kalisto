@@ -88,7 +88,7 @@ build:lima-node-rootfs:arm64:
   image:
     name: ubuntu:noble
     docker:
-      platform: linux/arm64/v8
+      platform: linux/amd64
   variables:
     KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
     KALISTO_UBUNTU_ARCH: arm64
