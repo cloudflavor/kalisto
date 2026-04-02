@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -704,26 +703,24 @@ fn ensure_rootless_cluster_network(
     let anchor_pid = anchor_child.id();
     write_file(&anchor_path, &format!("{anchor_pid}\n"))?;
 
-    let (readiness_read, readiness_write) =
-        std::os::unix::net::UnixStream::pair().map_err(io_error("unix_stream_pair"))?;
+    let stderr_log = root.join("slirp4netns.stderr.log");
+    let stderr_file = fs::File::create(&stderr_log).map_err(io_error("create"))?;
     let mut slirp = Command::new("slirp4netns");
     slirp
+        .arg("--configure")
         .arg("--mtu=65520")
         .arg("--disable-host-loopback")
         .arg("--api-socket")
         .arg(&socket_path)
-        .arg("--ready-fd")
-        .arg(readiness_write.as_raw_fd().to_string())
         .arg(anchor_pid.to_string())
         .arg(ROOTLESS_SLIRP_TAP_NAME)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let slirp_child = slirp.spawn().map_err(|source| Error::CommandIo {
+        .stderr(Stdio::from(stderr_file));
+    let mut slirp_child = slirp.spawn().map_err(|source| Error::CommandIo {
         program: "slirp4netns".to_owned(),
         source,
     })?;
-    drop(readiness_write);
-    wait_for_slirp_ready(readiness_read)?;
+    wait_for_slirp_ready(&mut slirp_child, &socket_path, &stderr_log)?;
     write_file(&slirp_path, &format!("{}\n", slirp_child.id()))?;
 
     let cluster = RootlessClusterNetwork {
@@ -734,16 +731,36 @@ fn ensure_rootless_cluster_network(
     Ok(cluster)
 }
 
-fn wait_for_slirp_ready(mut ready: UnixStream) -> Result<()> {
-    let mut buf = [0_u8; 1];
-    ready.read_exact(&mut buf).map_err(io_error("read_exact"))?;
-    if buf[0] == b'1' {
-        Ok(())
-    } else {
-        Err(Error::InvalidArgs(
-            "slirp4netns did not report readiness".to_owned(),
-        ))
+fn wait_for_slirp_ready(
+    child: &mut std::process::Child,
+    api_socket: &Path,
+    stderr_log: &Path,
+) -> Result<()> {
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().map_err(|source| Error::CommandIo {
+            program: "slirp4netns".to_owned(),
+            source,
+        })? {
+            let stderr = fs::read_to_string(stderr_log).unwrap_or_default();
+            return Err(Error::InvalidArgs(format!(
+                "slirp4netns exited early with status {:?}\nstderr:\n{}",
+                status.code(),
+                truncate(&stderr, 4000)
+            )));
+        }
+        if api_socket.exists()
+            && slirp_api_request(api_socket, &json!({ "execute": "list_hostfwd" })).is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+    let stderr = fs::read_to_string(stderr_log).unwrap_or_default();
+    Err(Error::InvalidArgs(format!(
+        "timed out waiting for slirp4netns readiness at {}\nstderr:\n{}",
+        api_socket.display(),
+        truncate(&stderr, 4000)
+    )))
 }
 
 fn ensure_rootless_bridge(runner: &dyn CommandRunner, anchor_pid: u32) -> Result<()> {
