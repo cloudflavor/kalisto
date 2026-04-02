@@ -524,8 +524,9 @@ impl McpServer {
             "instructions": concat!(
                 "Kalisto exposes cluster lifecycle, inspection, add-on, bench, and probe operations over MCP stdio. ",
                 "Use task-augmented `tools/call` for long-running or mutating operations. ",
-                "On Linux with the firecracker backend, start the MCP server with sudo, for example `sudo -E kalisto mcp`, ",
-                "because `clusters.create` configures TAP and bridge networking. ",
+                "On Linux with the firecracker backend, bridge networking requires sudo. ",
+                "Start the MCP server with sudo, for example `sudo -E kalisto mcp`, only when you explicitly use `--network bridge`. ",
+                "The default firecracker network mode is rootless `slirp4netns`. ",
                 "VM log streaming is not available over MCP stdio because stdout is reserved for protocol messages."
             )
         })
@@ -1188,12 +1189,12 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "clusters.create",
-        description: "Create Kalisto cluster state and backend networking. On Linux with the firecracker backend, run the MCP server itself with sudo because create configures TAP and bridge networking.",
+        description: "Create Kalisto cluster state and backend networking. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
         task_support: TaskSupport::Required,
     },
     ToolSpec {
         name: "clusters.up",
-        description: "Create the cluster if needed and boot the control-plane and worker nodes. On Linux with the firecracker backend, run the MCP server itself with sudo because up may implicitly call create and configure TAP and bridge networking.",
+        description: "Create the cluster if needed and boot the control-plane and worker nodes. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
         task_support: TaskSupport::Required,
     },
     ToolSpec {
@@ -1804,8 +1805,14 @@ fn linux_firecracker_sudo_guidance_from_args(arguments: &Value) -> Option<String
         .and_then(Value::as_str)
         .and_then(BackendKind::parse)
         .unwrap_or_else(BackendKind::host_default);
-    if cfg!(target_os = "linux") && backend == BackendKind::Firecracker {
-        Some("This operation uses the firecracker backend on Linux. Run the MCP server itself with sudo, for example `sudo -E kalisto mcp`, because cluster creation configures TAP and bridge networking.".to_owned())
+    let bridge_network_requested = arguments
+        .get("network")
+        .and_then(Value::as_str)
+        .map(|network| network.trim().is_empty() || network.trim() == "bridge")
+        .unwrap_or(false);
+    if cfg!(target_os = "linux") && backend == BackendKind::Firecracker && bridge_network_requested
+    {
+        Some("This operation uses firecracker bridge networking on Linux. Run the MCP server itself with sudo, for example `sudo -E kalisto mcp`.".to_owned())
     } else {
         None
     }
@@ -2810,7 +2817,8 @@ mod tests {
 
     use super::{
         McpServer, SUPPORTED_PROTOCOL_VERSION, TaskSupport, ToolCallRequest, execute_direct_tool,
-        parse_tool_args, task_command, tool_by_name, tool_definitions,
+        linux_firecracker_sudo_guidance_from_args, parse_tool_args, task_command, tool_by_name,
+        tool_definitions,
     };
 
     fn test_server() -> Arc<McpServer> {
@@ -2922,10 +2930,38 @@ mod tests {
     }
 
     #[test]
-    fn create_tool_description_mentions_linux_firecracker_sudo() {
+    fn create_tool_description_mentions_bridge_specific_linux_firecracker_sudo() {
         let tool = tool_by_name("clusters.create").expect("tool should exist");
         assert!(tool.description.contains("sudo"));
         assert!(tool.description.contains("firecracker"));
+        assert!(tool.description.contains("bridge"));
+        assert!(tool.description.contains("slirp4netns"));
+    }
+
+    #[test]
+    fn linux_firecracker_sudo_guidance_is_emitted_for_bridge_mode() {
+        let guidance = linux_firecracker_sudo_guidance_from_args(&json!({
+            "backend": "firecracker",
+            "network": "bridge"
+        }));
+        if cfg!(target_os = "linux") {
+            assert!(guidance.is_some());
+        } else {
+            assert!(guidance.is_none());
+        }
+    }
+
+    #[test]
+    fn linux_firecracker_sudo_guidance_is_omitted_for_slirp_default_mode() {
+        let explicit_slirp = linux_firecracker_sudo_guidance_from_args(&json!({
+            "backend": "firecracker",
+            "network": "slirp4netns"
+        }));
+        let implicit_default = linux_firecracker_sudo_guidance_from_args(&json!({
+            "backend": "firecracker"
+        }));
+        assert!(explicit_slirp.is_none());
+        assert!(implicit_default.is_none());
     }
 
     #[test]

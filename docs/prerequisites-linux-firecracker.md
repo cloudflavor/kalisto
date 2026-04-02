@@ -164,8 +164,10 @@ Kalisto currently has two Linux Firecracker networking modes:
   - uses `slirp4netns` for egress and host port forwards
   - depends on `slirp4netns`, `unshare`, and `nsenter`
 
-If you intend to use rootless Firecracker networking, install the `slirp4netns`
-tooling up front and start the cluster with `--network slirp4netns`.
+`slirp4netns` is now the default Firecracker mode on Linux.
+
+Use `--network bridge` only when you explicitly want host bridge/TAP networking
+and have the required host privileges (sudo).
 
 ## Operational Notes
 

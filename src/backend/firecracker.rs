@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,8 +32,13 @@ const BRIDGE_CIDR_BITS: u8 = 16;
 const ROOTLESS_SLIRP_TAP_NAME: &str = "kfcslip0";
 const ROOTLESS_SLIRP_GATEWAY_IP: &str = "10.0.2.2";
 const ROOTLESS_SLIRP_CIDR_BITS: u8 = 24;
+const ROOTLESS_NETWORK_MTU: u16 = 1500;
 const ROOTLESS_SSH_HOST: &str = "127.0.0.1";
 const ROOTLESS_NETWORK_DIR: &str = "firecracker-rootless-net";
+const ROOTLESS_SLIRP_SOCKET_FILE: &str = "slirp4netns.sock";
+const ROOTLESS_SLIRP_SOCKET_PATH_FILE: &str = "slirp4netns.socket-path";
+const ROOTLESS_SLIRP_SHORT_SOCKET_DIR: &str = "/tmp/kalisto-slirp4netns";
+const UNIX_SOCKET_PATH_MAX: usize = 107;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirecrackerNetworkMode {
@@ -611,8 +617,9 @@ impl RootlessClusterNetwork {
         let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
         let anchor_pid = read_required_pid(&root.join("anchor.pid"), "rootless firecracker netns")?;
         let _ = read_required_pid(&root.join("slirp4netns.pid"), "slirp4netns")?;
+        let api_socket = load_slirp_api_socket_path(&root)?;
         Ok(Self {
-            api_socket: root.join("slirp4netns.sock"),
+            api_socket,
             anchor_pid,
         })
     }
@@ -674,7 +681,8 @@ fn ensure_rootless_cluster_network(
 
     let anchor_path = root.join("anchor.pid");
     let slirp_path = root.join("slirp4netns.pid");
-    let socket_path = root.join("slirp4netns.sock");
+    let socket_path_file = root.join(ROOTLESS_SLIRP_SOCKET_PATH_FILE);
+    let socket_path = load_slirp_api_socket_path(&root)?;
     if let (Some(anchor_pid), Some(slirp_pid)) = (read_pid(&anchor_path)?, read_pid(&slirp_path)?)
         && process_exists(runner, anchor_pid)
         && process_exists(runner, slirp_pid)
@@ -686,9 +694,11 @@ fn ensure_rootless_cluster_network(
         });
     }
 
+    let _ = terminate_stale_slirp_processes_for_socket(runner, &socket_path);
     let _ = fs::remove_file(&anchor_path);
     let _ = fs::remove_file(&slirp_path);
     let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&socket_path_file);
 
     let anchor_child = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--fork", "sh", "-lc"])
@@ -702,17 +712,26 @@ fn ensure_rootless_cluster_network(
         })?;
     let anchor_pid = anchor_child.id();
     write_file(&anchor_path, &format!("{anchor_pid}\n"))?;
+    wait_for_rootless_anchor_ready(runner, anchor_pid)?;
 
     let stderr_log = root.join("slirp4netns.stderr.log");
+    let socket_path = choose_slirp_api_socket_path(&root)?;
+    write_file(&socket_path_file, &format!("{}\n", socket_path.display()))?;
+    let netns_path = format!("/proc/{anchor_pid}/ns/net");
+    let userns_path = format!("/proc/{anchor_pid}/ns/user");
+    let mtu_arg = format!("--mtu={ROOTLESS_NETWORK_MTU}");
     let stderr_file = fs::File::create(&stderr_log).map_err(io_error("create"))?;
     let mut slirp = Command::new("slirp4netns");
     slirp
         .arg("--configure")
-        .arg("--mtu=65520")
+        .arg(&mtu_arg)
         .arg("--disable-host-loopback")
         .arg("--api-socket")
         .arg(&socket_path)
-        .arg(anchor_pid.to_string())
+        .arg("--netns-type=path")
+        .arg(&netns_path)
+        .arg("--userns-path")
+        .arg(&userns_path)
         .arg(ROOTLESS_SLIRP_TAP_NAME)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file));
@@ -729,6 +748,54 @@ fn ensure_rootless_cluster_network(
     };
     ensure_rootless_bridge(runner, cluster.anchor_pid)?;
     Ok(cluster)
+}
+
+fn load_slirp_api_socket_path(root: &Path) -> Result<PathBuf> {
+    let socket_path_file = root.join(ROOTLESS_SLIRP_SOCKET_PATH_FILE);
+    if let Some(path) = read_trimmed(&socket_path_file)? {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(root.join(ROOTLESS_SLIRP_SOCKET_FILE))
+}
+
+fn choose_slirp_api_socket_path(root: &Path) -> Result<PathBuf> {
+    let default = root.join(ROOTLESS_SLIRP_SOCKET_FILE);
+    if unix_socket_path_fits(&default) {
+        return Ok(default);
+    }
+
+    let short_root = Path::new(ROOTLESS_SLIRP_SHORT_SOCKET_DIR);
+    fs::create_dir_all(short_root).map_err(io_error("create_dir_all"))?;
+    let socket_name = format!("{:08x}.sock", stable_hash(&root.display().to_string()));
+    let short_path = short_root.join(socket_name);
+    if !unix_socket_path_fits(&short_path) {
+        return Err(Error::InvalidArgs(format!(
+            "resolved slirp4netns API socket path is too long: {}",
+            short_path.display()
+        )));
+    }
+    Ok(short_path)
+}
+
+fn unix_socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX
+}
+
+fn wait_for_rootless_anchor_ready(runner: &dyn CommandRunner, anchor_pid: u32) -> Result<()> {
+    for _ in 0..100 {
+        if !process_exists(runner, anchor_pid) {
+            return Err(Error::InvalidArgs(format!(
+                "rootless network anchor process {anchor_pid} exited before becoming ready"
+            )));
+        }
+        if run_in_rootless_namespace(runner, anchor_pid, &["true"]).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(Error::InvalidArgs(format!(
+        "timed out waiting for rootless network anchor process {anchor_pid} readiness"
+    )))
 }
 
 fn wait_for_slirp_ready(
@@ -764,6 +831,7 @@ fn wait_for_slirp_ready(
 }
 
 fn ensure_rootless_bridge(runner: &dyn CommandRunner, anchor_pid: u32) -> Result<()> {
+    let mtu = ROOTLESS_NETWORK_MTU.to_string();
     if run_in_rootless_namespace(
         runner,
         anchor_pid,
@@ -777,6 +845,24 @@ fn ensure_rootless_bridge(runner: &dyn CommandRunner, anchor_pid: u32) -> Result
             &["ip", "link", "add", "name", BRIDGE_NAME, "type", "bridge"],
         )?;
     }
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &["ip", "link", "set", "dev", BRIDGE_NAME, "mtu", mtu.as_str()],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &[
+            "ip",
+            "link",
+            "set",
+            "dev",
+            ROOTLESS_SLIRP_TAP_NAME,
+            "mtu",
+            mtu.as_str(),
+        ],
+    )?;
     run_in_rootless_namespace(
         runner,
         anchor_pid,
@@ -808,6 +894,7 @@ fn ensure_rootless_tap(
     anchor_pid: u32,
     net: &NetworkConfig,
 ) -> Result<()> {
+    let mtu = ROOTLESS_NETWORK_MTU.to_string();
     let _ = run_in_rootless_namespace(
         runner,
         anchor_pid,
@@ -824,6 +911,19 @@ fn ensure_rootless_tap(
             net.tap_name.as_str(),
             "mode",
             "tap",
+        ],
+    )?;
+    run_in_rootless_namespace(
+        runner,
+        anchor_pid,
+        &[
+            "ip",
+            "link",
+            "set",
+            "dev",
+            net.tap_name.as_str(),
+            "mtu",
+            mtu.as_str(),
         ],
     )?;
     run_in_rootless_namespace(
@@ -1580,6 +1680,10 @@ fn maybe_cleanup_rootless_cluster_network(
     {
         let _ = signal(runner, "-TERM", anchor_pid);
     }
+    let socket_path = load_slirp_api_socket_path(&network_root)?;
+    let _ = terminate_stale_slirp_processes_for_socket(runner, &socket_path);
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(network_root.join(ROOTLESS_SLIRP_SOCKET_PATH_FILE));
     let _ = fs::remove_dir_all(network_root);
     Ok(())
 }
@@ -1773,6 +1877,46 @@ fn process_exists(runner: &dyn CommandRunner, pid: u32) -> bool {
     signal(runner, "-0", pid).is_ok()
 }
 
+fn terminate_stale_slirp_processes_for_socket(
+    runner: &dyn CommandRunner,
+    socket_path: &Path,
+) -> Result<()> {
+    let marker = socket_path.display().to_string();
+    let output = runner.run("ps", &["-eo".into(), "pid=,args=".into()])?;
+    for line in output.stdout.lines() {
+        let Some((pid, args)) = parse_pid_and_args_line(line) else {
+            continue;
+        };
+        if !args.contains("slirp4netns") || !args.contains(&marker) || !process_exists(runner, pid)
+        {
+            continue;
+        }
+
+        let _ = signal(runner, "-TERM", pid);
+        for _ in 0..20 {
+            if !process_exists(runner, pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if process_exists(runner, pid) {
+            let _ = signal(runner, "-KILL", pid);
+        }
+    }
+    Ok(())
+}
+
+fn parse_pid_and_args_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut fields = trimmed.splitn(2, char::is_whitespace);
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    let args = fields.next().unwrap_or_default().trim_start();
+    Some((pid, args))
+}
+
 fn signal(runner: &dyn CommandRunner, signal: &str, pid: u32) -> Result<Output> {
     runner.run("kill", &[signal.to_owned(), pid.to_string()])
 }
@@ -1848,12 +1992,15 @@ fn io_error(program: &'static str) -> impl FnOnce(std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::sync::Mutex;
 
     use super::{
-        BACKEND, FirecrackerNetworkMode, NetworkConfig, build_config_json, firecracker_subnet,
-        nat_postrouting_rule_args, parse_default_route_interface, stable_hash,
+        BACKEND, FirecrackerNetworkMode, NetworkConfig, ROOTLESS_SLIRP_SHORT_SOCKET_DIR,
+        UNIX_SOCKET_PATH_MAX, build_config_json, choose_slirp_api_socket_path, firecracker_subnet,
+        load_slirp_api_socket_path, nat_postrouting_rule_args, parse_default_route_interface,
+        parse_pid_and_args_line, stable_hash,
     };
     use crate::backend::InstanceConfig;
     use crate::backend::runtime::ClusterBackend;
@@ -1970,5 +2117,53 @@ mod tests {
         assert_eq!(status, "kalisto-test-cp Stopped firecracker");
 
         let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn choose_slirp_api_socket_path_falls_back_to_short_tmp_path() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let long_root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-rootless-network-{}-{}-{}",
+            "x".repeat(70),
+            std::process::id(),
+            stable_hash("fallback")
+        ));
+        let socket_path = choose_slirp_api_socket_path(&long_root).unwrap();
+        assert!(socket_path.starts_with(Path::new(ROOTLESS_SLIRP_SHORT_SOCKET_DIR)));
+        assert!(socket_path.as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX);
+    }
+
+    #[test]
+    fn load_slirp_api_socket_path_prefers_persisted_override() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-socket-path-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("slirp4netns.socket-path"),
+            "/tmp/kalisto-slirp4netns/unit.sock\n",
+        )
+        .unwrap();
+
+        let socket_path = load_slirp_api_socket_path(&root).unwrap();
+        assert_eq!(socket_path, Path::new("/tmp/kalisto-slirp4netns/unit.sock"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_pid_and_args_line_extracts_pid_and_args() {
+        let parsed = parse_pid_and_args_line("  1234 slirp4netns --api-socket /tmp/a.sock")
+            .expect("line should parse");
+        assert_eq!(parsed.0, 1234);
+        assert_eq!(parsed.1, "slirp4netns --api-socket /tmp/a.sock");
+    }
+
+    #[test]
+    fn parse_pid_and_args_line_rejects_invalid_rows() {
+        assert!(parse_pid_and_args_line("").is_none());
+        assert!(parse_pid_and_args_line("not-a-pid slirp4netns --help").is_none());
     }
 }
