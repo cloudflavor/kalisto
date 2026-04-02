@@ -856,10 +856,8 @@ fn run_in_rootless_namespace(
         "-t".into(),
         anchor_pid.to_string(),
         "--user".into(),
-        "--setuid".into(),
-        "0".into(),
-        "--setgid".into(),
-        "0".into(),
+        "--preserve-credentials".into(),
+        "--keep-caps".into(),
         "--net".into(),
     ];
     args.extend(command.iter().map(|value| (*value).to_owned()));
@@ -1051,10 +1049,8 @@ fn firecracker_command(
                 "-t".to_owned(),
                 cluster_network.anchor_pid.to_string(),
                 "--user".to_owned(),
-                "--setuid".to_owned(),
-                "0".to_owned(),
-                "--setgid".to_owned(),
-                "0".to_owned(),
+                "--preserve-credentials".to_owned(),
+                "--keep-caps".to_owned(),
                 "--net".to_owned(),
                 "firecracker".to_owned(),
             ]);
