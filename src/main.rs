@@ -8,8 +8,8 @@ use structopt::StructOpt;
 
 use kalisto::cli::{
     AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
-    Command, CompletionsArgs, MacosLimaArgs, MacosLimaK3sArgs, McpArgs, McpTaskRunnerArgs,
-    NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, UpArgs,
+    Command, CompletionsArgs, KubeconfigArgs, MacosLimaArgs, MacosLimaK3sArgs, McpArgs,
+    McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, UpArgs,
 };
 use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
@@ -34,6 +34,7 @@ use kalisto::probe::macos_lima_k3s::{
     ProbeConfig as MacosLimaK3sProbeConfig, run as run_macos_lima_k3s_probe,
 };
 use kalisto::process::SystemRunner;
+use kalisto::shell::shell_escape;
 use kalisto::telemetry;
 
 fn main() -> ExitCode {
@@ -287,9 +288,7 @@ fn run_list() -> Result<()> {
 }
 
 fn run_status(args: ClusterLookupArgs) -> Result<()> {
-    let Some(name) = args.cluster_name()? else {
-        return Ok(());
-    };
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
     let status = cluster_status(&name)?;
     println!("cluster: {}", status.name);
     println!("state root: {}", status.state_root.display());
@@ -314,9 +313,7 @@ fn run_status(args: ClusterLookupArgs) -> Result<()> {
 }
 
 fn run_stats(args: StatsArgs) -> Result<()> {
-    let Some(name) = args.cluster_name()? else {
-        return Ok(());
-    };
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
     let interval = Duration::from_secs(args.interval_secs.max(1));
 
     if args.watch {
@@ -333,12 +330,22 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
 }
 
-fn run_kubeconfig(args: ClusterLookupArgs) -> Result<()> {
-    let Some(name) = args.cluster_name()? else {
-        return Ok(());
-    };
-    println!("{}", cluster_kubeconfig_path(&name)?.display());
+fn run_kubeconfig(args: KubeconfigArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let path = cluster_kubeconfig_path(&name)?;
+    if args.path {
+        println!("{}", path.display());
+    } else {
+        println!("{}", kubeconfig_export_command(&path));
+    }
     Ok(())
+}
+
+fn kubeconfig_export_command(path: &std::path::Path) -> String {
+    format!(
+        "export KUBECONFIG={}",
+        shell_escape(path.as_os_str().to_string_lossy().as_ref())
+    )
 }
 
 fn run_bench(args: BenchArgs) -> Result<()> {
@@ -806,7 +813,9 @@ mod tests {
     use kalisto::k3s::{ComponentToggles, NodeRole, ServerMode};
     use kalisto::plugin::PluginSpec;
 
-    use super::{plugin_status, render_conflicts};
+    use super::{
+        kubeconfig_export_command, plugin_status, render_conflicts, require_selected_cluster_name,
+    };
 
     #[test]
     fn plugin_status_marks_selected_cni_as_installed() {
@@ -830,6 +839,18 @@ mod tests {
             render_conflicts(&["cni/flannel".to_owned(), "lb/servicelb".to_owned()]),
             "cni/flannel, lb/servicelb"
         );
+    }
+
+    #[test]
+    fn kubeconfig_export_command_escapes_path_for_shell() {
+        let command = kubeconfig_export_command(std::path::Path::new("/tmp/kube'config.yaml"));
+        assert_eq!(command, "export KUBECONFIG='/tmp/kube'\"'\"'config.yaml'");
+    }
+
+    #[test]
+    fn require_selected_cluster_name_rejects_none() {
+        let error = require_selected_cluster_name(None).expect_err("none should fail");
+        assert!(error.to_string().contains("no default cluster selected"));
     }
 
     fn fixture_cluster_state() -> ClusterState {

@@ -40,7 +40,7 @@ pub enum Command {
     List,
     Stats(StatsArgs),
     Status(ClusterLookupArgs),
-    Kubeconfig(ClusterLookupArgs),
+    Kubeconfig(KubeconfigArgs),
     Bench(BenchArgs),
     ProbeMacosLima(MacosLimaArgs),
     ProbeMacosLimaK3s(MacosLimaK3sArgs),
@@ -278,6 +278,23 @@ pub struct ClusterLookupArgs {
 }
 
 impl ClusterLookupArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct KubeconfigArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+    #[structopt(long)]
+    pub path: bool,
+}
+
+impl KubeconfigArgs {
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -743,6 +760,31 @@ enabled = true
         match cli.command {
             Command::List => {}
             other => panic!("expected list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_command_defaults_to_export_snippet() {
+        let cli = Cli::from_iter_safe(["kalisto", "kubeconfig"]).expect("parse");
+        match cli.command {
+            Command::Kubeconfig(args) => {
+                assert!(args.name.is_none());
+                assert!(!args.path);
+            }
+            other => panic!("expected kubeconfig command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_command_accepts_path_mode_and_name() {
+        let cli = Cli::from_iter_safe(["kalisto", "kubeconfig", "--name", "dev", "--path"])
+            .expect("parse");
+        match cli.command {
+            Command::Kubeconfig(args) => {
+                assert_eq!(args.name.as_deref(), Some("dev"));
+                assert!(args.path);
+            }
+            other => panic!("expected kubeconfig command, got {other:?}"),
         }
     }
 }

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tracing::{info, info_span, warn};
+use tracing::{debug, info, info_span, warn};
 
 use crate::artifact::resolve_cluster_spec;
 use crate::backend::lima::canonicalize_path;
@@ -1248,7 +1248,7 @@ fn list_at_root(clusters_root: &Path, runner: &dyn CommandRunner) -> Result<Vec<
 pub fn kubeconfig_path(name: &str) -> Result<std::path::PathBuf> {
     let state_root = require_cluster_state_root(name)?;
     let kubeconfig_path = ClusterState::load(state_root.as_path())?.kubeconfig_path;
-    info!(
+    debug!(
         cluster = %name,
         kubeconfig = %kubeconfig_path.display(),
         "resolved kubeconfig path"
