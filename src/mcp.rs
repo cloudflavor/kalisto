@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::BackendKind;
 use crate::cli::{BenchArgs, UpArgs};
-use crate::cluster::addon::CniPlugin;
+use crate::cluster::addon::{CniPlugin, MetalLbConfig, MetalLbMode};
 use crate::cluster::manager::{
     benchmark as cluster_benchmark, create as cluster_create, destroy as cluster_destroy,
     down as cluster_down, install_addon as cluster_install_addon, list as cluster_list,
@@ -1421,6 +1421,13 @@ fn lifecycle_properties() -> Map<String, Value> {
             json!({ "type": "string", "enum": ["none", "flannel", "cilium"] }),
         ),
         ("ciliumVersion".to_owned(), json!({ "type": "string" })),
+        (
+            "addons".to_owned(),
+            json!({
+                "type": "array",
+                "items": { "type": "string" }
+            }),
+        ),
         ("keepFailedRuntime".to_owned(), json!({ "type": "boolean" })),
         ("agentless".to_owned(), json!({ "type": "boolean" })),
         ("noRosetta".to_owned(), json!({ "type": "boolean" })),
@@ -1612,6 +1619,7 @@ struct ClusterStateView {
     cni_plugin: String,
     cilium_version: String,
     addons: Vec<String>,
+    metallb: MetalLbConfigView,
     server_mode: String,
     component_toggles: ComponentTogglesView,
     kubeconfig_path: String,
@@ -1646,6 +1654,7 @@ impl ClusterStateView {
             cni_plugin: state.cni_plugin.as_str().to_owned(),
             cilium_version: state.cilium_version.clone(),
             addons: state.addons.clone(),
+            metallb: MetalLbConfigView::from_config(&state.metallb),
             server_mode: match state.server_mode {
                 ServerMode::Standard => "standard".to_owned(),
                 ServerMode::Agentless => "agentless".to_owned(),
@@ -1663,6 +1672,27 @@ impl ClusterStateView {
 struct NodeResourcesView {
     cpus: u8,
     memory_gib: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetalLbConfigView {
+    mode: Option<String>,
+    addresses: Vec<String>,
+    config_file: Option<String>,
+}
+
+impl MetalLbConfigView {
+    fn from_config(config: &MetalLbConfig) -> Self {
+        Self {
+            mode: config.mode.map(MetalLbMode::as_str).map(ToOwned::to_owned),
+            addresses: config.addresses.clone(),
+            config_file: config
+                .config_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        }
+    }
 }
 
 impl NodeResourcesView {
@@ -1949,6 +1979,7 @@ struct ClusterLifecycleArgs {
     k3s_version: Option<String>,
     cni: Option<String>,
     cilium_version: Option<String>,
+    addons: Option<Vec<String>>,
     keep_failed_runtime: Option<bool>,
     agentless: Option<bool>,
     no_rosetta: Option<bool>,
@@ -2021,6 +2052,7 @@ impl ClusterLifecycleArgs {
             k3s_version: self.k3s_version,
             cni,
             cilium_version: self.cilium_version,
+            addons: self.addons.unwrap_or_default(),
             keep_failed_runtime: self.keep_failed_runtime.unwrap_or(false),
             stream_vm_logs: false,
             agentless: self.agentless.unwrap_or(false),
@@ -2062,6 +2094,7 @@ impl BenchArgsPayload {
                 None => None,
             },
             cilium_version: lifecycle.cilium_version,
+            addons: lifecycle.addons.unwrap_or_default(),
             keep_failed_runtime: lifecycle.keep_failed_runtime.unwrap_or(false),
             stream_vm_logs: false,
             agentless: lifecycle.agentless.unwrap_or(false),
@@ -2287,6 +2320,9 @@ fn append_up_args(args: &mut Vec<String>, up: &UpArgs) {
     if let Some(version) = &up.cilium_version {
         args.extend(["--cilium-version".to_owned(), version.clone()]);
     }
+    for addon in &up.addons {
+        args.extend(["--addon".to_owned(), addon.clone()]);
+    }
     if up.keep_failed_runtime {
         args.push("--keep-failed-runtime".to_owned());
     }
@@ -2318,6 +2354,7 @@ fn append_bench_args(args: &mut Vec<String>, bench: &BenchArgs) {
         k3s_version: bench.k3s_version.clone(),
         cni: bench.cni,
         cilium_version: bench.cilium_version.clone(),
+        addons: bench.addons.clone(),
         keep_failed_runtime: bench.keep_failed_runtime,
         stream_vm_logs: false,
         agentless: bench.agentless,
@@ -2809,7 +2846,7 @@ mod tests {
 
     use crate::backend::BackendKind;
     use crate::cli::{Cli, Command};
-    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
+    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig, MetalLbMode};
     use crate::cluster::spec::NodeResources;
     use crate::cluster::state::{ClusterState, NodeState};
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
@@ -3035,6 +3072,11 @@ mod tests {
             cni_plugin: CniPlugin::Flannel,
             cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
             addons: vec!["lb/metallb".to_owned()],
+            metallb: MetalLbConfig {
+                mode: Some(MetalLbMode::Layer2),
+                addresses: vec!["10.0.0.10-10.0.0.20".to_owned()],
+                config_file: None,
+            },
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             kubeconfig_path: PathBuf::from("/tmp/kubeconfig.yaml"),
@@ -3099,6 +3141,13 @@ mod tests {
                 .and_then(|node| node.get("role"))
                 .and_then(Value::as_str),
             Some("control-plane")
+        );
+        assert_eq!(
+            cluster
+                .get("metallb")
+                .and_then(|value| value.get("mode"))
+                .and_then(Value::as_str),
+            Some("layer2")
         );
     }
 

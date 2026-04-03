@@ -807,7 +807,7 @@ mod tests {
     use std::path::PathBuf;
 
     use kalisto::backend::BackendKind;
-    use kalisto::cluster::addon::CniPlugin;
+    use kalisto::cluster::addon::{CniPlugin, MetalLbConfig};
     use kalisto::cluster::spec::NodeResources;
     use kalisto::cluster::state::ClusterState;
     use kalisto::k3s::{ComponentToggles, NodeRole, ServerMode};
@@ -877,6 +877,7 @@ mod tests {
             cni_plugin: CniPlugin::None,
             cilium_version: "1.19.1".to_owned(),
             addons: Vec::new(),
+            metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             kubeconfig_path: PathBuf::from("kubeconfig.yaml"),

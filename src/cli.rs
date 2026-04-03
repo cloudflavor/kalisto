@@ -146,6 +146,8 @@ pub struct UpArgs {
     pub cni: Option<CniPlugin>,
     #[structopt(long)]
     pub cilium_version: Option<String>,
+    #[structopt(long = "addon", parse(try_from_str = parse_up_addon_id))]
+    pub addons: Vec<String>,
     #[structopt(long)]
     pub keep_failed_runtime: bool,
     #[structopt(long)]
@@ -221,6 +223,10 @@ impl UpArgs {
         if let Some(cilium_version) = self.cilium_version {
             spec.cilium_version = cilium_version;
         }
+        apply_cli_addons(&mut spec, &self.addons)?;
+        if spec.addons.iter().any(|addon| addon == "lb/metallb") || !spec.metallb.is_empty() {
+            spec.metallb.validate()?;
+        }
         spec.keep_failed_runtime = self.keep_failed_runtime;
         spec.stream_vm_logs = self.stream_vm_logs;
         if self.agentless {
@@ -249,6 +255,26 @@ pub struct McpTaskRunnerArgs {
 fn parse_cni_plugin(value: &str) -> std::result::Result<CniPlugin, String> {
     CniPlugin::parse(value)
         .ok_or_else(|| format!("unsupported cni `{value}`; expected one of: none, flannel, cilium"))
+}
+
+fn parse_up_addon_id(value: &str) -> std::result::Result<String, String> {
+    match value {
+        "ingress/traefik" | "ingress/kong" | "lb/servicelb" | "lb/metallb" | "storage/longhorn"
+        | "storage/local-path" => Ok(value.to_owned()),
+        _ => Err(format!(
+            "unsupported addon `{value}`; expected one of: ingress/traefik, ingress/kong, lb/servicelb, lb/metallb, storage/longhorn, storage/local-path"
+        )),
+    }
+}
+
+fn apply_cli_addons(spec: &mut ClusterSpec, addons: &[String]) -> crate::error::Result<()> {
+    for addon in addons {
+        let addon = parse_up_addon_id(addon).map_err(crate::error::Error::InvalidArgs)?;
+        if !spec.addons.iter().any(|installed| installed == &addon) {
+            spec.addons.push(addon);
+        }
+    }
+    Ok(())
 }
 
 fn parse_backend_kind(value: &str) -> std::result::Result<BackendKind, String> {
@@ -387,6 +413,8 @@ pub struct BenchArgs {
     pub cni: Option<CniPlugin>,
     #[structopt(long)]
     pub cilium_version: Option<String>,
+    #[structopt(long = "addon", parse(try_from_str = parse_up_addon_id))]
+    pub addons: Vec<String>,
     #[structopt(long)]
     pub keep_failed_runtime: bool,
     #[structopt(long)]
@@ -420,6 +448,7 @@ impl BenchArgs {
             k3s_version: self.k3s_version,
             cni: self.cni,
             cilium_version: self.cilium_version,
+            addons: self.addons,
             keep_failed_runtime: self.keep_failed_runtime,
             stream_vm_logs: self.stream_vm_logs,
             agentless: self.agentless,
@@ -593,6 +622,41 @@ mod tests {
     }
 
     #[test]
+    fn up_command_parses_addon_flags() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "up",
+            "--addon",
+            "lb/metallb",
+            "--addon",
+            "ingress/traefik",
+            "--addon",
+            "ingress/kong",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                assert_eq!(
+                    args.addons,
+                    vec![
+                        "lb/metallb".to_owned(),
+                        "ingress/traefik".to_owned(),
+                        "ingress/kong".to_owned()
+                    ]
+                );
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn up_command_rejects_unsupported_addon_flag() {
+        let error = Cli::from_iter_safe(["kalisto", "up", "--addon", "ingress/nginx"]).unwrap_err();
+        assert!(format!("{error}").contains("unsupported addon `ingress/nginx`"));
+    }
+
+    #[test]
     fn addon_install_command_parses_catalog_id() {
         let cli =
             Cli::from_iter_safe(["kalisto", "addon", "install", "lb/metallb"]).expect("parse");
@@ -709,6 +773,51 @@ enabled = true
                 assert_eq!(spec.name, "from-cli");
                 assert_eq!(spec.api_port, 18443);
                 assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn up_command_cli_addons_extend_kalisto_toml_plugins() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-cli-addon-merge-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("kalisto.toml"),
+            r#"
+[plugins.traefik]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "up",
+            "--project-root",
+            root.to_str().unwrap(),
+            "--addon",
+            "lb/metallb",
+            "--addon",
+            "ingress/traefik",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                let spec = args.into_cluster_spec().unwrap();
+                assert!(spec.addons.iter().any(|addon| addon == "ingress/traefik"));
+                assert!(spec.addons.iter().any(|addon| addon == "lb/metallb"));
+                assert_eq!(
+                    spec.addons
+                        .iter()
+                        .filter(|addon| addon.as_str() == "ingress/traefik")
+                        .count(),
+                    1
+                );
             }
             other => panic!("expected up command, got {other:?}"),
         }
