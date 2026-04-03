@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::fs;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tracing::info;
@@ -14,6 +16,9 @@ use crate::shell::shell_escape;
 pub const DEFAULT_CILIUM_VERSION: &str = "1.19.1";
 const CILIUM_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-cilium.yaml";
 const TRAEFIK_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-traefik.yaml";
+const KONG_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-kong.yaml";
+const METALLB_CONFIG_MANIFEST_PATH: &str =
+    "/var/lib/rancher/k3s/server/manifests/kalisto-metallb-config.yaml";
 const METALLB_MANIFEST_URL: &str = "https://raw.githubusercontent.com/metallb/metallb/v0.15.3/config/manifests/metallb-native.yaml";
 const METALLB_WAIT_COMMAND: &str = concat!(
     "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n metallb-system rollout status deployment/controller --timeout=30s && ",
@@ -27,6 +32,13 @@ const LONGHORN_WAIT_COMMAND: &str = concat!(
 );
 const LOCAL_PATH_MANIFEST_URL: &str = "https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.34/deploy/local-path-storage.yaml";
 const LOCAL_PATH_WAIT_COMMAND: &str = "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=30s";
+const CILIUM_HELMCHART_TEMPLATE: &str =
+    include_str!("../../manifests/addons/cilium-helmchart.yaml");
+const TRAEFIK_HELMCHART_TEMPLATE: &str =
+    include_str!("../../manifests/addons/traefik-helmchart.yaml");
+const KONG_HELMCHART_TEMPLATE: &str = include_str!("../../manifests/addons/kong-helmchart.yaml");
+const METALLB_LAYER2_CONFIG_TEMPLATE: &str =
+    include_str!("../../manifests/addons/metallb-layer2-config.yaml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CniPlugin {
@@ -73,10 +85,78 @@ impl CniPlugin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalLbMode {
+    Layer2,
+}
+
+impl MetalLbMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Layer2 => "layer2",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "layer2" => Some(Self::Layer2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MetalLbConfig {
+    pub mode: Option<MetalLbMode>,
+    pub addresses: Vec<String>,
+    pub config_file: Option<PathBuf>,
+}
+
+impl MetalLbConfig {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.addresses.is_empty() && self.config_file.is_none()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.addresses.is_empty() && self.mode.is_some() && self.config_file.is_none() {
+            return Err(Error::InvalidArgs(
+                "MetalLB mode requires addresses or `--metallb-config-file`".to_owned(),
+            ));
+        }
+
+        if !self.addresses.is_empty() && self.config_file.is_some() {
+            return Err(Error::InvalidArgs(
+                "MetalLB addresses cannot be combined with `--metallb-config-file`".to_owned(),
+            ));
+        }
+
+        if self.mode.is_some() && self.config_file.is_some() {
+            return Err(Error::InvalidArgs(
+                "MetalLB mode cannot be combined with `--metallb-config-file`".to_owned(),
+            ));
+        }
+
+        for entry in &self.addresses {
+            validate_metallb_address(entry)?;
+        }
+
+        Ok(())
+    }
+
+    fn effective_mode_for_addresses(&self) -> Option<MetalLbMode> {
+        if self.addresses.is_empty() {
+            None
+        } else {
+            Some(self.mode.unwrap_or(MetalLbMode::Layer2))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddonId {
     CniFlannel,
     CniCilium,
     IngressTraefik,
+    IngressKong,
     LbServiceLb,
     LbMetalLb,
     StorageLonghorn,
@@ -89,6 +169,7 @@ impl AddonId {
             Self::CniFlannel => "cni/flannel",
             Self::CniCilium => "cni/cilium",
             Self::IngressTraefik => "ingress/traefik",
+            Self::IngressKong => "ingress/kong",
             Self::LbServiceLb => "lb/servicelb",
             Self::LbMetalLb => "lb/metallb",
             Self::StorageLonghorn => "storage/longhorn",
@@ -101,6 +182,7 @@ impl AddonId {
             "cni/flannel" => Some(Self::CniFlannel),
             "cni/cilium" => Some(Self::CniCilium),
             "ingress/traefik" => Some(Self::IngressTraefik),
+            "ingress/kong" => Some(Self::IngressKong),
             "lb/servicelb" => Some(Self::LbServiceLb),
             "lb/metallb" => Some(Self::LbMetalLb),
             "storage/longhorn" => Some(Self::StorageLonghorn),
@@ -125,6 +207,7 @@ pub fn install_post_ready_addons(
     cni: CniPlugin,
     cilium_version: &str,
     addons: &[String],
+    metallb: &MetalLbConfig,
 ) -> Result<()> {
     if cni == CniPlugin::Cilium {
         install_cilium(
@@ -146,6 +229,7 @@ pub fn install_post_ready_addons(
             guest_kubeconfig,
             addon,
             cilium_version,
+            Some(metallb),
         )?;
     }
 
@@ -166,6 +250,7 @@ pub fn install_catalog_addon(
         guest_kubeconfig,
         addon,
         DEFAULT_CILIUM_VERSION,
+        None,
     )
 }
 
@@ -176,6 +261,7 @@ pub fn install_catalog_addon_with_cilium_version(
     guest_kubeconfig: &Path,
     addon: &str,
     cilium_version: &str,
+    metallb: Option<&MetalLbConfig>,
 ) -> Result<()> {
     let addon = AddonId::parse(addon)
         .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
@@ -186,6 +272,7 @@ pub fn install_catalog_addon_with_cilium_version(
         guest_kubeconfig,
         addon,
         cilium_version,
+        metallb,
     )
 }
 
@@ -196,6 +283,7 @@ fn install_addon(
     guest_kubeconfig: &Path,
     addon: AddonId,
     cilium_version: &str,
+    metallb: Option<&MetalLbConfig>,
 ) -> Result<()> {
     match addon {
         AddonId::CniFlannel => {
@@ -216,6 +304,7 @@ fn install_addon(
         AddonId::IngressTraefik => {
             install_traefik(backend, runner, control_plane, guest_kubeconfig)
         }
+        AddonId::IngressKong => install_kong(backend, runner, control_plane, guest_kubeconfig),
         AddonId::LbServiceLb => {
             info!(
                 node = %control_plane.name,
@@ -224,18 +313,9 @@ fn install_addon(
             );
             Ok(())
         }
-        AddonId::LbMetalLb => install_remote_yaml_addon(
-            backend,
-            runner,
-            control_plane,
-            guest_kubeconfig,
-            RemoteYamlAddonSpec {
-                addon,
-                url: METALLB_MANIFEST_URL,
-                wait_command_template: METALLB_WAIT_COMMAND,
-                timeout: Duration::from_secs(300),
-            },
-        ),
+        AddonId::LbMetalLb => {
+            install_metallb(backend, runner, control_plane, guest_kubeconfig, metallb)
+        }
         AddonId::StorageLonghorn => install_remote_yaml_addon(
             backend,
             runner,
@@ -378,6 +458,122 @@ fn install_traefik(
     Ok(())
 }
 
+fn install_kong(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    guest_kubeconfig: &Path,
+) -> Result<()> {
+    info!(
+        node = %control_plane.name,
+        addon = "kong",
+        "installing post-ready add-on"
+    );
+
+    apply_guest_manifest(
+        backend,
+        runner,
+        control_plane,
+        KONG_MANIFEST_PATH,
+        &render_kong_helmchart(),
+    )?;
+
+    if should_wait_for_addons() {
+        let wait_command = format!(
+            "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-system rollout status deployment/kong-kong --timeout=30s",
+            kubeconfig = shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()),
+        );
+        wait_for_guest_rollout(
+            backend,
+            runner,
+            control_plane,
+            &wait_command,
+            Duration::from_secs(300),
+        )
+        .map_err(|error| {
+            Error::InvalidArgs(format!(
+                "failed to install add-on ingress/kong on cluster control-plane {}: {error}",
+                control_plane.name
+            ))
+        })?;
+        info!(
+            node = %control_plane.name,
+            addon = "kong",
+            "post-ready add-on is ready"
+        );
+    } else {
+        info!(
+            node = %control_plane.name,
+            addon = "kong",
+            "post-ready add-on manifest applied (async readiness)"
+        );
+    }
+
+    Ok(())
+}
+
+fn install_metallb(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    guest_kubeconfig: &Path,
+    metallb: Option<&MetalLbConfig>,
+) -> Result<()> {
+    install_remote_yaml_addon(
+        backend,
+        runner,
+        control_plane,
+        guest_kubeconfig,
+        RemoteYamlAddonSpec {
+            addon: AddonId::LbMetalLb,
+            url: METALLB_MANIFEST_URL,
+            wait_command_template: METALLB_WAIT_COMMAND,
+            timeout: Duration::from_secs(300),
+        },
+    )?;
+
+    if let Some(config) = metallb
+        && !config.is_empty()
+    {
+        config.validate()?;
+        apply_metallb_config(backend, runner, control_plane, config)?;
+        info!(
+            node = %control_plane.name,
+            addon = AddonId::LbMetalLb.as_str(),
+            "applied MetalLB address configuration"
+        );
+    }
+
+    Ok(())
+}
+
+fn apply_metallb_config(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    config: &MetalLbConfig,
+) -> Result<()> {
+    let manifest = if let Some(path) = &config.config_file {
+        fs::read_to_string(path).map_err(|source| Error::CommandIo {
+            program: "read_to_string".to_owned(),
+            source,
+        })?
+    } else {
+        match config.effective_mode_for_addresses() {
+            Some(MetalLbMode::Layer2) => render_metallb_layer2_config(&config.addresses),
+            None => return Ok(()),
+        }
+    };
+
+    apply_guest_manifest(
+        backend,
+        runner,
+        control_plane,
+        METALLB_CONFIG_MANIFEST_PATH,
+        &manifest,
+    )
+}
+
 fn install_remote_yaml_addon(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -483,40 +679,86 @@ fn wait_for_guest_rollout(
 }
 
 fn render_cilium_helmchart(version: &str) -> String {
-    format!(
-        concat!(
-            "apiVersion: helm.cattle.io/v1\n",
-            "kind: HelmChart\n",
-            "metadata:\n",
-            "  name: cilium\n",
-            "  namespace: kube-system\n",
-            "spec:\n",
-            "  bootstrap: true\n",
-            "  repo: https://helm.cilium.io/\n",
-            "  chart: cilium\n",
-            "  version: {version}\n",
-            "  targetNamespace: kube-system\n",
-            "  valuesContent: |-\n",
-            "    operator:\n",
-            "      replicas: 1\n"
-        ),
-        version = version,
-    )
+    CILIUM_HELMCHART_TEMPLATE.replace("__CILIUM_VERSION__", version)
 }
 
 fn render_traefik_helmchart() -> String {
-    concat!(
-        "apiVersion: helm.cattle.io/v1\n",
-        "kind: HelmChart\n",
-        "metadata:\n",
-        "  name: traefik\n",
-        "  namespace: kube-system\n",
-        "spec:\n",
-        "  repo: https://helm.traefik.io/traefik\n",
-        "  chart: traefik\n",
-        "  targetNamespace: kube-system\n",
-    )
-    .to_owned()
+    TRAEFIK_HELMCHART_TEMPLATE.to_owned()
+}
+
+fn render_kong_helmchart() -> String {
+    KONG_HELMCHART_TEMPLATE.to_owned()
+}
+
+fn render_metallb_layer2_config(addresses: &[String]) -> String {
+    let entries = addresses
+        .iter()
+        .map(|entry| format!("    - {}", entry.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    METALLB_LAYER2_CONFIG_TEMPLATE.replace("__METALLB_ADDRESSES__", &entries)
+}
+
+fn validate_metallb_address(entry: &str) -> Result<()> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err(Error::InvalidArgs(
+            "MetalLB address entries must not be empty".to_owned(),
+        ));
+    }
+
+    if let Some((start, end)) = entry.split_once('-') {
+        let start = parse_metallb_ip(start, "range start")?;
+        let end = parse_metallb_ip(end, "range end")?;
+        match (start, end) {
+            (IpAddr::V4(start), IpAddr::V4(end)) => {
+                if u32::from(start) > u32::from(end) {
+                    return Err(Error::InvalidArgs(format!(
+                        "invalid MetalLB range `{entry}`: start must be <= end"
+                    )));
+                }
+            }
+            (IpAddr::V6(start), IpAddr::V6(end)) => {
+                if u128::from_be_bytes(start.octets()) > u128::from_be_bytes(end.octets()) {
+                    return Err(Error::InvalidArgs(format!(
+                        "invalid MetalLB range `{entry}`: start must be <= end"
+                    )));
+                }
+            }
+            _ => {
+                return Err(Error::InvalidArgs(format!(
+                    "invalid MetalLB range `{entry}`: start and end must use the same IP family"
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some((ip, prefix)) = entry.split_once('/') {
+        let ip = parse_metallb_ip(ip, "CIDR address")?;
+        let prefix = prefix.trim().parse::<u8>().map_err(|_| {
+            Error::InvalidArgs(format!("invalid MetalLB CIDR `{entry}`: invalid prefix"))
+        })?;
+        let max_bits = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix > max_bits {
+            return Err(Error::InvalidArgs(format!(
+                "invalid MetalLB CIDR `{entry}`: prefix must be <= {max_bits}"
+            )));
+        }
+        return Ok(());
+    }
+
+    parse_metallb_ip(entry, "address").map(|_| ())
+}
+
+fn parse_metallb_ip(value: &str, label: &str) -> Result<IpAddr> {
+    value
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| Error::InvalidArgs(format!("invalid MetalLB {label} `{}`", value.trim())))
 }
 
 #[cfg(test)]
@@ -524,7 +766,8 @@ mod tests {
     use crate::k3s::ComponentToggles;
 
     use super::{
-        AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, parse_truthy_flag, render_cilium_helmchart,
+        AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig, MetalLbMode, parse_truthy_flag,
+        render_cilium_helmchart, render_kong_helmchart, render_metallb_layer2_config,
         render_traefik_helmchart,
     };
 
@@ -573,6 +816,21 @@ mod tests {
         assert!(manifest.contains("name: traefik"));
         assert!(manifest.contains("repo: https://helm.traefik.io/traefik"));
         assert!(manifest.contains("chart: traefik"));
+        assert!(manifest.contains("providers:"));
+        assert!(manifest.contains("publishedService:"));
+        assert!(!manifest.contains("external-dns.alpha.kubernetes.io/hostname"));
+    }
+
+    #[test]
+    fn kong_manifest_uses_official_helm_repo() {
+        let manifest = render_kong_helmchart();
+        assert!(manifest.contains("kind: HelmChart"));
+        assert!(manifest.contains("name: kong"));
+        assert!(manifest.contains("repo: https://charts.konghq.com"));
+        assert!(manifest.contains("chart: kong"));
+        assert!(manifest.contains("ingressClass: kong"));
+        assert!(manifest.contains("publish_service: kube-system/kong-kong-proxy"));
+        assert!(!manifest.contains("external-dns.alpha.kubernetes.io/hostname"));
     }
 
     #[test]
@@ -583,6 +841,7 @@ mod tests {
             AddonId::parse("ingress/traefik"),
             Some(AddonId::IngressTraefik)
         );
+        assert_eq!(AddonId::parse("ingress/kong"), Some(AddonId::IngressKong));
         assert_eq!(AddonId::parse("lb/servicelb"), Some(AddonId::LbServiceLb));
         assert_eq!(AddonId::parse("lb/metallb"), Some(AddonId::LbMetalLb));
         assert_eq!(
@@ -594,8 +853,72 @@ mod tests {
             Some(AddonId::StorageLocalPath)
         );
         assert_eq!(AddonId::IngressTraefik.as_str(), "ingress/traefik");
+        assert_eq!(AddonId::IngressKong.as_str(), "ingress/kong");
         assert_eq!(AddonId::LbServiceLb.as_str(), "lb/servicelb");
         assert_eq!(AddonId::LbMetalLb.as_str(), "lb/metallb");
+    }
+
+    #[test]
+    fn metallb_mode_roundtrips() {
+        assert_eq!(MetalLbMode::parse("layer2"), Some(MetalLbMode::Layer2));
+        assert_eq!(MetalLbMode::parse("LAYER2"), Some(MetalLbMode::Layer2));
+        assert_eq!(MetalLbMode::Layer2.as_str(), "layer2");
+        assert_eq!(MetalLbMode::parse("bgp"), None);
+    }
+
+    #[test]
+    fn metallb_config_rejects_incompatible_inputs() {
+        let config = MetalLbConfig {
+            mode: Some(MetalLbMode::Layer2),
+            addresses: vec!["10.0.0.10-10.0.0.20".to_owned()],
+            config_file: Some(std::path::PathBuf::from("/tmp/metallb.yaml")),
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined")
+        );
+    }
+
+    #[test]
+    fn metallb_config_validates_address_entries() {
+        let valid = MetalLbConfig {
+            mode: Some(MetalLbMode::Layer2),
+            addresses: vec![
+                "10.0.0.10-10.0.0.20".to_owned(),
+                "10.0.1.0/24".to_owned(),
+                "2001:db8::10-2001:db8::20".to_owned(),
+            ],
+            config_file: None,
+        };
+        valid.validate().expect("expected valid addresses");
+
+        let invalid = MetalLbConfig {
+            mode: Some(MetalLbMode::Layer2),
+            addresses: vec!["10.0.0.30-10.0.0.20".to_owned()],
+            config_file: None,
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("start must be <= end")
+        );
+    }
+
+    #[test]
+    fn metallb_layer2_manifest_renders_addresses() {
+        let manifest = render_metallb_layer2_config(&[
+            "10.0.0.10-10.0.0.20".to_owned(),
+            "10.0.1.0/24".to_owned(),
+        ]);
+        assert!(manifest.contains("kind: IPAddressPool"));
+        assert!(manifest.contains("kind: L2Advertisement"));
+        assert!(manifest.contains("    - 10.0.0.10-10.0.0.20"));
+        assert!(manifest.contains("    - 10.0.1.0/24"));
     }
 
     #[test]

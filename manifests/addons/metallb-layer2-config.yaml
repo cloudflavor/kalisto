@@ -1,0 +1,17 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: kalisto-default
+  namespace: metallb-system
+spec:
+  addresses:
+__METALLB_ADDRESSES__
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: kalisto-default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - kalisto-default

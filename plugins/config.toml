@@ -20,6 +20,13 @@ conflicts = []
 description = "Install Traefik ingress controller"
 
 [[plugin]]
+id = "ingress/kong"
+category = "ingress"
+install_kind = "manifest"
+conflicts = []
+description = "Install Kong ingress controller and gateway"
+
+[[plugin]]
 id = "lb/servicelb"
 category = "lb"
 install_kind = "k3s-builtin"
