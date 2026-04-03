@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::backend::BackendKind;
-use crate::cluster::addon::CniPlugin;
+use crate::cluster::addon::{CniPlugin, MetalLbConfig, MetalLbMode};
 use crate::cluster::spec::{ClusterSpec, parse_image_arch};
 use crate::error::{Error, Result};
 use crate::k3s::ServerMode;
@@ -113,6 +113,7 @@ pub struct PluginsConfig {
     pub cilium: CiliumPluginConfig,
     pub flannel: EnabledPluginConfig,
     pub traefik: EnabledPluginConfig,
+    pub kong: EnabledPluginConfig,
     pub servicelb: EnabledPluginConfig,
     pub metallb: MetallbPluginConfig,
     pub longhorn: EnabledPluginConfig,
@@ -224,8 +225,22 @@ fn apply_plugin_config(config: &PluginsConfig, spec: &mut ClusterSpec) -> Result
     if config.traefik.enabled == Some(true) {
         push_addon(spec, "ingress/traefik");
     }
-    if config.metallb.enabled == Some(true) {
+    if config.kong.enabled == Some(true) {
+        push_addon(spec, "ingress/kong");
+    }
+    let metallb = parse_metallb_config(&config.metallb, &spec.workspace_root)?;
+    if config.metallb.enabled == Some(false) && !metallb.is_empty() {
+        return Err(Error::InvalidArgs(
+            "kalisto.toml sets `plugins.metallb.enabled = false` but also defines MetalLB configuration"
+                .to_owned(),
+        ));
+    }
+    if config.metallb.enabled == Some(true) || !metallb.is_empty() {
         push_addon(spec, "lb/metallb");
+    }
+    if config.metallb.enabled == Some(true) || !metallb.is_empty() {
+        spec.metallb = metallb;
+        spec.metallb.validate()?;
     }
     if config.longhorn.enabled == Some(true) {
         push_addon(spec, "storage/longhorn");
@@ -243,6 +258,29 @@ fn push_addon(spec: &mut ClusterSpec, addon: &str) {
     }
 }
 
+fn parse_metallb_config(
+    config: &MetallbPluginConfig,
+    project_root: &Path,
+) -> Result<MetalLbConfig> {
+    let mode = match &config.mode {
+        Some(mode) => Some(MetalLbMode::parse(mode).ok_or_else(|| {
+            Error::InvalidArgs(format!(
+                "unsupported `plugins.metallb.mode` value `{mode}` in kalisto.toml; expected one of: layer2"
+            ))
+        })?),
+        None => None,
+    };
+    let config_file = config
+        .config_file
+        .as_ref()
+        .map(|path| resolve_relative_path(project_root, path));
+    Ok(MetalLbConfig {
+        mode,
+        addresses: config.addresses.clone(),
+        config_file,
+    })
+}
+
 fn resolve_relative_path(project_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -255,7 +293,7 @@ fn resolve_relative_path(project_root: &Path, path: &Path) -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
+    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbMode};
     use crate::cluster::spec::{ClusterSpec, ImageArch};
 
     use super::KalistoConfig;
@@ -286,8 +324,13 @@ name = "w0"
 enabled = true
 version = "1.19.2"
 
+[plugins.kong]
+enabled = true
+
 [plugins.metallb]
 enabled = true
+mode = "layer2"
+addresses = ["192.168.50.240-192.168.50.250"]
 "#,
         )
         .unwrap();
@@ -306,7 +349,13 @@ enabled = true
         assert_eq!(spec.worker_count, 1);
         assert_eq!(spec.cni_plugin, CniPlugin::Cilium);
         assert_eq!(spec.cilium_version, "1.19.2");
+        assert!(spec.addons.iter().any(|addon| addon == "ingress/kong"));
         assert!(spec.addons.iter().any(|addon| addon == "lb/metallb"));
+        assert_eq!(spec.metallb.mode, Some(MetalLbMode::Layer2));
+        assert_eq!(
+            spec.metallb.addresses,
+            vec!["192.168.50.240-192.168.50.250".to_owned()]
+        );
     }
 
     #[test]
@@ -331,5 +380,45 @@ enabled = true
                 .contains("cannot enable both `plugins.flannel` and `plugins.cilium`")
         );
         assert_eq!(spec.cilium_version, DEFAULT_CILIUM_VERSION);
+    }
+
+    #[test]
+    fn metallb_addresses_enable_addon_without_explicit_enabled_flag() {
+        let config: KalistoConfig = toml::from_str(
+            r#"
+[plugins.metallb]
+addresses = ["10.10.0.200-10.10.0.220"]
+"#,
+        )
+        .unwrap();
+        let mut spec = ClusterSpec::new("default".to_owned(), PathBuf::from("/workspace"));
+
+        config.apply_to_cluster_spec(&mut spec).unwrap();
+
+        assert!(spec.addons.iter().any(|addon| addon == "lb/metallb"));
+        assert_eq!(
+            spec.metallb.addresses,
+            vec!["10.10.0.200-10.10.0.220".to_owned()]
+        );
+    }
+
+    #[test]
+    fn metallb_config_file_is_resolved_relative_to_project_root() {
+        let config: KalistoConfig = toml::from_str(
+            r#"
+[plugins.metallb]
+enabled = true
+config_file = "manifests/metallb.yaml"
+"#,
+        )
+        .unwrap();
+        let mut spec = ClusterSpec::new("default".to_owned(), PathBuf::from("/workspace"));
+
+        config.apply_to_cluster_spec(&mut spec).unwrap();
+
+        assert_eq!(
+            spec.metallb.config_file,
+            Some(PathBuf::from("/workspace/manifests/metallb.yaml"))
+        );
     }
 }

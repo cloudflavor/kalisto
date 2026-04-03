@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backend::BackendKind;
-use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
+use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig};
 use crate::k3s::{ComponentToggles, ServerMode};
 use crate::paths::{artifacts_root, config_root, data_root};
 
@@ -74,6 +74,7 @@ pub struct ClusterSpec {
     pub cni_plugin: CniPlugin,
     pub cilium_version: String,
     pub addons: Vec<String>,
+    pub metallb: MetalLbConfig,
     pub server_mode: ServerMode,
     pub component_toggles: ComponentToggles,
     pub keep_failed_runtime: bool,
@@ -109,6 +110,7 @@ impl ClusterSpec {
             cni_plugin,
             cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
             addons: Vec::new(),
+            metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
             component_toggles,
             keep_failed_runtime: false,

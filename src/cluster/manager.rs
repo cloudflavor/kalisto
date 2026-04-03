@@ -23,6 +23,7 @@ use crate::cluster::wait::{
     wait_for_host_http_with_tail, wait_for_node_ready, wait_for_stable_guest_success_with_tail,
     wait_for_worker_process,
 };
+use crate::config::load::load_project_config;
 use crate::error::{Error, Result};
 use crate::k3s::NodeRole;
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
@@ -521,6 +522,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         spec.cni_plugin,
         &spec.cilium_version,
         &spec.addons,
+        &spec.metallb,
     ) {
         return Err(rollback_failed_up(
             backend,
@@ -591,6 +593,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         cni_plugin: spec.cni_plugin,
         cilium_version: spec.cilium_version.clone(),
         addons: spec.addons.clone(),
+        metallb: spec.metallb.clone(),
         server_mode: spec.server_mode,
         component_toggles: spec.component_toggles,
         kubeconfig_path: persisted_kubeconfig,
@@ -986,6 +989,17 @@ fn install_addon_at_root(
     let addon_id = AddonId::parse(addon)
         .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
     let mut state = ClusterState::load(state_root)?;
+    let mut metallb_config = state.metallb.clone();
+    if addon_id == AddonId::LbMetalLb {
+        if let Some(config) = load_project_config(&state.workspace_root)? {
+            let mut configured = ClusterSpec::new(state.name.clone(), state.workspace_root.clone());
+            config.apply_to_cluster_spec(&mut configured)?;
+            if !configured.metallb.is_empty() {
+                metallb_config = configured.metallb;
+            }
+        }
+        metallb_config.validate()?;
+    }
     validate_addon_install_allowed(&state, addon_id)?;
     let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
     let backend = backend_for(state.backend);
@@ -1023,7 +1037,11 @@ fn install_addon_at_root(
         addon = addon_id.as_str(),
         "installing cluster add-on"
     );
-    let desired_state_changed = record_desired_addon_state(&mut state, addon_id);
+    let mut desired_state_changed = record_desired_addon_state(&mut state, addon_id);
+    if addon_id == AddonId::LbMetalLb && state.metallb != metallb_config {
+        state.metallb = metallb_config.clone();
+        desired_state_changed = true;
+    }
 
     install_catalog_addon_with_cilium_version(
         backend,
@@ -1032,6 +1050,11 @@ fn install_addon_at_root(
         &control_plane_guest_kubeconfig,
         addon_id.as_str(),
         &state.cilium_version,
+        if addon_id == AddonId::LbMetalLb {
+            Some(&metallb_config)
+        } else {
+            None
+        },
     )?;
 
     if desired_state_changed {
@@ -1817,6 +1840,7 @@ fn cluster_spec_from_state(state: &ClusterState) -> ClusterSpec {
         cni_plugin: state.cni_plugin,
         cilium_version: state.cilium_version.clone(),
         addons: state.addons.clone(),
+        metallb: state.metallb.clone(),
         server_mode: state.server_mode,
         component_toggles: state.component_toggles,
         keep_failed_runtime: false,
@@ -1874,6 +1898,7 @@ fn cluster_state_from_spec(
         cni_plugin: spec.cni_plugin,
         cilium_version: spec.cilium_version.clone(),
         addons: spec.addons.clone(),
+        metallb: spec.metallb.clone(),
         server_mode: spec.server_mode,
         component_toggles: spec.component_toggles,
         kubeconfig_path: state_root.join("kubeconfig.yaml"),
@@ -2076,7 +2101,7 @@ mod tests {
     use std::path::Path;
 
     use crate::backend::BackendKind;
-    use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION};
+    use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig};
     use crate::cluster::node::Instance;
     use crate::cluster::spec::{ClusterSpec, NodeResources};
     use crate::cluster::state::{ClusterState, NodeState};
@@ -2624,6 +2649,91 @@ mod tests {
     }
 
     #[test]
+    fn install_metallb_addon_uses_project_kalisto_toml_config() {
+        let _guard = env_lock();
+        let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-addon-metallb-config-{}",
+            std::process::id()
+        ));
+        let workspace_root = root.join("workspace");
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&state_root).unwrap();
+
+        fs::write(
+            workspace_root.join("kalisto.toml"),
+            r#"
+[plugins.metallb]
+addresses = ["10.20.0.200-10.20.0.220"]
+"#,
+        )
+        .unwrap();
+
+        let state = ClusterState {
+            name: "dev".to_owned(),
+            backend: BackendKind::Lima,
+            workspace_root: workspace_root.clone(),
+            template: "template://default".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            api_port: 16443,
+            worker_count: 0,
+            control_plane_resources: NodeResources {
+                cpus: 4,
+                memory_gib: 6,
+            },
+            worker_resources: NodeResources {
+                cpus: 2,
+                memory_gib: 4,
+            },
+            enable_rosetta: true,
+            network: "lima:user-v2".to_owned(),
+            k3s_version: "v1.33.5+k3s1".to_owned(),
+            cni_plugin: CniPlugin::Flannel,
+            cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
+            addons: Vec::new(),
+            metallb: MetalLbConfig::default(),
+            server_mode: ServerMode::Standard,
+            component_toggles: ComponentToggles::default(),
+            kubeconfig_path: state_root.join("kubeconfig.yaml"),
+            token_path: state_root.join("node-token"),
+            nodes: vec![NodeState {
+                name: "kalisto-dev-cp".to_owned(),
+                role: NodeRole::ControlPlane,
+                artifacts_root: state_root.join("kalisto-dev-cp"),
+            }],
+        };
+        state.save(&state_root).unwrap();
+
+        unsafe {
+            std::env::remove_var("KALISTO_WAIT_FOR_ADDONS");
+        }
+
+        let runner = FakeRunner::with_statuses([("kalisto-dev-cp", "Running")]);
+        let outcome = install_addon_at_root(&state_root, "dev", "lb/metallb", &runner).unwrap();
+        assert_eq!(outcome.addon, "lb/metallb");
+
+        let state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(
+            state.metallb.addresses,
+            vec!["10.20.0.200-10.20.0.220".to_owned()]
+        );
+
+        let invocations = runner.invocations.lock().unwrap().clone();
+        assert!(invocations.iter().any(|(program, args)| {
+            program == "limactl"
+                && args.iter().any(|arg| arg == "shell")
+                && args
+                    .iter()
+                    .any(|arg| arg.contains("kalisto-metallb-config.yaml"))
+        }));
+
+        restore_env("KALISTO_WAIT_FOR_ADDONS", original_wait_for_addons);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn logs_returns_local_node_log_sections() {
         let root = std::env::temp_dir().join(format!("kalisto-logs-{}", std::process::id()));
         let state_root = root.join("cluster");
@@ -2814,6 +2924,7 @@ mod tests {
             cni_plugin: CniPlugin::Flannel,
             cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
             addons: Vec::new(),
+            metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             kubeconfig_path: root.join("kubeconfig.yaml"),
@@ -2854,6 +2965,7 @@ mod tests {
             cni_plugin: CniPlugin::None,
             cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
             addons: Vec::new(),
+            metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             kubeconfig_path: Path::new("kubeconfig.yaml").to_path_buf(),

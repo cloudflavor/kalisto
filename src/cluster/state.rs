@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::backend::BackendKind;
-use crate::cluster::addon::CniPlugin;
+use crate::cluster::addon::{CniPlugin, MetalLbConfig, MetalLbMode};
 use crate::cluster::spec::NodeResources;
 use crate::error::{Error, Result};
 use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
@@ -32,6 +32,7 @@ pub struct ClusterState {
     pub cni_plugin: CniPlugin,
     pub cilium_version: String,
     pub addons: Vec<String>,
+    pub metallb: MetalLbConfig,
     pub server_mode: ServerMode,
     pub component_toggles: ComponentToggles,
     pub kubeconfig_path: PathBuf,
@@ -92,6 +93,24 @@ impl ClusterState {
             format!("k3s_version\t{}", escape(&self.k3s_version)),
             format!("cni_plugin\t{}", self.cni_plugin.as_str()),
             format!("cilium_version\t{}", escape(&self.cilium_version)),
+            format!(
+                "metallb_mode\t{}",
+                self.metallb
+                    .mode
+                    .map(MetalLbMode::as_str)
+                    .unwrap_or_default()
+            ),
+            format!(
+                "metallb_config_file\t{}",
+                escape(
+                    &self
+                        .metallb
+                        .config_file
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                )
+            ),
             format!(
                 "server_mode\t{}",
                 match self.server_mode {
@@ -156,6 +175,9 @@ impl ClusterState {
         for addon in &self.addons {
             lines.push(format!("addon\t{}", escape(addon)));
         }
+        for address in &self.metallb.addresses {
+            lines.push(format!("metallb_address\t{}", escape(address)));
+        }
 
         fs::write(Self::state_file(root), lines.join("\n")).map_err(|source| Error::CommandIo {
             program: "write".to_owned(),
@@ -188,6 +210,9 @@ impl ClusterState {
         let mut cni_plugin = None;
         let mut cilium_version = None;
         let mut addons = Vec::new();
+        let mut metallb_mode = None;
+        let mut metallb_config_file = None;
+        let mut metallb_addresses = Vec::new();
         let mut server_mode = None;
         let mut disable_traefik = None;
         let mut disable_servicelb = None;
@@ -263,6 +288,29 @@ impl ClusterState {
                 Some("addon") => {
                     if let Some(value) = parts.get(1) {
                         addons.push(unescape(value));
+                    }
+                }
+                Some("metallb_mode") => {
+                    if let Some(value) = parts.get(1).map(|value| unescape(value))
+                        && !value.trim().is_empty()
+                    {
+                        metallb_mode = Some(MetalLbMode::parse(&value).ok_or_else(|| {
+                            Error::InvalidArgs(format!(
+                                "invalid cluster state: unsupported metallb_mode `{value}`"
+                            ))
+                        })?);
+                    }
+                }
+                Some("metallb_config_file") => {
+                    metallb_config_file = parts
+                        .get(1)
+                        .map(|value| unescape(value))
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                }
+                Some("metallb_address") => {
+                    if let Some(value) = parts.get(1) {
+                        metallb_addresses.push(unescape(value));
                     }
                 }
                 Some("server_mode") => {
@@ -346,6 +394,11 @@ impl ClusterState {
             cni_plugin: required(cni_plugin, "cni_plugin")?,
             cilium_version: required(cilium_version, "cilium_version")?,
             addons,
+            metallb: MetalLbConfig {
+                mode: metallb_mode,
+                addresses: metallb_addresses,
+                config_file: metallb_config_file,
+            },
             server_mode: required(server_mode, "server_mode")?,
             component_toggles: ComponentToggles {
                 disable_traefik: required(disable_traefik, "disable_traefik")?,
@@ -402,7 +455,7 @@ mod tests {
     use std::fs;
 
     use crate::backend::BackendKind;
-    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
+    use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig};
     use crate::cluster::spec::NodeResources;
     use crate::error::Error;
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
@@ -435,6 +488,11 @@ mod tests {
             cni_plugin: CniPlugin::Flannel,
             cilium_version: DEFAULT_CILIUM_VERSION.to_owned(),
             addons: vec!["lb/metallb".to_owned()],
+            metallb: MetalLbConfig {
+                mode: None,
+                addresses: vec!["10.0.0.10-10.0.0.20".to_owned()],
+                config_file: None,
+            },
             server_mode: ServerMode::Standard,
             component_toggles: ComponentToggles::default(),
             kubeconfig_path: std::path::PathBuf::from("/tmp/kubeconfig.yaml"),
@@ -470,6 +528,10 @@ mod tests {
         assert_eq!(loaded.cni_plugin, CniPlugin::Flannel);
         assert_eq!(loaded.cilium_version, DEFAULT_CILIUM_VERSION);
         assert_eq!(loaded.addons, vec!["lb/metallb".to_owned()]);
+        assert_eq!(
+            loaded.metallb.addresses,
+            vec!["10.0.0.10-10.0.0.20".to_owned()]
+        );
         assert_eq!(
             loaded.control_plane_resources,
             NodeResources {
