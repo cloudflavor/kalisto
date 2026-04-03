@@ -42,6 +42,133 @@ cargo run -- up \
   --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
 ```
 
+Ingress add-ons can be enabled at cluster bring-up:
+
+```bash
+# Traefik ingress + MetalLB
+cargo run -- up --addon ingress/traefik --addon lb/metallb
+
+# Kong ingress + MetalLB
+cargo run -- up --addon ingress/kong --addon lb/metallb
+```
+
+MetalLB address configuration is config-only via `kalisto.toml`:
+
+```toml
+[plugins.metallb]
+enabled = true
+mode = "layer2"
+addresses = ["192.168.1.240-192.168.1.250"]
+```
+
+You can also supply a full MetalLB config manifest from disk:
+
+```toml
+[plugins.metallb]
+enabled = true
+config_file = "manifests/metallb.yaml"
+```
+
+Notes:
+
+- `addresses` and `config_file` are mutually exclusive.
+- If `addresses` or `config_file` is set, Kalisto auto-enables `lb/metallb`.
+- Pick ranges that are reachable from your host network and do not overlap active DHCP/static assignments.
+
+Current ingress defaults baked into add-on manifests:
+
+- Traefik:
+  - `service.type=LoadBalancer`
+  - Kubernetes Ingress `publishedService` enabled
+- Kong:
+  - `ingressClass=kong`, `createIngressClass=true`
+  - `ingressController.env.publish_service=kube-system/kong-kong-proxy`
+  - `proxy.type=LoadBalancer`
+
+## Ingress hostnames
+
+To expose an app, create a Kubernetes `Ingress` and set `spec.rules[].host` to your own domain (or an `xip.kali.st` hostname).
+
+Resolve ingress service IPs:
+
+```bash
+KUBECONFIG_PATH="$(cargo run -- kubeconfig --path)"
+kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system get svc traefik
+kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system get svc kong-kong-proxy
+```
+
+If you want wildcard-style local hostnames, you can still use `xip.kali.st`.
+Example host format:
+
+- `myapp.<LB_IP>.xip.kali.st`
+- example: `myapp.192.168.1.50.xip.kali.st`
+
+Traefik Ingress example:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-traefik
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: myapp.192.168.1.50.xip.kali.st
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 80
+```
+
+Kong Ingress example:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-kong
+spec:
+  ingressClassName: kong
+  rules:
+    - host: myapp.192.168.1.50.xip.kali.st
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 80
+```
+
+## `kalisto expose svc` target UX
+
+The target workflow is:
+
+```bash
+kalisto expose svc myapp --port 80 --ingress traefik
+```
+
+Expected behavior for this planned command:
+
+- discover ingress LoadBalancer IP
+- generate host like `<service>.<lb-ip>.xip.kali.st`
+- create/update Ingress resource with selected ingress class
+- optionally annotate the ingress controller service for domain automation
+- print final URL
+
+Current status:
+
+- not implemented yet; use explicit Ingress manifests as shown above
+- add-on install does not apply a global domain annotation by default
+- MetalLB IP pool configuration is read from `kalisto.toml` only
+
 Kalisto stores its own files under XDG-style roots:
 
 ```text
