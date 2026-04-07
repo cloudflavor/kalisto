@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self};
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -343,6 +343,7 @@ fn cancel_task_from_cluster_state(record: &TaskRecord) -> Result<bool> {
 struct McpServer {
     default_project_root: Option<PathBuf>,
     initialized: Mutex<bool>,
+    framing: Mutex<Option<FramingMode>>,
     writer: Mutex<()>,
     tasks_dir: PathBuf,
     next_task_counter: AtomicU64,
@@ -359,7 +360,7 @@ impl McpServer {
         for entry in fs::read_dir(&tasks_dir).map_err(io_error("read_dir"))? {
             let entry = entry.map_err(io_error("read_dir"))?;
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_persisted_task_record_path(&path) {
                 continue;
             }
             let content = fs::read_to_string(&path).map_err(io_error("read_to_string"))?;
@@ -403,6 +404,7 @@ impl McpServer {
         let server = Arc::new(Self {
             default_project_root: project_root,
             initialized: Mutex::new(false),
+            framing: Mutex::new(None),
             writer: Mutex::new(()),
             tasks_dir,
             next_task_counter: AtomicU64::new(next_counter),
@@ -423,27 +425,18 @@ impl McpServer {
 
     fn serve(self: Arc<Self>) -> Result<()> {
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|source| Error::CommandIo {
-                program: "stdin".to_owned(),
-                source,
-            })?;
-            if line.trim().is_empty() {
-                continue;
+        let mut reader = BufReader::new(stdin.lock());
+        let mut framing = self.framing_mode()?;
+        while let Some(value) = read_stdio_message(&mut reader, &mut framing)? {
+            if let Some(mode) = framing {
+                self.set_framing_mode(mode)?;
             }
-            self.handle_line(&line)?;
+            self.handle_value(value)?;
         }
         Ok(())
     }
 
-    fn handle_line(self: &Arc<Self>, line: &str) -> Result<()> {
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_error(Value::Null, -32700, format!("parse error: {error}"))?;
-                return Ok(());
-            }
-        };
+    fn handle_value(self: &Arc<Self>, value: Value) -> Result<()> {
         let Some(message) = value.as_object() else {
             self.write_error(Value::Null, -32600, "invalid JSON-RPC message".to_owned())?;
             return Ok(());
@@ -1118,17 +1111,27 @@ impl McpServer {
             .lock()
             .map_err(|_| Error::InvalidArgs("stdout writer mutex was poisoned".to_owned()))?;
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer(&mut stdout, message).map_err(|error| {
-            Error::InvalidArgs(format!("failed to serialize MCP message: {error}"))
-        })?;
-        stdout.write_all(b"\n").map_err(|source| Error::CommandIo {
-            program: "stdout".to_owned(),
-            source,
-        })?;
-        stdout.flush().map_err(|source| Error::CommandIo {
-            program: "stdout".to_owned(),
-            source,
-        })?;
+        write_stdio_message(
+            &mut stdout,
+            message,
+            self.framing_mode()?
+                .unwrap_or(FramingMode::NewlineDelimited),
+        )
+    }
+
+    fn framing_mode(&self) -> Result<Option<FramingMode>> {
+        self.framing
+            .lock()
+            .map(|mode| *mode)
+            .map_err(|_| Error::InvalidArgs("stdio framing mutex was poisoned".to_owned()))
+    }
+
+    fn set_framing_mode(&self, mode: FramingMode) -> Result<()> {
+        let mut framing = self
+            .framing
+            .lock()
+            .map_err(|_| Error::InvalidArgs("stdio framing mutex was poisoned".to_owned()))?;
+        *framing = Some(mode);
         Ok(())
     }
 
@@ -1141,6 +1144,122 @@ impl McpServer {
             *state = initialized;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramingMode {
+    ContentLength,
+    NewlineDelimited,
+}
+
+fn read_stdio_message(
+    reader: &mut dyn BufRead,
+    framing: &mut Option<FramingMode>,
+) -> Result<Option<Value>> {
+    let framing_mode = match framing {
+        Some(mode) => *mode,
+        None => match detect_stdio_framing(reader)? {
+            Some(mode) => mode,
+            None => return Ok(None),
+        },
+    };
+    *framing = Some(framing_mode);
+
+    match framing_mode {
+        FramingMode::ContentLength => read_content_length_message(reader),
+        FramingMode::NewlineDelimited => read_newline_message(reader),
+    }
+}
+
+fn detect_stdio_framing(reader: &mut dyn BufRead) -> Result<Option<FramingMode>> {
+    loop {
+        let buffer = reader.fill_buf().map_err(io_error("stdin"))?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        match buffer[0] {
+            b'{' => return Ok(Some(FramingMode::NewlineDelimited)),
+            b'C' | b'c' => return Ok(Some(FramingMode::ContentLength)),
+            b'\n' | b'\r' | b' ' | b'\t' => reader.consume(1),
+            _ => return Ok(Some(FramingMode::NewlineDelimited)),
+        }
+    }
+}
+
+fn read_content_length_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
+    let mut content_length = None;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(io_error("stdin"))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                Error::InvalidArgs(format!("invalid Content-Length header: {error}"))
+            })?);
+        }
+    }
+
+    let length = content_length
+        .ok_or_else(|| Error::InvalidArgs("missing Content-Length header".to_owned()))?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).map_err(io_error("stdin"))?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| Error::InvalidArgs(format!("failed to parse MCP JSON message: {error}")))
+}
+
+fn read_newline_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(io_error("stdin"))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(trimmed)
+            .map_err(|error| Error::InvalidArgs(format!("parse error: {error}")))?;
+        return Ok(Some(value));
+    }
+}
+
+fn write_stdio_message(
+    writer: &mut dyn Write,
+    message: &Value,
+    framing: FramingMode,
+) -> Result<()> {
+    let body = serde_json::to_vec(message)
+        .map_err(|error| Error::InvalidArgs(format!("failed to serialize MCP message: {error}")))?;
+    match framing {
+        FramingMode::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n", body.len()).map_err(io_error("stdout"))?;
+            writer.write_all(&body).map_err(io_error("stdout"))?;
+        }
+        FramingMode::NewlineDelimited => {
+            writer.write_all(&body).map_err(io_error("stdout"))?;
+            writer.write_all(b"\n").map_err(io_error("stdout"))?;
+        }
+    }
+    writer.flush().map_err(io_error("stdout"))
+}
+
+fn is_persisted_task_record_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    file_name.ends_with(".json")
+        && !file_name.ends_with(".manifest.json")
+        && !file_name.ends_with(".exit.json")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2839,6 +2958,7 @@ fn poisoned(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
@@ -2869,6 +2989,7 @@ mod tests {
         Arc::new(McpServer {
             default_project_root: None,
             initialized: Mutex::new(false),
+            framing: Mutex::new(None),
             writer: Mutex::new(()),
             tasks_dir: root.join("mcp/tasks"),
             next_task_counter: AtomicU64::new(0),
@@ -3258,5 +3379,107 @@ mod tests {
             record.progress.detail.as_deref(),
             Some("legacy task finished")
         );
+    }
+
+    #[test]
+    fn reads_content_length_messages() {
+        let body = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1})).expect("json body");
+        let payload = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(&body)
+        );
+        let mut reader = Cursor::new(payload.into_bytes());
+        let mut framing = None;
+        let message = super::read_stdio_message(&mut reader, &mut framing)
+            .expect("read message")
+            .expect("message");
+
+        assert_eq!(framing, Some(super::FramingMode::ContentLength));
+        assert_eq!(message, json!({"jsonrpc":"2.0","id":1}));
+    }
+
+    #[test]
+    fn writes_content_length_messages() {
+        let mut output = Vec::new();
+        let message = json!({"jsonrpc":"2.0","result":{}});
+        super::write_stdio_message(&mut output, &message, super::FramingMode::ContentLength)
+            .expect("write");
+
+        let output = String::from_utf8(output).expect("utf8");
+        let (headers, body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length separator");
+        assert!(headers.starts_with("Content-Length: "));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).expect("parse body"),
+            message
+        );
+    }
+
+    #[test]
+    fn mcp_load_ignores_manifest_and_exit_sidecars() {
+        let _guard = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-mcp-sidecars-{}-{}",
+            std::process::id(),
+            super::unix_timestamp_millis()
+        ));
+        let tasks_dir = root.join("kalisto/mcp/tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("task-good.json"),
+            r#"{
+  "task_id": "task-good",
+  "title": "good",
+  "status": "completed",
+  "status_message": "done",
+  "created_at": "2026-01-01T00:00:00Z",
+  "last_updated_at": "2026-01-01T00:00:01Z",
+  "ttl_millis": 1000,
+  "poll_interval_millis": 1000,
+  "request": {
+    "tool_name": "clusters.up",
+    "arguments": {}
+  },
+  "result": null,
+  "stdout_path": "/tmp/stdout",
+  "stderr_path": "/tmp/stderr",
+  "child_id": null
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            tasks_dir.join("task-good.manifest.json"),
+            r#"{
+  "tool_name": "clusters.up",
+  "arguments": {},
+  "default_project_root": null
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            tasks_dir.join("task-good.exit.json"),
+            r#"{
+  "exit_code": 0,
+  "error": null,
+  "finished_at": "2026-01-01T00:00:02Z"
+}"#,
+        )
+        .unwrap();
+
+        let original = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("XDG_DATA_HOME", &root) };
+        let loaded = McpServer::load(None)
+            .ok()
+            .and_then(|server| server.task("task-good"));
+        match original {
+            Some(value) => unsafe { std::env::set_var("XDG_DATA_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        let _ = fs::remove_dir_all(root);
+
+        let record = loaded.expect("task record should load while sidecars are ignored");
+        assert_eq!(record.task_id, "task-good");
     }
 }

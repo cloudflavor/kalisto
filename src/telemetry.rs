@@ -9,7 +9,12 @@ pub fn init(log_level: Option<Level>) -> Result<()> {
     let env_filter = env_filter(log_level)?;
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer().with_target(false).compact())
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .compact()
+                .with_writer(std::io::stderr),
+        )
         .try_init()
         .map_err(|error| {
             Error::InvalidArgs(format!("failed to initialize tracing subscriber: {error}"))

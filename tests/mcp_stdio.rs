@@ -205,3 +205,52 @@ fn mcp_stdio_supports_task_backed_calls() {
 
     let _ = fs::remove_dir_all(xdg_data_home);
 }
+
+#[test]
+fn mcp_stdio_clusters_list_keeps_stdout_protocol_clean() {
+    let xdg_data_home = unique_temp_dir("mcp-stdio-clusters-list");
+    fs::create_dir_all(&xdg_data_home).expect("temp xdg dir should exist");
+    let mut harness = McpHarness::spawn(&xdg_data_home);
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    }));
+    let _ = harness.read_until_response(1);
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    }));
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "clusters.list",
+            "arguments": {}
+        }
+    }));
+    let response = harness.read_until_response(2);
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("clusters"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(xdg_data_home);
+}
