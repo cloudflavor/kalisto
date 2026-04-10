@@ -1,9 +1,9 @@
 [[plugin]]
 id = "cni/flannel"
 category = "cni"
-install_kind = "k3s-builtin"
+install_kind = "manifest"
 conflicts = ["cni/cilium"]
-description = "Use the built-in K3s flannel networking stack"
+description = "Install Flannel as the cluster CNI"
 
 [[plugin]]
 id = "cni/cilium"

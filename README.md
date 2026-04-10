@@ -9,6 +9,17 @@ Current scope:
 - Kubernetes distro: `k3s`
 - image pipeline: container-built seed image plus macOS finalization pass
 
+## Harness examples
+
+Sample generic E2E harness projects live under [examples/](/Users/runner/projects/rust/kalisto/examples).
+
+Try:
+
+```bash
+cargo run -- test ls --project-root examples/harness/nginx-smoke
+cargo run -- test ls --project-root examples/harness/job-smoke
+```
+
 ## Product commands
 
 The first product-facing commands are available now:
@@ -46,10 +57,10 @@ Ingress add-ons can be enabled at cluster bring-up:
 
 ```bash
 # Traefik ingress + MetalLB
-cargo run -- up --addon ingress/traefik --addon lb/metallb
+cargo run -- up --addons ingress/traefik --addons lb/metallb
 
 # Kong ingress + MetalLB
-cargo run -- up --addon ingress/kong --addon lb/metallb
+cargo run -- up --addons ingress/kong --addons lb/metallb
 ```
 
 MetalLB address configuration is config-only via `kalisto.toml`:
