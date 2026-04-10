@@ -57,6 +57,18 @@ pub fn run_scenario(
         "harness: preparing namespace `{}` for scenario `{}`",
         scenario.namespace, scenario.name
     );
+
+    // Wait for the node to be ready before applying manifests
+    // This is necessary because CNI addons are applied asynchronously
+    eprintln!("harness: waiting for node to be ready");
+    wait_for_node_ready(
+        backend,
+        runner,
+        control_plane_name,
+        control_plane_runtime_root,
+        &guest_kubeconfig,
+    )?;
+
     ensure_namespace(
         backend,
         runner,
@@ -320,6 +332,61 @@ fn run_wait(
         runtime_root,
         guest_kubeconfig,
         namespace,
+        &command,
+    )?;
+    Ok(())
+}
+
+fn wait_for_node_ready(
+    backend: &dyn crate::backend::ClusterBackend,
+    runner: &dyn CommandRunner,
+    instance_name: &str,
+    runtime_root: &Path,
+    guest_kubeconfig: &Path,
+) -> Result<()> {
+    // Wait for node to be ready - first wait for node object to exist
+    let check_node = format!("kubectl get nodes -o name | grep -q 'node/'",);
+    for _ in 0..60 {
+        if run_guest_kubectl_script(
+            backend,
+            runner,
+            instance_name,
+            runtime_root,
+            guest_kubeconfig,
+            "default",
+            &check_node,
+        )
+        .is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    // Wait for CNI (flannel) daemonset to be ready - this is required for node scheduling
+    eprintln!("harness: waiting for CNI to be ready");
+    let wait_cni = format!(
+        "kubectl wait --for=condition=ready pod -n kube-flannel -l app=flannel --timeout=300s || true",
+    );
+    let _ = run_guest_kubectl_script(
+        backend,
+        runner,
+        instance_name,
+        runtime_root,
+        guest_kubeconfig,
+        "default",
+        &wait_cni,
+    );
+
+    // Then wait for node Ready condition
+    let command = format!("kubectl wait --for=condition=Ready node --all --timeout=300s",);
+    run_guest_kubectl_script(
+        backend,
+        runner,
+        instance_name,
+        runtime_root,
+        guest_kubeconfig,
+        "default",
         &command,
     )?;
     Ok(())
