@@ -209,7 +209,7 @@ pub fn default_template(workspace_root: &Path) -> String {
         return template;
     }
 
-    if let Some(template) = lima_template_under(Some(&workspace_root.join("artifacts"))) {
+    if let Some(template) = lima_template_under_workspace_ancestors(workspace_root) {
         return template;
     }
 
@@ -220,6 +220,15 @@ pub fn default_template(workspace_root: &Path) -> String {
     }
 
     "template://default".to_owned()
+}
+
+fn lima_template_under_workspace_ancestors(workspace_root: &Path) -> Option<String> {
+    for root in workspace_root.ancestors() {
+        if let Some(template) = lima_template_under(Some(&root.join("artifacts"))) {
+            return Some(template);
+        }
+    }
+    None
 }
 
 fn lima_template_under(root: Option<&Path>) -> Option<String> {
@@ -314,6 +323,35 @@ mod tests {
         assert_eq!(
             default_template(&workspace_root),
             xdg_template.display().to_string()
+        );
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_template_finds_artifacts_in_workspace_ancestors() {
+        let _guard = env_lock();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root =
+            std::env::temp_dir().join(format!("kalisto-spec-ancestor-{}", std::process::id()));
+        let data_home = root.join("xdg-data");
+        let workspace_root = root.join("examples").join("harness").join("job-smoke");
+        let ancestor_template = root
+            .join("artifacts")
+            .join("lima-node")
+            .join(super::default_lima_finalized_template_filename());
+        fs::create_dir_all(workspace_root.as_path()).unwrap();
+        fs::create_dir_all(ancestor_template.parent().unwrap()).unwrap();
+        fs::write(&ancestor_template, "ancestor\n").unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        assert_eq!(
+            default_template(&workspace_root),
+            ancestor_template.display().to_string()
         );
 
         restore_env("XDG_DATA_HOME", original_xdg_data_home);

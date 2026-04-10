@@ -1535,10 +1535,6 @@ fn lifecycle_properties() -> Map<String, Value> {
             json!({ "type": "integer", "minimum": 1, "maximum": 65535 }),
         ),
         ("k3sVersion".to_owned(), json!({ "type": "string" })),
-        (
-            "cni".to_owned(),
-            json!({ "type": "string", "enum": ["none", "flannel", "cilium"] }),
-        ),
         ("ciliumVersion".to_owned(), json!({ "type": "string" })),
         (
             "addons".to_owned(),
@@ -2079,7 +2075,7 @@ struct AddonInstallArgsPayload {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClusterLifecycleArgs {
     project_root: Option<PathBuf>,
     name: Option<String>,
@@ -2096,7 +2092,6 @@ struct ClusterLifecycleArgs {
     network: Option<String>,
     api_port: Option<u16>,
     k3s_version: Option<String>,
-    cni: Option<String>,
     cilium_version: Option<String>,
     addons: Option<Vec<String>>,
     keep_failed_runtime: Option<bool>,
@@ -2105,7 +2100,7 @@ struct ClusterLifecycleArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BenchArgsPayload {
     #[serde(flatten)]
     lifecycle: ClusterLifecycleArgs,
@@ -2149,10 +2144,6 @@ impl ClusterLifecycleArgs {
             Some(value) => Some(parse_image_arch(value)?),
             None => None,
         };
-        let cni = match self.cni.as_deref() {
-            Some(value) => Some(parse_cni(value)?),
-            None => None,
-        };
         Ok(UpArgs {
             project_root: self.project_root.or(default_project_root),
             name: self.name,
@@ -2169,7 +2160,6 @@ impl ClusterLifecycleArgs {
             network: self.network,
             api_port: self.api_port,
             k3s_version: self.k3s_version,
-            cni,
             cilium_version: self.cilium_version,
             addons: self.addons.unwrap_or_default(),
             keep_failed_runtime: self.keep_failed_runtime.unwrap_or(false),
@@ -2208,10 +2198,6 @@ impl BenchArgsPayload {
             network: lifecycle.network,
             api_port: lifecycle.api_port,
             k3s_version: lifecycle.k3s_version,
-            cni: match lifecycle.cni.as_deref() {
-                Some(value) => Some(parse_cni(value)?),
-                None => None,
-            },
             cilium_version: lifecycle.cilium_version,
             addons: lifecycle.addons.unwrap_or_default(),
             keep_failed_runtime: lifecycle.keep_failed_runtime.unwrap_or(false),
@@ -2237,15 +2223,6 @@ fn parse_image_arch(value: &str) -> std::result::Result<ImageArch, JsonRpcError>
         jsonrpc_error(
             -32602,
             format!("unsupported arch `{value}`; expected one of: amd64, x86_64, arm64, aarch64"),
-        )
-    })
-}
-
-fn parse_cni(value: &str) -> std::result::Result<CniPlugin, JsonRpcError> {
-    CniPlugin::parse(value).ok_or_else(|| {
-        jsonrpc_error(
-            -32602,
-            format!("unsupported cni `{value}`; expected one of: none, flannel, cilium"),
         )
     })
 }
@@ -2433,14 +2410,11 @@ fn append_up_args(args: &mut Vec<String>, up: &UpArgs) {
     if let Some(version) = &up.k3s_version {
         args.extend(["--k3s-version".to_owned(), version.clone()]);
     }
-    if let Some(cni) = up.cni {
-        args.extend(["--cni".to_owned(), cni.as_str().to_owned()]);
-    }
     if let Some(version) = &up.cilium_version {
         args.extend(["--cilium-version".to_owned(), version.clone()]);
     }
     for addon in &up.addons {
-        args.extend(["--addon".to_owned(), addon.clone()]);
+        args.extend(["--addons".to_owned(), addon.clone()]);
     }
     if up.keep_failed_runtime {
         args.push("--keep-failed-runtime".to_owned());
@@ -2471,7 +2445,6 @@ fn append_bench_args(args: &mut Vec<String>, bench: &BenchArgs) {
         network: bench.network.clone(),
         api_port: bench.api_port,
         k3s_version: bench.k3s_version.clone(),
-        cni: bench.cni,
         cilium_version: bench.cilium_version.clone(),
         addons: bench.addons.clone(),
         keep_failed_runtime: bench.keep_failed_runtime,
@@ -3030,6 +3003,23 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_tool_schema_is_addon_only() {
+        let definitions = tool_definitions();
+        let up = definitions
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("clusters.up"))
+            .expect("clusters.up tool should be present");
+        let properties = up
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .expect("clusters.up schema should expose properties");
+
+        assert!(properties.contains_key("addons"));
+        assert!(!properties.contains_key("cni"));
+    }
+
+    #[test]
     fn tool_list_includes_stats_and_addons() {
         let definitions = tool_definitions();
         let names = definitions
@@ -3291,6 +3281,53 @@ mod tests {
                 "cni/cilium".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn task_command_builds_cluster_up_cli_with_addons() {
+        let (program, args) = task_command(
+            "clusters.up",
+            &json!({
+                "name": "dev",
+                "addons": ["cni/flannel", "lb/metallb"],
+                "workers": 0
+            }),
+            None,
+        )
+        .expect("command should build");
+
+        assert!(program.contains("kalisto"));
+        assert_eq!(
+            args,
+            vec![
+                "up".to_owned(),
+                "--name".to_owned(),
+                "dev".to_owned(),
+                "--workers".to_owned(),
+                "0".to_owned(),
+                "--addons".to_owned(),
+                "cni/flannel".to_owned(),
+                "--addons".to_owned(),
+                "lb/metallb".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn task_command_rejects_legacy_cni_field_for_cluster_up() {
+        let error = task_command(
+            "clusters.up",
+            &json!({
+                "name": "dev",
+                "cni": "flannel"
+            }),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("invalid tool arguments"));
+        assert!(error.message.contains("unknown field `cni`"));
     }
 
     #[test]

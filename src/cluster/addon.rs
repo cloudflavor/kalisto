@@ -14,6 +14,7 @@ use crate::process::CommandRunner;
 use crate::shell::shell_escape;
 
 pub const DEFAULT_CILIUM_VERSION: &str = "1.19.1";
+const FLANNEL_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-flannel.yaml";
 const CILIUM_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-cilium.yaml";
 const TRAEFIK_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-traefik.yaml";
 const KONG_MANIFEST_PATH: &str = "/var/lib/rancher/k3s/server/manifests/kalisto-kong.yaml";
@@ -32,6 +33,8 @@ const LONGHORN_WAIT_COMMAND: &str = concat!(
 );
 const LOCAL_PATH_MANIFEST_URL: &str = "https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.34/deploy/local-path-storage.yaml";
 const LOCAL_PATH_WAIT_COMMAND: &str = "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=30s";
+const FLANNEL_HELMCHART_TEMPLATE: &str =
+    include_str!("../../manifests/addons/flannel-helmchart.yaml");
 const CILIUM_HELMCHART_TEMPLATE: &str =
     include_str!("../../manifests/addons/cilium-helmchart.yaml");
 const TRAEFIK_HELMCHART_TEMPLATE: &str =
@@ -73,7 +76,9 @@ impl CniPlugin {
                 toggles.disable_network_policy = true;
             }
             Self::Flannel => {
-                toggles.flannel_backend_none = false;
+                toggles.flannel_backend_none = true;
+                toggles.disable_coredns = false;
+                toggles.disable_network_policy = true;
             }
             Self::Cilium => {
                 toggles.flannel_backend_none = true;
@@ -199,37 +204,48 @@ struct RemoteYamlAddonSpec<'a> {
     timeout: Duration,
 }
 
-pub fn install_post_ready_addons(
-    backend: &dyn ClusterBackend,
-    runner: &dyn CommandRunner,
-    control_plane: &Instance,
-    guest_kubeconfig: &Path,
-    cni: CniPlugin,
-    cilium_version: &str,
-    addons: &[String],
-    metallb: &MetalLbConfig,
-) -> Result<()> {
-    if cni == CniPlugin::Cilium {
-        install_cilium(
-            backend,
-            runner,
-            control_plane,
-            guest_kubeconfig,
-            cilium_version,
+pub struct PostReadyAddonRequest<'a> {
+    pub backend: &'a dyn ClusterBackend,
+    pub runner: &'a dyn CommandRunner,
+    pub control_plane: &'a Instance,
+    pub guest_kubeconfig: &'a Path,
+    pub cni: CniPlugin,
+    pub cilium_version: &'a str,
+    pub addons: &'a [String],
+    pub metallb: &'a MetalLbConfig,
+}
+
+pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<()> {
+    if request.cni == CniPlugin::Flannel {
+        install_flannel(
+            request.backend,
+            request.runner,
+            request.control_plane,
+            request.guest_kubeconfig,
         )?;
     }
 
-    for addon in addons {
+    if request.cni == CniPlugin::Cilium {
+        install_cilium(
+            request.backend,
+            request.runner,
+            request.control_plane,
+            request.guest_kubeconfig,
+            request.cilium_version,
+        )?;
+    }
+
+    for addon in request.addons {
         let addon = AddonId::parse(addon)
             .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
         install_addon(
-            backend,
-            runner,
-            control_plane,
-            guest_kubeconfig,
+            request.backend,
+            request.runner,
+            request.control_plane,
+            request.guest_kubeconfig,
             addon,
-            cilium_version,
-            Some(metallb),
+            request.cilium_version,
+            Some(request.metallb),
         )?;
     }
 
@@ -286,14 +302,7 @@ fn install_addon(
     metallb: Option<&MetalLbConfig>,
 ) -> Result<()> {
     match addon {
-        AddonId::CniFlannel => {
-            info!(
-                node = %control_plane.name,
-                addon = "flannel",
-                "flannel CNI is managed by k3s bootstrap flags"
-            );
-            Ok(())
-        }
+        AddonId::CniFlannel => install_flannel(backend, runner, control_plane, guest_kubeconfig),
         AddonId::CniCilium => install_cilium(
             backend,
             runner,
@@ -341,6 +350,65 @@ fn install_addon(
             },
         ),
     }
+}
+
+fn install_flannel(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    guest_kubeconfig: &Path,
+) -> Result<()> {
+    info!(
+        node = %control_plane.name,
+        addon = "flannel",
+        "installing post-ready add-on"
+    );
+
+    apply_guest_manifest(
+        backend,
+        runner,
+        control_plane,
+        FLANNEL_MANIFEST_PATH,
+        &render_flannel_helmchart(),
+    )?;
+
+    if should_wait_for_addons() {
+        let wait_command = format!(
+            concat!(
+                "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl get namespace kube-flannel >/dev/null 2>&1 && ",
+                "daemonset_name=\"$(KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-flannel get daemonset -o jsonpath='{{.items[0].metadata.name}}')\" && ",
+                "test -n \"${{daemonset_name}}\" && ",
+                "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-flannel rollout status daemonset/\"${{daemonset_name}}\" --timeout=30s"
+            ),
+            kubeconfig = shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()),
+        );
+        wait_for_guest_rollout(
+            backend,
+            runner,
+            control_plane,
+            &wait_command,
+            Duration::from_secs(300),
+        )
+        .map_err(|error| {
+            Error::InvalidArgs(format!(
+                "failed to install add-on cni/flannel on cluster control-plane {}: {error}",
+                control_plane.name
+            ))
+        })?;
+        info!(
+            node = %control_plane.name,
+            addon = "flannel",
+            "post-ready add-on is ready"
+        );
+    } else {
+        info!(
+            node = %control_plane.name,
+            addon = "flannel",
+            "post-ready add-on manifest applied (async readiness)"
+        );
+    }
+
+    Ok(())
 }
 
 fn install_cilium(
@@ -682,6 +750,10 @@ fn render_cilium_helmchart(version: &str) -> String {
     CILIUM_HELMCHART_TEMPLATE.replace("__CILIUM_VERSION__", version)
 }
 
+fn render_flannel_helmchart() -> String {
+    FLANNEL_HELMCHART_TEMPLATE.to_owned()
+}
+
 fn render_traefik_helmchart() -> String {
     TRAEFIK_HELMCHART_TEMPLATE.to_owned()
 }
@@ -767,8 +839,8 @@ mod tests {
 
     use super::{
         AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig, MetalLbMode, parse_truthy_flag,
-        render_cilium_helmchart, render_kong_helmchart, render_metallb_layer2_config,
-        render_traefik_helmchart,
+        render_cilium_helmchart, render_flannel_helmchart, render_kong_helmchart,
+        render_metallb_layer2_config, render_traefik_helmchart,
     };
 
     #[test]
@@ -797,6 +869,26 @@ mod tests {
         assert!(toggles.flannel_backend_none);
         assert!(!toggles.disable_coredns);
         assert!(toggles.disable_network_policy);
+    }
+
+    #[test]
+    fn flannel_defaults_disable_builtin_flannel_backend() {
+        let mut toggles = ComponentToggles::default();
+        CniPlugin::Flannel.apply_component_defaults(&mut toggles);
+        assert!(toggles.flannel_backend_none);
+        assert!(!toggles.disable_coredns);
+        assert!(toggles.disable_network_policy);
+    }
+
+    #[test]
+    fn flannel_manifest_targets_k3s_cluster_cidr() {
+        let manifest = render_flannel_helmchart();
+        assert!(manifest.contains("kind: HelmChart"));
+        assert!(manifest.contains("name: flannel"));
+        assert!(manifest.contains("repo: https://flannel-io.github.io/flannel/"));
+        assert!(manifest.contains("chart: flannel"));
+        assert!(manifest.contains("targetNamespace: kube-flannel"));
+        assert!(manifest.contains("podCidr: 10.42.0.0/16"));
     }
 
     #[test]

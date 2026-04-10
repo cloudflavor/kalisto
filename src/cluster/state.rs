@@ -378,6 +378,9 @@ mod tests {
     #[test]
     fn state_roundtrips() {
         let root = std::env::temp_dir().join(format!("kalisto-state-{}", std::process::id()));
+        let mut component_toggles = ComponentToggles::default();
+        CniPlugin::Flannel.apply_component_defaults(&mut component_toggles);
+
         let state = ClusterState {
             name: "dev".to_owned(),
             backend: BackendKind::Lima,
@@ -407,7 +410,7 @@ mod tests {
                 config_file: None,
             },
             server_mode: ServerMode::Standard,
-            component_toggles: ComponentToggles::default(),
+            component_toggles,
             kubeconfig_path: std::path::PathBuf::from("/tmp/kubeconfig.yaml"),
             token_path: std::path::PathBuf::from("/tmp/token"),
             nodes: vec![
@@ -441,7 +444,9 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/rootfs.ext4"))
         );
         assert_eq!(loaded.worker_count, 1);
-        assert_eq!(loaded.component_toggles, ComponentToggles::default());
+        let mut expected_toggles = ComponentToggles::default();
+        CniPlugin::Flannel.apply_component_defaults(&mut expected_toggles);
+        assert_eq!(loaded.component_toggles, expected_toggles);
         assert_eq!(loaded.cni_plugin, CniPlugin::Flannel);
         assert_eq!(loaded.cilium_version, DEFAULT_CILIUM_VERSION);
         assert_eq!(loaded.addons, vec!["lb/metallb".to_owned()]);

@@ -6,6 +6,7 @@ use crate::backend::BackendKind;
 use crate::cluster::addon::{CniPlugin, MetalLbConfig, MetalLbMode};
 use crate::cluster::spec::{ClusterSpec, parse_image_arch};
 use crate::error::{Error, Result};
+use crate::harness::HarnessConfig;
 use crate::k3s::ServerMode;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -14,6 +15,7 @@ pub struct KalistoConfig {
     pub cluster: ClusterConfig,
     pub nodes: NodesConfig,
     pub plugins: PluginsConfig,
+    pub harness: HarnessConfig,
 }
 
 impl KalistoConfig {
@@ -65,6 +67,10 @@ impl KalistoConfig {
         }
 
         Ok(())
+    }
+
+    pub fn resolve_relative_paths(&mut self, project_root: &Path) {
+        self.harness.resolve_relative_paths(project_root);
     }
 }
 
@@ -420,5 +426,31 @@ config_file = "manifests/metallb.yaml"
             spec.metallb.config_file,
             Some(PathBuf::from("/workspace/manifests/metallb.yaml"))
         );
+    }
+
+    #[test]
+    fn config_parses_named_harness_scenarios() {
+        let config: KalistoConfig = toml::from_str(
+            r#"
+[[harness.scenarios]]
+name = "smoke"
+namespace = "demo"
+manifests = ["k8s/app.yaml"]
+
+[[harness.scenarios.waits]]
+kind = "deployment"
+name = "api"
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "pods-present"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" get pods"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.harness.scenarios.len(), 1);
+        assert_eq!(config.harness.scenarios[0].name, "smoke");
+        assert_eq!(config.harness.scenarios[0].namespace, "demo");
     }
 }

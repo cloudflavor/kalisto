@@ -9,7 +9,8 @@ use crate::artifact::resolve_cluster_spec;
 use crate::backend::lima::canonicalize_path;
 use crate::backend::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig, backend_for};
 use crate::cluster::addon::{
-    AddonId, CniPlugin, install_catalog_addon_with_cilium_version, install_post_ready_addons,
+    AddonId, CniPlugin, PostReadyAddonRequest, install_catalog_addon_with_cilium_version,
+    install_post_ready_addons,
 };
 use crate::cluster::node::{
     Instance, JoinConfig, K3sBootstrapConfig, StartedWorker, bootstrap_server, bootstrap_worker,
@@ -574,16 +575,16 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
-    if let Err(error) = install_post_ready_addons(
+    if let Err(error) = install_post_ready_addons(PostReadyAddonRequest {
         backend,
         runner,
-        &control_plane,
-        &control_plane_guest_kubeconfig,
-        spec.cni_plugin,
-        &spec.cilium_version,
-        &spec.addons,
-        &spec.metallb,
-    ) {
+        control_plane: &control_plane,
+        guest_kubeconfig: &control_plane_guest_kubeconfig,
+        cni: spec.cni_plugin,
+        cilium_version: &spec.cilium_version,
+        addons: &spec.addons,
+        metallb: &spec.metallb,
+    }) {
         return Err(rollback_failed_up(
             backend,
             runner,
@@ -2488,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn record_desired_cilium_state_updates_cluster_networking_mode() {
+    fn record_desired_cni_state_updates_cluster_networking_mode() {
         let root = std::env::temp_dir().join(format!("kalisto-addon-state-{}", std::process::id()));
         let state_root = root.join("cluster");
         fs::create_dir_all(&state_root).unwrap();
@@ -2500,7 +2501,7 @@ mod tests {
 
         let mut state = ClusterState::load(&state_root).unwrap();
         assert_eq!(state.cni_plugin, CniPlugin::Flannel);
-        assert!(!state.component_toggles.flannel_backend_none);
+        assert!(state.component_toggles.flannel_backend_none);
 
         assert!(record_desired_addon_state(&mut state, AddonId::CniCilium));
         assert_eq!(state.cni_plugin, CniPlugin::Cilium);
@@ -2683,6 +2684,55 @@ mod tests {
     }
 
     #[test]
+    fn install_addon_at_root_applies_flannel_without_restarting_cluster() {
+        let _guard = env_lock();
+        let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-addon-install-flannel-{}",
+            std::process::id()
+        ));
+        let state_root = root.join("cluster");
+        fs::create_dir_all(&state_root).unwrap();
+        save_state(
+            &state_root,
+            "dev",
+            vec![("kalisto-dev-cp", NodeRole::ControlPlane)],
+        );
+
+        let mut state = ClusterState::load(&state_root).unwrap();
+        state.cni_plugin = CniPlugin::None;
+        CniPlugin::None.apply_component_defaults(&mut state.component_toggles);
+        state.save(&state_root).unwrap();
+
+        unsafe {
+            std::env::remove_var("KALISTO_WAIT_FOR_ADDONS");
+        }
+
+        let runner = FakeRunner::with_statuses([("kalisto-dev-cp", "Running")]);
+        let outcome = install_addon_at_root(&state_root, "dev", "cni/flannel", &runner).unwrap();
+
+        assert_eq!(outcome.cluster, "dev");
+        assert_eq!(outcome.addon, "cni/flannel");
+
+        let state = ClusterState::load(&state_root).unwrap();
+        assert_eq!(state.cni_plugin, CniPlugin::Flannel);
+        assert!(state.component_toggles.flannel_backend_none);
+
+        let invocations = runner.invocations.lock().unwrap().clone();
+        assert!(invocations.iter().any(|(program, args)| {
+            program == "limactl"
+                && args.iter().any(|arg| arg == "shell")
+                && args.iter().any(|arg| arg.contains("kalisto-flannel.yaml"))
+        }));
+        assert!(!invocations.iter().any(|(program, args)| {
+            program == "limactl" && args.iter().any(|arg| arg == "stop" || arg == "start")
+        }));
+
+        restore_env("KALISTO_WAIT_FOR_ADDONS", original_wait_for_addons);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn install_addon_at_root_does_not_persist_cilium_state_when_apply_fails() {
         let _guard = env_lock();
         let original_wait_for_addons = std::env::var_os("KALISTO_WAIT_FOR_ADDONS");
@@ -2741,6 +2791,9 @@ addresses = ["10.20.0.200-10.20.0.220"]
         )
         .unwrap();
 
+        let mut component_toggles = ComponentToggles::default();
+        CniPlugin::Flannel.apply_component_defaults(&mut component_toggles);
+
         let state = ClusterState {
             name: "dev".to_owned(),
             backend: BackendKind::Lima,
@@ -2766,7 +2819,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
             addons: Vec::new(),
             metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
-            component_toggles: ComponentToggles::default(),
+            component_toggles,
             kubeconfig_path: state_root.join("kubeconfig.yaml"),
             token_path: state_root.join("node-token"),
             nodes: vec![NodeState {
@@ -2969,6 +3022,9 @@ addresses = ["10.20.0.200-10.20.0.220"]
     }
 
     fn save_state(root: &std::path::Path, name: &str, nodes: Vec<(&str, NodeRole)>) {
+        let mut component_toggles = ComponentToggles::default();
+        CniPlugin::Flannel.apply_component_defaults(&mut component_toggles);
+
         let state = ClusterState {
             name: name.to_owned(),
             backend: BackendKind::Lima,
@@ -2997,7 +3053,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
             addons: Vec::new(),
             metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
-            component_toggles: ComponentToggles::default(),
+            component_toggles,
             kubeconfig_path: root.join("kubeconfig.yaml"),
             token_path: root.join("node-token"),
             nodes: nodes
@@ -3074,7 +3130,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
         let clusters_root = workspace_root.join(".kalisto").join("clusters");
         let error = list_at_root(&clusters_root, &runner).unwrap_err();
         match error {
-            Error::InvalidArgs(message) => assert!(message.contains("missing backend")),
+            Error::InvalidArgs(message) => assert!(message.contains("invalid cluster state json")),
             other => panic!("unexpected error: {other}"),
         }
 
