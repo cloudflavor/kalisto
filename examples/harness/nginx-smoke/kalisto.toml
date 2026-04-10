@@ -1,0 +1,28 @@
+[[harness.scenarios]]
+name = "deployment-smoke"
+namespace = "demo-web"
+cluster_lifecycle = "ephemeral"
+manifests = [
+    "k8s/deployment.yaml",
+    "k8s/service.yaml",
+]
+
+[[harness.scenarios.waits]]
+kind = "deployment"
+name = "web"
+timeout_secs = 180
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "ready-replica-count"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" get deployment web -o jsonpath='{.status.readyReplicas}' | grep -Fx '1'"
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "service-present"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" get service web"
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "pod-running"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" get pods -l app=web -o jsonpath='{.items[0].status.phase}' | grep -Fx 'Running'"

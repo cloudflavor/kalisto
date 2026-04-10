@@ -1,0 +1,20 @@
+[[harness.scenarios]]
+name = "job-smoke"
+namespace = "demo-job"
+cluster_lifecycle = "ephemeral"
+manifests = ["k8s/job.yaml"]
+
+[[harness.scenarios.waits]]
+kind = "job"
+name = "migration-check"
+timeout_secs = 180
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "job-succeeded"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" get job migration-check -o jsonpath='{.status.succeeded}' | grep -Fx '1'"
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "job-log-marker"
+command = "kubectl -n \"$KALISTO_NAMESPACE\" logs job/migration-check | grep -Fx 'migration-ok'"
