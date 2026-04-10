@@ -4,6 +4,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod error;
+pub mod harness;
 pub mod k3s;
 pub mod lima_k3s;
 pub mod mcp;

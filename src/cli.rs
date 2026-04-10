@@ -25,6 +25,7 @@ pub struct Cli {
 pub enum Command {
     Create(UpArgs),
     Up(UpArgs),
+    Test(TestArgs),
     Mcp(McpArgs),
     #[structopt(name = "mcp-task-runner")]
     McpTaskRunner(McpTaskRunnerArgs),
@@ -50,6 +51,41 @@ pub enum Command {
 pub struct AddonArgs {
     #[structopt(subcommand)]
     pub command: AddonCommand,
+}
+
+#[derive(Debug, StructOpt)]
+pub struct TestArgs {
+    #[structopt(subcommand)]
+    pub command: TestCommand,
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(rename_all = "kebab")]
+pub enum TestCommand {
+    Run(TestRunArgs),
+    Ls(TestListArgs),
+}
+
+#[derive(Debug, StructOpt)]
+pub struct TestRunArgs {
+    #[structopt(long, parse(from_os_str))]
+    pub project_root: Option<PathBuf>,
+    #[structopt(long)]
+    pub name: Option<String>,
+    #[structopt(long)]
+    pub scenario: String,
+}
+
+impl TestRunArgs {
+    pub fn into_cluster_spec(&self) -> crate::error::Result<ClusterSpec> {
+        resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct TestListArgs {
+    #[structopt(long, parse(from_os_str))]
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -142,11 +178,9 @@ pub struct UpArgs {
     pub api_port: Option<u16>,
     #[structopt(long)]
     pub k3s_version: Option<String>,
-    #[structopt(long, parse(try_from_str = parse_cni_plugin))]
-    pub cni: Option<CniPlugin>,
     #[structopt(long)]
     pub cilium_version: Option<String>,
-    #[structopt(long = "addon", parse(try_from_str = parse_up_addon_id))]
+    #[structopt(long = "addons", alias = "addon", parse(try_from_str = parse_up_addon_id))]
     pub addons: Vec<String>,
     #[structopt(long)]
     pub keep_failed_runtime: bool,
@@ -160,24 +194,7 @@ pub struct UpArgs {
 
 impl UpArgs {
     pub fn into_cluster_spec(self) -> crate::error::Result<ClusterSpec> {
-        let project_root = default_project_root(self.project_root.clone())?;
-        let config = load_project_config(&project_root)?;
-        let cli_name = self.name.clone();
-        let name = cli_name
-            .clone()
-            .or_else(|| {
-                config
-                    .as_ref()
-                    .and_then(|config| config.cluster.name.clone())
-            })
-            .unwrap_or(default_cluster_name(Some(&project_root))?);
-        let mut spec = ClusterSpec::new(name, project_root);
-        if let Some(config) = &config {
-            config.apply_to_cluster_spec(&mut spec)?;
-        }
-        if let Some(name) = cli_name {
-            spec.name = name;
-        }
+        let mut spec = resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())?;
         if let Some(backend) = self.backend {
             spec.backend = backend;
         }
@@ -215,15 +232,10 @@ impl UpArgs {
         if let Some(k3s_version) = self.k3s_version {
             spec.k3s_version = k3s_version;
         }
-        if let Some(cni) = self.cni {
-            spec.cni_plugin = cni;
-            spec.cni_plugin
-                .apply_component_defaults(&mut spec.component_toggles);
-        }
         if let Some(cilium_version) = self.cilium_version {
             spec.cilium_version = cilium_version;
         }
-        apply_cli_addons(&mut spec, &self.addons)?;
+        apply_requested_addons(&mut spec, &self.addons)?;
         if spec.addons.iter().any(|addon| addon == "lb/metallb") || !spec.metallb.is_empty() {
             spec.metallb.validate()?;
         }
@@ -236,6 +248,30 @@ impl UpArgs {
         spec.enable_rosetta = !self.no_rosetta;
         Ok(spec)
     }
+}
+
+fn resolve_base_cluster_spec(
+    project_root: Option<PathBuf>,
+    cli_name: Option<String>,
+) -> crate::error::Result<ClusterSpec> {
+    let project_root = default_project_root(project_root)?;
+    let config = load_project_config(&project_root)?;
+    let name = cli_name
+        .clone()
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.cluster.name.clone())
+        })
+        .unwrap_or(default_cluster_name(Some(&project_root))?);
+    let mut spec = ClusterSpec::new(name, project_root);
+    if let Some(config) = &config {
+        config.apply_to_cluster_spec(&mut spec)?;
+    }
+    if let Some(name) = cli_name {
+        spec.name = name;
+    }
+    Ok(spec)
 }
 
 #[derive(Debug, StructOpt)]
@@ -252,29 +288,54 @@ pub struct McpTaskRunnerArgs {
     pub exit_path: PathBuf,
 }
 
-fn parse_cni_plugin(value: &str) -> std::result::Result<CniPlugin, String> {
-    CniPlugin::parse(value)
-        .ok_or_else(|| format!("unsupported cni `{value}`; expected one of: none, flannel, cilium"))
-}
-
 fn parse_up_addon_id(value: &str) -> std::result::Result<String, String> {
     match value {
-        "ingress/traefik" | "ingress/kong" | "lb/servicelb" | "lb/metallb" | "storage/longhorn"
-        | "storage/local-path" => Ok(value.to_owned()),
+        "cni/flannel" | "cni/cilium" | "ingress/traefik" | "ingress/kong" | "lb/servicelb"
+        | "lb/metallb" | "storage/longhorn" | "storage/local-path" => Ok(value.to_owned()),
         _ => Err(format!(
-            "unsupported addon `{value}`; expected one of: ingress/traefik, ingress/kong, lb/servicelb, lb/metallb, storage/longhorn, storage/local-path"
+            "unsupported addon `{value}`; expected one of: cni/flannel, cni/cilium, ingress/traefik, ingress/kong, lb/servicelb, lb/metallb, storage/longhorn, storage/local-path"
         )),
     }
 }
 
-fn apply_cli_addons(spec: &mut ClusterSpec, addons: &[String]) -> crate::error::Result<()> {
+pub fn apply_requested_addons(
+    spec: &mut ClusterSpec,
+    addons: &[String],
+) -> crate::error::Result<()> {
+    let mut requested_cni = None;
     for addon in addons {
         let addon = parse_up_addon_id(addon).map_err(crate::error::Error::InvalidArgs)?;
-        if !spec.addons.iter().any(|installed| installed == &addon) {
-            spec.addons.push(addon);
+        match addon.as_str() {
+            "cni/flannel" => {
+                requested_cni = merge_requested_cni(requested_cni, CniPlugin::Flannel)?
+            }
+            "cni/cilium" => requested_cni = merge_requested_cni(requested_cni, CniPlugin::Cilium)?,
+            _ if !spec.addons.iter().any(|installed| installed == &addon) => {
+                spec.addons.push(addon);
+            }
+            _ => {}
         }
     }
+    if let Some(cni) = requested_cni {
+        spec.cni_plugin = cni;
+        spec.cni_plugin
+            .apply_component_defaults(&mut spec.component_toggles);
+    }
     Ok(())
+}
+
+fn merge_requested_cni(
+    existing: Option<CniPlugin>,
+    requested: CniPlugin,
+) -> crate::error::Result<Option<CniPlugin>> {
+    match existing {
+        Some(current) if current != requested => Err(crate::error::Error::InvalidArgs(format!(
+            "conflicting CNI add-ons requested: `{}` and `{}` are mutually exclusive",
+            current.as_str(),
+            requested.as_str()
+        ))),
+        _ => Ok(Some(requested)),
+    }
 }
 
 fn parse_backend_kind(value: &str) -> std::result::Result<BackendKind, String> {
@@ -409,11 +470,9 @@ pub struct BenchArgs {
     pub api_port: Option<u16>,
     #[structopt(long)]
     pub k3s_version: Option<String>,
-    #[structopt(long, parse(try_from_str = parse_cni_plugin))]
-    pub cni: Option<CniPlugin>,
     #[structopt(long)]
     pub cilium_version: Option<String>,
-    #[structopt(long = "addon", parse(try_from_str = parse_up_addon_id))]
+    #[structopt(long = "addons", alias = "addon", parse(try_from_str = parse_up_addon_id))]
     pub addons: Vec<String>,
     #[structopt(long)]
     pub keep_failed_runtime: bool,
@@ -446,7 +505,6 @@ impl BenchArgs {
             network: self.network,
             api_port: self.api_port,
             k3s_version: self.k3s_version,
-            cni: self.cni,
             cilium_version: self.cilium_version,
             addons: self.addons,
             keep_failed_runtime: self.keep_failed_runtime,
@@ -576,6 +634,50 @@ mod tests {
     }
 
     #[test]
+    fn test_run_command_parses_scenario_and_name() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "test",
+            "run",
+            "--scenario",
+            "smoke",
+            "--name",
+            "dev",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Test(args) => match args.command {
+                super::TestCommand::Run(args) => {
+                    assert_eq!(args.scenario, "smoke");
+                    assert_eq!(args.name.as_deref(), Some("dev"));
+                }
+                other => panic!("expected test run command, got {other:?}"),
+            },
+            other => panic!("expected test command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ls_command_parses_project_root() {
+        let cli = Cli::from_iter_safe(["kalisto", "test", "ls", "--project-root", "/tmp/work"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Test(args) => match args.command {
+                super::TestCommand::Ls(args) => {
+                    assert_eq!(
+                        args.project_root,
+                        Some(std::path::PathBuf::from("/tmp/work"))
+                    );
+                }
+                other => panic!("expected test ls command, got {other:?}"),
+            },
+            other => panic!("expected test command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn stats_command_parses_default_lookup_args() {
         let cli = Cli::from_iter_safe(["kalisto", "stats", "--watch", "--interval-secs", "5"])
             .expect("cli should parse");
@@ -591,12 +693,12 @@ mod tests {
     }
 
     #[test]
-    fn up_command_parses_cni_flags() {
+    fn up_command_parses_cni_addon_flags() {
         let cli = Cli::from_iter_safe([
             "kalisto",
             "up",
-            "--cni",
-            "cilium",
+            "--addons",
+            "cni/cilium",
             "--cilium-version",
             "1.19.2",
         ])
@@ -604,7 +706,7 @@ mod tests {
 
         match cli.command {
             Command::Up(args) => {
-                assert_eq!(args.cni, Some(CniPlugin::Cilium));
+                assert_eq!(args.addons, vec!["cni/cilium".to_owned()]);
                 assert_eq!(args.cilium_version.as_deref(), Some("1.19.2"));
             }
             other => panic!("expected up command, got {other:?}"),
@@ -626,11 +728,13 @@ mod tests {
         let cli = Cli::from_iter_safe([
             "kalisto",
             "up",
-            "--addon",
+            "--addons",
+            "cni/flannel",
+            "--addons",
             "lb/metallb",
-            "--addon",
+            "--addons",
             "ingress/traefik",
-            "--addon",
+            "--addons",
             "ingress/kong",
         ])
         .expect("cli should parse");
@@ -640,6 +744,7 @@ mod tests {
                 assert_eq!(
                     args.addons,
                     vec![
+                        "cni/flannel".to_owned(),
                         "lb/metallb".to_owned(),
                         "ingress/traefik".to_owned(),
                         "ingress/kong".to_owned()
@@ -651,8 +756,49 @@ mod tests {
     }
 
     #[test]
+    fn up_command_cni_addon_sets_cluster_cni_without_tracking_it_as_post_boot_addon() {
+        let cli = Cli::from_iter_safe(["kalisto", "up", "--addons", "cni/flannel"]).expect("parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                let spec = args.into_cluster_spec().unwrap();
+                assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
+                assert!(spec.component_toggles.flannel_backend_none);
+                assert!(!spec.addons.iter().any(|addon| addon == "cni/flannel"));
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn up_command_rejects_conflicting_cni_addons() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "up",
+            "--addons",
+            "cni/flannel",
+            "--addons",
+            "cni/cilium",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Command::Up(args) => {
+                let error = args.into_cluster_spec().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("conflicting CNI add-ons requested")
+                );
+            }
+            other => panic!("expected up command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn up_command_rejects_unsupported_addon_flag() {
-        let error = Cli::from_iter_safe(["kalisto", "up", "--addon", "ingress/nginx"]).unwrap_err();
+        let error =
+            Cli::from_iter_safe(["kalisto", "up", "--addons", "ingress/nginx"]).unwrap_err();
         assert!(format!("{error}").contains("unsupported addon `ingress/nginx`"));
     }
 
@@ -762,8 +908,8 @@ enabled = true
             "from-cli",
             "--api-port",
             "18443",
-            "--cni",
-            "flannel",
+            "--addons",
+            "cni/flannel",
         ])
         .expect("cli should parse");
 
@@ -773,6 +919,7 @@ enabled = true
                 assert_eq!(spec.name, "from-cli");
                 assert_eq!(spec.api_port, 18443);
                 assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
+                assert!(spec.component_toggles.flannel_backend_none);
             }
             other => panic!("expected up command, got {other:?}"),
         }
@@ -799,9 +946,9 @@ enabled = true
             "up",
             "--project-root",
             root.to_str().unwrap(),
-            "--addon",
+            "--addons",
             "lb/metallb",
-            "--addon",
+            "--addons",
             "ingress/traefik",
         ])
         .expect("cli should parse");
@@ -820,6 +967,55 @@ enabled = true
                 );
             }
             other => panic!("expected up command, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_run_uses_project_cluster_config() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-cli-test-config-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("kalisto.toml"),
+            r#"
+[cluster]
+name = "from-config"
+backend = "lima"
+
+[[harness.scenarios]]
+name = "smoke"
+
+[[harness.scenarios.probes]]
+type = "command"
+name = "pods"
+command = "kubectl get pods"
+"#,
+        )
+        .unwrap();
+
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "test",
+            "run",
+            "--project-root",
+            root.to_str().unwrap(),
+            "--scenario",
+            "smoke",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Test(args) => match args.command {
+                super::TestCommand::Run(args) => {
+                    let spec = args.into_cluster_spec().unwrap();
+                    assert_eq!(spec.name, "from-config");
+                    assert_eq!(spec.backend, crate::backend::BackendKind::Lima);
+                }
+                other => panic!("expected test run command, got {other:?}"),
+            },
+            other => panic!("expected test command, got {other:?}"),
         }
 
         let _ = fs::remove_dir_all(root);

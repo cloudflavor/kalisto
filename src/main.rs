@@ -9,7 +9,8 @@ use structopt::StructOpt;
 use kalisto::cli::{
     AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
     Command, CompletionsArgs, KubeconfigArgs, MacosLimaArgs, MacosLimaK3sArgs, McpArgs,
-    McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, UpArgs,
+    McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, TestArgs, TestCommand,
+    TestListArgs, TestRunArgs, UpArgs, apply_requested_addons,
 };
 use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
@@ -19,7 +20,10 @@ use kalisto::cluster::manager::{
     scale as cluster_scale, stats as cluster_stats, status as cluster_status, up as cluster_up,
 };
 use kalisto::cluster::state::ClusterState;
+use kalisto::config::load_project_config;
 use kalisto::error::{Error, Result};
+use kalisto::harness::scenario::ScenarioClusterLifecycle;
+use kalisto::harness::{ScenarioConfig, run_scenario};
 use kalisto::k3s::ServerMode as K3sServerMode;
 use kalisto::mcp::{run as run_mcp_server, run_task_runner as run_mcp_task_runner};
 use kalisto::paths::{
@@ -53,6 +57,7 @@ fn real_main() -> Result<()> {
     match cli.command {
         Command::Create(args) => run_create(args),
         Command::Up(args) => run_up(args),
+        Command::Test(args) => run_test(args),
         Command::Mcp(args) => run_mcp(args),
         Command::McpTaskRunner(args) => run_hidden_mcp_task_runner(args),
         Command::Down(args) => run_down(args),
@@ -70,6 +75,13 @@ fn real_main() -> Result<()> {
         Command::Bench(args) => run_bench(args),
         Command::ProbeMacosLima(args) => run_lima_probe(args),
         Command::ProbeMacosLimaK3s(args) => run_lima_k3s_probe(args),
+    }
+}
+
+fn run_test(args: TestArgs) -> Result<()> {
+    match args.command {
+        TestCommand::Run(args) => run_test_run(args),
+        TestCommand::Ls(args) => run_test_list(args),
     }
 }
 
@@ -110,6 +122,121 @@ fn run_up(args: UpArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_test_list(args: TestListArgs) -> Result<()> {
+    let project_root = kalisto::paths::default_project_root(args.project_root)?;
+    let config = load_project_config(&project_root)?.ok_or_else(|| {
+        Error::InvalidArgs(format!(
+            "no kalisto.toml found under {}",
+            project_root.display()
+        ))
+    })?;
+    if config.harness.scenarios.is_empty() {
+        return Err(Error::InvalidArgs(format!(
+            "{} does not define any harness scenarios",
+            project_root.join("kalisto.toml").display()
+        )));
+    }
+
+    for scenario in &config.harness.scenarios {
+        println!(
+            "{}\t{}\t{}\t{}",
+            scenario.name,
+            scenario.namespace,
+            match scenario.cluster_lifecycle {
+                ScenarioClusterLifecycle::Ephemeral => "ephemeral",
+                ScenarioClusterLifecycle::Persistent => "persistent",
+            },
+            describe_scenario(scenario)
+        );
+    }
+    Ok(())
+}
+
+fn run_test_run(args: TestRunArgs) -> Result<()> {
+    let mut spec = args.into_cluster_spec()?;
+    let project_root = spec.workspace_root.clone();
+    let config = load_project_config(&project_root)?.ok_or_else(|| {
+        Error::InvalidArgs(format!(
+            "no kalisto.toml found under {}",
+            project_root.display()
+        ))
+    })?;
+    let scenario = config
+        .harness
+        .scenario(&args.scenario)
+        .cloned()
+        .ok_or_else(|| {
+            Error::InvalidArgs(format!(
+                "harness scenario `{}` was not found in {}",
+                args.scenario,
+                project_root.join("kalisto.toml").display()
+            ))
+        })?;
+
+    apply_harness_cluster_settings(&mut spec, &scenario)?;
+    let lifecycle = scenario.cluster_lifecycle;
+    let cluster_name = spec.name.clone();
+    let outcome = cluster_up(&spec)?;
+    let run_result = run_scenario(&outcome.state, &scenario, &SystemRunner);
+    let report = match run_result {
+        Ok(report) => report,
+        Err(error) => {
+            if should_preserve_cluster_after_scenario_failure(lifecycle) {
+                eprintln!(
+                    "scenario failed; preserving cluster `{}` for inspection",
+                    cluster_name
+                );
+            }
+            return Err(error);
+        }
+    };
+    if should_destroy_cluster_after_scenario_success(lifecycle) {
+        cluster_destroy(&cluster_name)?;
+    }
+
+    println!("scenario: {}", report.scenario);
+    println!("cluster: {}", report.cluster);
+    println!("namespace: {}", report.namespace);
+    println!("manifests applied: {}", report.applied_manifests.len());
+    println!("waits passed: {}", report.waits.len());
+    println!("probes passed: {}", report.probes.len());
+    println!(
+        "cluster lifecycle: {}",
+        match lifecycle {
+            ScenarioClusterLifecycle::Ephemeral => "ephemeral",
+            ScenarioClusterLifecycle::Persistent => "persistent",
+        }
+    );
+    Ok(())
+}
+
+fn should_destroy_cluster_after_scenario_success(lifecycle: ScenarioClusterLifecycle) -> bool {
+    lifecycle == ScenarioClusterLifecycle::Ephemeral
+}
+
+fn should_preserve_cluster_after_scenario_failure(lifecycle: ScenarioClusterLifecycle) -> bool {
+    lifecycle == ScenarioClusterLifecycle::Ephemeral
+}
+
+fn apply_harness_cluster_settings(
+    spec: &mut kalisto::cluster::spec::ClusterSpec,
+    scenario: &ScenarioConfig,
+) -> Result<()> {
+    apply_requested_addons(spec, &scenario.cluster.addons)?;
+    spec.worker_count = scenario.cluster.workers;
+    spec.requested_worker_count = Some(scenario.cluster.workers);
+    spec.server_mode = if scenario.cluster.agentless {
+        K3sServerMode::Agentless
+    } else {
+        K3sServerMode::Standard
+    };
+    if scenario.cluster.agentless {
+        spec.worker_count = 0;
+        spec.requested_worker_count = Some(0);
+    }
+    Ok(())
+}
+
 fn run_down(args: ClusterLookupArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     cluster_down(&name, args.force)?;
@@ -123,6 +250,15 @@ fn run_destroy(args: ClusterLookupArgs) -> Result<()> {
     clear_default_cluster_name_if_matches(&name)?;
     println!("destroyed cluster `{name}`");
     Ok(())
+}
+
+fn describe_scenario(scenario: &ScenarioConfig) -> String {
+    format!(
+        "{} manifest(s), {} wait(s), {} probe(s)",
+        scenario.manifests.len(),
+        scenario.waits.len(),
+        scenario.probes.len()
+    )
 }
 
 fn run_addon(args: AddonArgs) -> Result<()> {
@@ -815,6 +951,8 @@ mod tests {
 
     use super::{
         kubeconfig_export_command, plugin_status, render_conflicts, require_selected_cluster_name,
+        should_destroy_cluster_after_scenario_success,
+        should_preserve_cluster_after_scenario_failure,
     };
 
     #[test]
@@ -853,7 +991,57 @@ mod tests {
         assert!(error.to_string().contains("no default cluster selected"));
     }
 
+    #[test]
+    fn ephemeral_scenarios_destroy_on_success_only() {
+        assert!(should_destroy_cluster_after_scenario_success(
+            super::ScenarioClusterLifecycle::Ephemeral
+        ));
+        assert!(!should_destroy_cluster_after_scenario_success(
+            super::ScenarioClusterLifecycle::Persistent
+        ));
+        assert!(should_preserve_cluster_after_scenario_failure(
+            super::ScenarioClusterLifecycle::Ephemeral
+        ));
+        assert!(!should_preserve_cluster_after_scenario_failure(
+            super::ScenarioClusterLifecycle::Persistent
+        ));
+    }
+
+    #[test]
+    fn harness_cluster_settings_default_to_flannel_and_zero_workers() {
+        let mut spec = kalisto::cluster::spec::ClusterSpec::new(
+            "smoke".to_owned(),
+            PathBuf::from("/tmp/workspace"),
+        );
+        let scenario = super::ScenarioConfig {
+            name: "smoke".to_owned(),
+            namespace: "default".to_owned(),
+            cluster_lifecycle: super::ScenarioClusterLifecycle::Ephemeral,
+            cluster: kalisto::harness::ScenarioClusterConfig::default(),
+            manifests: Vec::new(),
+            waits: Vec::new(),
+            probes: vec![kalisto::harness::ProbeConfig::Command(
+                kalisto::harness::CommandProbeConfig {
+                    name: "pods".to_owned(),
+                    command: "kubectl get pods".to_owned(),
+                },
+            )],
+        };
+
+        super::apply_harness_cluster_settings(&mut spec, &scenario).unwrap();
+
+        assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
+        assert_eq!(spec.worker_count, 0);
+        assert_eq!(spec.requested_worker_count, Some(0));
+        assert_eq!(spec.server_mode, ServerMode::Standard);
+        assert!(spec.component_toggles.flannel_backend_none);
+        assert_eq!(scenario.cluster.addons, vec!["cni/flannel".to_owned()]);
+    }
+
     fn fixture_cluster_state() -> ClusterState {
+        let mut component_toggles = ComponentToggles::default();
+        CniPlugin::None.apply_component_defaults(&mut component_toggles);
+
         ClusterState {
             name: "dev".to_owned(),
             backend: BackendKind::Lima,
@@ -879,7 +1067,7 @@ mod tests {
             addons: Vec::new(),
             metallb: MetalLbConfig::default(),
             server_mode: ServerMode::Standard,
-            component_toggles: ComponentToggles::default(),
+            component_toggles,
             kubeconfig_path: PathBuf::from("kubeconfig.yaml"),
             token_path: PathBuf::from("node-token"),
             nodes: vec![kalisto::cluster::state::NodeState {
