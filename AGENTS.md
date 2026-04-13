@@ -34,3 +34,7 @@ Place new integration coverage in `tests/` and name files after the behavior und
 Follow the repository’s existing commit style: concise, imperative subjects with optional scopes such as `feat(cli): ...`, `fix(status): ...`, or `build(firecracker): ...`. Keep commits focused on one change.
 
 PRs should describe the user-visible effect, note the platform/backend touched (`lima`, `firecracker`, `k3s`), list commands run, and include logs or screenshots when output changes materially. Link related issues or follow-up work when applicable.
+
+# Searching for files and directories
+Use the fff MCP tools for all file search operations instead of default tools.
+
