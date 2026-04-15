@@ -194,6 +194,31 @@ cargo run -- bench \
   --runs 3
 ```
 
+## Build versioning
+
+`cargo build` generates a build version used by both `kalisto --version` and MCP
+`serverInfo.version`.
+
+Version rules:
+
+- exact clean release tag `vX.Y.Z` at `HEAD` -> `X.Y.Z`
+- off-tag or dirty builds with a nearest release tag `vX.Y.Z` ->
+  `X.Y.(Z+1)-dev.<commits_since_vX.Y.Z>+g<short_sha>[.dirty]`
+- repositories without a matching release tag ->
+  `<Cargo.toml version>-dev.<commit_count>+g<short_sha>[.dirty]`
+
+Examples:
+
+- on tag `v1.4.2` (clean): `1.4.2`
+- 7 commits after `v1.4.2`: `1.4.3-dev.7+gabc1234def56`
+- same commit with tracked local edits: `1.4.3-dev.7+gabc1234def56.dirty`
+
+To force a specific version string in CI or local builds:
+
+```bash
+KALISTO_BUILD_VERSION=1.4.3-rc.1+build42 cargo build
+```
+
 ## Lima image pipeline
 
 Kalisto uses a two-stage image flow:
