@@ -512,7 +512,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "kalisto",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::version::build_version()
             },
             "instructions": concat!(
                 "Kalisto exposes cluster lifecycle, inspection, add-on, bench, and probe operations over MCP stdio. ",

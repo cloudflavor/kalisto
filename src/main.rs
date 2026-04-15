@@ -52,7 +52,10 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<()> {
-    let cli = Cli::from_args();
+    let matches = Cli::clap()
+        .version(kalisto::version::build_version())
+        .get_matches();
+    let cli = Cli::from_clap(&matches);
     telemetry::init(cli.log_level)?;
     match cli.command {
         Command::Create(args) => run_create(args),

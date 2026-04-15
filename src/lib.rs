@@ -16,3 +16,4 @@ pub mod shell;
 pub mod telemetry;
 #[cfg(test)]
 pub mod test_support;
+pub mod version;
