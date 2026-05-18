@@ -94,7 +94,7 @@ impl ClusterSpec {
             firecracker_kernel: None,
             firecracker_rootfs: None,
             api_port: 16443,
-            worker_count: 1,
+            worker_count: 0,
             requested_worker_count: None,
             control_plane_resources: NodeResources {
                 cpus: DEFAULT_CONTROL_PLANE_CPUS,
@@ -359,14 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn default_cluster_shape_is_single_worker_multinode() {
+    fn default_cluster_shape_is_control_plane_only() {
         let spec = ClusterSpec::new(
             "kalisto".to_owned(),
             std::path::PathBuf::from("/tmp/kalisto-workspace"),
         );
 
         assert_eq!(spec.backend, BackendKind::host_default());
-        assert_eq!(spec.worker_count, 1);
+        assert_eq!(spec.worker_count, 0);
         assert_eq!(spec.cni_plugin, CniPlugin::None);
         assert!(spec.component_toggles.flannel_backend_none);
         assert_eq!(spec.cilium_version, DEFAULT_CILIUM_VERSION);

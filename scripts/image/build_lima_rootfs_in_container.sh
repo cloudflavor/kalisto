@@ -65,11 +65,6 @@ network:
         name: "en*"
       dhcp4: true
       dhcp6: true
-    default-eth:
-      match:
-        name: "eth*"
-      dhcp4: true
-      dhcp6: true
 EOF
 
 cat > /etc/systemd/system/ssh.service.d/10-kalisto-hostkeys.conf <<'EOF'

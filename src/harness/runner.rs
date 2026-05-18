@@ -344,19 +344,21 @@ fn wait_for_node_ready(
     runtime_root: &Path,
     guest_kubeconfig: &Path,
 ) -> Result<()> {
-    // Wait for node to be ready - first wait for node object to exist
-    let check_node = format!("kubectl get nodes -o name | grep -q 'node/'",);
+    // Wait for node to be ready - first wait for node object to exist.
+    // Keep resource parsing in Rust to avoid depending on extra guest shell tools.
+    let check_node = "kubectl get nodes -o name";
     for _ in 0..60 {
-        if run_guest_kubectl_script(
+        if run_guest_kubectl_script_capture(
             backend,
             runner,
             instance_name,
             runtime_root,
             guest_kubeconfig,
             "default",
-            &check_node,
+            check_node,
         )
-        .is_ok()
+        .map(|output| has_node_resource(&output))
+        .unwrap_or(false)
         {
             break;
         }
@@ -365,9 +367,9 @@ fn wait_for_node_ready(
 
     // Wait for CNI (flannel) daemonset to be ready - this is required for node scheduling
     eprintln!("harness: waiting for CNI to be ready");
-    let wait_cni = format!(
-        "kubectl wait --for=condition=ready pod -n kube-flannel -l app=flannel --timeout=300s || true",
-    );
+    let wait_cni =
+        "kubectl wait --for=condition=ready pod -n kube-flannel -l app=flannel --timeout=300s || true"
+            .to_string();
     let _ = run_guest_kubectl_script(
         backend,
         runner,
@@ -379,7 +381,7 @@ fn wait_for_node_ready(
     );
 
     // Then wait for node Ready condition
-    let command = format!("kubectl wait --for=condition=Ready node --all --timeout=300s",);
+    let command = "kubectl wait --for=condition=Ready node --all --timeout=300s".to_string();
     run_guest_kubectl_script(
         backend,
         runner,
@@ -452,6 +454,13 @@ fn run_guest_kubectl_script_capture(
         text.push_str(output.stderr.trim_end());
     }
     Ok(text)
+}
+
+fn has_node_resource(output: &str) -> bool {
+    output
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with("node/"))
 }
 
 fn kubectl_script(guest_kubeconfig: &Path, namespace: &str, script: &str) -> String {
@@ -542,7 +551,7 @@ mod tests {
 
     use crate::harness::scenario::WaitConfig;
 
-    use super::{failure_diagnostics_script, heredoc_marker, kubectl_script};
+    use super::{failure_diagnostics_script, has_node_resource, heredoc_marker, kubectl_script};
 
     #[test]
     fn kubectl_script_exports_expected_environment() {
@@ -558,6 +567,14 @@ mod tests {
         assert!(script.contains("export KALISTO_NAMESPACE='demo'"));
         assert!(script.contains("kubectl() { /usr/local/bin/k3s kubectl \"$@\"; }"));
         assert!(script.contains("kubectl get pods"));
+    }
+
+    #[test]
+    fn has_node_resource_detects_node_lines() {
+        assert!(has_node_resource("node/kalisto-cp"));
+        assert!(has_node_resource("warning: noisy output\nnode/kalisto-cp"));
+        assert!(!has_node_resource("No resources found"));
+        assert!(!has_node_resource(""));
     }
 
     #[test]
