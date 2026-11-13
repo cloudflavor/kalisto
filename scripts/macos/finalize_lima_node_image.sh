@@ -59,7 +59,7 @@ limactl start \
 
 deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
 while :; do
-  if limactl shell --tty=false "${INSTANCE_NAME}" sudo sh -lc "test -f /etc/kalisto/node-image.env && test -x /usr/local/bin/k3s && /usr/local/bin/k3s --version >/dev/null 2>&1" >/dev/null 2>&1; then
+  if limactl shell --tty=false "${INSTANCE_NAME}" sudo sh -lc "test -f /etc/kalisto/node-image.env && test -x /usr/local/bin/k3s && /usr/local/bin/k3s --version >/dev/null 2>&1 && test -S /run/dbus/system_bus_socket && command -v rsync >/dev/null && command -v lsb_release >/dev/null && command -v resolvectl >/dev/null" >/dev/null 2>&1; then
     break
   fi
   if [ "$(date +%s)" -ge "${deadline}" ]; then
@@ -80,6 +80,9 @@ limactl shell --tty=false "${INSTANCE_NAME}" sudo sh -lc '
   journalctl --rotate >/dev/null 2>&1 || true
   journalctl --vacuum-time=1s >/dev/null 2>&1 || true
   fstrim -av >/dev/null 2>&1 || true
+  # A finalized disk is a template, not the finalization VM identity.
+  cloud-init clean --logs --seed --machine-id
+  rm -f /etc/netplan/50-cloud-init.yaml /etc/ssh/ssh_host_*
 '
 
 INSTANCE_DIR="$(limactl list --format '{{ .Dir }}' "${INSTANCE_NAME}" | tr -d '\r')"

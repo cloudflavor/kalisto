@@ -110,6 +110,21 @@ else
   ROOTFS_SOURCE_DIR="${ROOTFS_DIR}"
 fi
 
+for REQUIRED_GUEST_TOOL in dbus-daemon rsync lsb_release resolvectl; do
+  if [ ! -x "${ROOTFS_SOURCE_DIR}/usr/bin/${REQUIRED_GUEST_TOOL}" ]; then
+    echo "node rootfs is missing ${REQUIRED_GUEST_TOOL}; rebuild the rootfs before assembling the node image" >&2
+    exit 1
+  fi
+done
+
+# BuildKit owns /etc/resolv.conf during RUN. Install the guest resolver link
+# only after rootfs export, before populating the ext4 image.
+ln -sfn /run/systemd/resolve/stub-resolv.conf "${ROOTFS_SOURCE_DIR}/etc/resolv.conf"
+rm -f "${ROOTFS_SOURCE_DIR}/etc/cloud/cloud.cfg.d/99_kalisto_network.cfg" \
+  "${ROOTFS_SOURCE_DIR}/etc/systemd/network/10-kalisto-dhcp.network" \
+  "${ROOTFS_SOURCE_DIR}/etc/netplan/10-kalisto-dhcp.yaml" \
+  "${ROOTFS_SOURCE_DIR}/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service"
+
 SPECIAL_PERMISSIONS_MANIFEST="${ROOTFS_SOURCE_DIR}/etc/kalisto/rootfs-special-permissions.manifest"
 if [ -f "${SPECIAL_PERMISSIONS_MANIFEST}" ]; then
   while read -r MODE OWNER GROUP ABSOLUTE_PATH; do
