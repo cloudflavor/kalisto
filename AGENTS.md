@@ -6,6 +6,18 @@ Kalisto is a Rust CLI and library. `src/main.rs` is the CLI entrypoint, and `src
 
 Integration tests live in `tests/`. Artifact builders and release helpers live in `scripts/macos/`, `scripts/linux/`, and `scripts/image/`. Runtime and example artifacts are stored under `artifacts/`; longer-form notes and prerequisites live in `docs/` and `notes/`.
 
+## Portable installation contract
+
+- Installing the Kalisto binary must be sufficient: `kalisto pull` prepares required images and managed runtime tools, then `kalisto up` works outside this checkout.
+- Do not require Homebrew, Docker, host sudo, repository scripts, manually installed Helm/Crane/Lima, custom templates, or machine-specific environment overrides for the standard macOS flow.
+- Keep paths relative to the current user's configuration/data directories. Never ship this Mac's absolute build paths as runtime defaults.
+- Startup after preparation must create fresh VMs and reach the requested fully functional three-node profile within 60 seconds, including authenticated API, CNI rollouts, worker DNS, and cross-node traffic. No downloads during `up`.
+- Preserve explicit CNI selection; do not silently enable Flannel to satisfy the budget.
+
+## macOS Storage
+
+On this Mac, keep Rust compilation, node-image builds, build outputs, caches, and large build temporaries under `/Volumes/Builds/runner/`. Verify the external volume is mounted and preserve the checkout's external `target` and `artifacts` symlinks. Linux VM runtime disks may use the local SSD (`~/.lima`) for boot performance; moving build output onto the internal SSD is not an allowed optimization. Builds and validation remain CI-only unless explicitly authorized locally.
+
 ## Build, Test, and Development Commands
 
 - `cargo build` — compile the library and CLI.
@@ -20,6 +32,7 @@ Live infrastructure tests are opt-in and require host prerequisites:
 
 - `KALISTO_LIVE_LIMA_TESTS=1 cargo test --test macos_lima_live -- --nocapture`
 - `KALISTO_LIVE_LIMA_K3S_TESTS=1 cargo test --test macos_lima_k3s_live -- --nocapture`
+- `KALISTO_LIVE_THREE_NODE_BOOT_BUDGET=1 cargo test --release --test macos_three_node_boot_budget -- --nocapture` — actual cold CLI startup, three Ready nodes, authenticated host API, and DNS probes from both workers within 60 seconds.
 
 ## Coding Style & Naming Conventions
 
