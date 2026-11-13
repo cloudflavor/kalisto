@@ -8,14 +8,14 @@ use structopt::StructOpt;
 
 use kalisto::cli::{
     AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
-    Command, CompletionsArgs, KubeconfigArgs, MacosLimaArgs, MacosLimaK3sArgs, McpArgs,
-    McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, TestArgs, TestCommand,
-    TestListArgs, TestRunArgs, UpArgs, apply_requested_addons,
+    Command, CompletionsArgs, DestroyArgs, KubeconfigArgs, MacosLimaArgs, MacosLimaK3sArgs,
+    McpArgs, McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, TestArgs,
+    TestCommand, TestListArgs, TestRunArgs, UpArgs, apply_requested_addons,
 };
 use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
-    benchmark as cluster_benchmark, create as cluster_create, destroy as cluster_destroy,
-    down as cluster_down, install_addon as cluster_install_addon,
+    benchmark as cluster_benchmark, create as cluster_create, defined_cluster_names,
+    destroy as cluster_destroy, down as cluster_down, install_addon as cluster_install_addon,
     kubeconfig_path as cluster_kubeconfig_path, list as cluster_list, logs as cluster_logs,
     scale as cluster_scale, stats as cluster_stats, status as cluster_status, up as cluster_up,
 };
@@ -247,12 +247,45 @@ fn run_down(args: ClusterLookupArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_destroy(args: ClusterLookupArgs) -> Result<()> {
-    let name = require_selected_cluster_name(args.cluster_name()?)?;
-    cluster_destroy(&name)?;
-    clear_default_cluster_name_if_matches(&name)?;
-    println!("destroyed cluster `{name}`");
-    Ok(())
+fn run_destroy(args: DestroyArgs) -> Result<()> {
+    let names = if args.all {
+        defined_cluster_names()?
+    } else {
+        match args.cluster_names()? {
+            Some(names) => names,
+            None => vec![require_selected_cluster_name(None)?],
+        }
+    };
+    if names.is_empty() {
+        println!("no clusters");
+        return Ok(());
+    }
+    destroy_cluster_batch(&names, |name| {
+        cluster_destroy(name)?;
+        clear_default_cluster_name_if_matches(name)
+    })
+}
+
+fn destroy_cluster_batch(
+    names: &[String],
+    mut destroy: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for name in names {
+        match destroy(name) {
+            Ok(()) => println!("destroyed cluster `{name}`"),
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs(format!(
+            "failed to destroy {} cluster(s): {}",
+            failures.len(),
+            failures.join("; "),
+        )))
+    }
 }
 
 fn describe_scenario(scenario: &ScenarioConfig) -> String {
@@ -957,6 +990,24 @@ mod tests {
         should_destroy_cluster_after_scenario_success,
         should_preserve_cluster_after_scenario_failure,
     };
+
+    #[test]
+    fn destroy_batch_attempts_every_name_and_reports_failures() {
+        let names = vec!["one".to_owned(), "broken".to_owned(), "two".to_owned()];
+        let mut attempted = Vec::new();
+        let result = super::destroy_cluster_batch(&names, |name| {
+            attempted.push(name.to_owned());
+            if name == "broken" {
+                Err(kalisto::error::Error::InvalidArgs(
+                    "backend unavailable".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempted, names);
+        assert!(result.unwrap_err().to_string().contains("broken"));
+    }
 
     #[test]
     fn plugin_status_marks_selected_cni_as_installed() {

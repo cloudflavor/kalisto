@@ -220,7 +220,7 @@ pub fn stop_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<
 
 pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "deleting lima instance");
-    runner.run(
+    match runner.run(
         "limactl",
         &[
             "-y".into(),
@@ -228,8 +228,11 @@ pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Resul
             "--force".into(),
             instance_name.to_owned(),
         ],
-    )?;
-    Ok(())
+    ) {
+        Ok(_) => Ok(()),
+        Err(Error::CommandFailed { stderr, .. }) if is_missing_instance_error(&stderr) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn query_instance_status(runner: &dyn CommandRunner, instance_name: &str) -> Result<String> {

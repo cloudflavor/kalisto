@@ -231,10 +231,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
     let state = ClusterState::load(&state_root)?;
     if cluster_has_running_nodes(runner, &state)? {
-        return Err(Error::InvalidArgs(format!(
-            "cluster `{}` is already running",
-            state.name
-        )));
+        info!(cluster = %state.name, "resuming existing cluster bring-up");
     }
     let resolved_spec = resolve_up_spec(&state, spec);
     let spec = &resolved_spec;
@@ -763,7 +760,18 @@ fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) ->
         firecracker_rootfs: state.firecracker_rootfs.clone(),
         stream_vm_logs: false,
     };
-    delete_instances(backend, runner, &state.nodes);
+    let mut failures = Vec::new();
+    for node in state.nodes.iter().rev() {
+        if let Err(error) = backend.delete_instance(runner, &node.name, &node.artifacts_root) {
+            failures.push(format!("{}: {error}", node.name));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{name}` definition retained because node removal failed: {}",
+            failures.join("; "),
+        )));
+    }
     let instance_names = state
         .nodes
         .iter()
@@ -796,6 +804,34 @@ pub fn logs(name: &str, node_name: &str) -> Result<NodeLogs> {
 pub fn list() -> Result<Vec<ClusterStatus>> {
     let runner = SystemRunner;
     list_with_runner(&runner)
+}
+
+pub fn defined_cluster_names() -> Result<Vec<String>> {
+    defined_cluster_names_at_root(&ClusterSpec::clusters_root_for()?)
+}
+
+fn defined_cluster_names_at_root(root: &Path) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("read_dir")(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_error("read_dir"))?;
+        let path = entry.path();
+        if path.is_dir() && ClusterState::state_file(&path).is_file() {
+            let name = entry.file_name().into_string().map_err(|_| {
+                Error::InvalidArgs(format!(
+                    "cluster directory is not UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn logs_at_root(state_root: &Path, node_name: &str) -> Result<NodeLogs> {
@@ -2007,7 +2043,11 @@ fn rollback_failed_up(
             "cluster bring-up failed; preserving cluster definition"
         );
     }
-    cleanup_instances(backend, runner, started_instances);
+    // A retry may be resuming existing VMs with user data. Failed bring-up
+    // must never delete their disks; only an explicit destroy may do that.
+    if !keep_failed_runtime {
+        stop_instances(backend, runner, started_instances, true);
+    }
     error
 }
 
@@ -2287,6 +2327,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_node_deletion_preserves_cluster_definition() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-destroy-failed-{}", std::process::id()));
+        let state_root = root.join("workspace/.kalisto/clusters/broken");
+        save_state(
+            &state_root,
+            "broken",
+            vec![("cp", NodeRole::ControlPlane), ("worker", NodeRole::Worker)],
+        );
+        let runner = FakeRunner::with_invocation_failure_containing([], "delete");
+        assert!(super::destroy_at_root(&state_root, "broken", &runner).is_err());
+        assert!(ClusterState::state_file(&state_root).exists());
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(
+            invocations
+                .iter()
+                .filter(|(_, args)| args.iter().any(|arg| arg == "delete"))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn defined_names_include_saved_clusters_without_probing_backends() {
+        let root = std::env::temp_dir().join(format!("kalisto-defined-{}", std::process::id()));
+        let clusters = root.join("workspace/.kalisto/clusters");
+        save_state(&clusters.join("second"), "second", vec![]);
+        save_state(&clusters.join("first"), "first", vec![]);
+        fs::create_dir_all(clusters.join("not-a-cluster")).unwrap();
+        assert_eq!(
+            super::defined_cluster_names_at_root(&clusters).unwrap(),
+            vec!["first".to_owned(), "second".to_owned()],
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn defined_names_are_empty_when_no_clusters_directory_exists() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-no-definitions-{}", std::process::id()));
+        assert!(
+            super::defined_cluster_names_at_root(&root)
+                .unwrap()
+                .is_empty()
+        );
+    }
     #[test]
     fn list_returns_sorted_clusters() {
         let root = std::env::temp_dir().join(format!("kalisto-list-{}", std::process::id()));
