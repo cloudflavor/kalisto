@@ -25,6 +25,8 @@ pub struct Cli {
 #[structopt(rename_all = "kebab")]
 pub enum Command {
     Create(UpArgs),
+    /// Cache Lima node images, K3s and Cilium assets before starting fresh VMs.
+    Pull(UpArgs),
     Up(UpArgs),
     Test(TestArgs),
     Mcp(McpArgs),
@@ -246,7 +248,9 @@ impl UpArgs {
             spec.server_mode = ServerMode::Agentless;
             spec.worker_count = 0;
         }
-        spec.enable_rosetta = !self.no_rosetta;
+        if self.no_rosetta {
+            spec.enable_rosetta = false;
+        }
         Ok(spec)
     }
 }
@@ -596,6 +600,28 @@ mod tests {
     use crate::cluster::spec::ImageArch;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn pull_accepts_the_same_cluster_asset_selection_as_up() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "pull",
+            "--backend",
+            "lima",
+            "--arch",
+            "arm64",
+            "--addons",
+            "cni/cilium",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Pull(args) => {
+                assert_eq!(args.image_arch, Some(ImageArch::Aarch64));
+                assert_eq!(args.addons, vec!["cni/cilium"]);
+            }
+            other => panic!("expected pull command, got {other:?}"),
+        }
+    }
 
     #[test]
     fn up_flags_parse_runtime_debug_options() {

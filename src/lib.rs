@@ -8,10 +8,14 @@ pub mod harness;
 pub mod k3s;
 pub mod lima_k3s;
 pub mod mcp;
+mod native_image;
 pub mod paths;
 pub mod plugin;
 pub mod probe;
 pub mod process;
+pub mod pull;
+mod qcow;
+pub mod runtime;
 pub mod shell;
 pub mod telemetry;
 #[cfg(test)]

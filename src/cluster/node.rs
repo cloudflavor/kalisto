@@ -152,7 +152,7 @@ pub fn start_node_instance(
     cpus: u8,
     memory_gib: u8,
 ) -> Result<Output> {
-    backend.start_instance(
+    let output = backend.start_instance(
         runner,
         base_config,
         &InstanceConfig {
@@ -162,7 +162,11 @@ pub fn start_node_instance(
             cpus,
             memory_gib,
         },
-    )
+    )?;
+    if let Some(assets) = &base_config.boot_assets_root {
+        assets.stage_node(backend, runner, node)?;
+    }
+    Ok(output)
 }
 
 pub fn start_worker_instances(
@@ -569,6 +573,7 @@ mod tests {
                 network: "lima:user-v2".to_owned(),
                 firecracker_kernel: None,
                 firecracker_rootfs: None,
+                boot_assets_root: None,
                 stream_vm_logs: false,
             },
             &[],

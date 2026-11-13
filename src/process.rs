@@ -21,6 +21,15 @@ pub trait CommandRunner {
         self.run(program, args)
     }
 
+    fn run_with_env(
+        &self,
+        program: &str,
+        args: &[String],
+        _env: &[(&str, &Path)],
+    ) -> Result<Output> {
+        self.run(program, args)
+    }
+
     fn system_runner(&self) -> Option<SystemRunner> {
         None
     }
@@ -31,11 +40,20 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<Output> {
-        run_command(program, args, false)
+        run_command(program, args, false, &[])
     }
 
     fn run_live(&self, program: &str, args: &[String]) -> Result<Output> {
-        run_command(program, args, raw_streams_enabled())
+        run_command(program, args, raw_streams_enabled(), &[])
+    }
+
+    fn run_with_env(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(&str, &Path)],
+    ) -> Result<Output> {
+        run_command(program, args, raw_streams_enabled(), env)
     }
 
     fn system_runner(&self) -> Option<SystemRunner> {
@@ -51,9 +69,19 @@ pub fn ensure_path_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn run_command(program: &str, args: &[String], live: bool) -> Result<Output> {
-    let mut command = Command::new(program);
+fn run_command(
+    program: &str,
+    args: &[String],
+    live: bool,
+    env: &[(&str, &Path)],
+) -> Result<Output> {
+    let executable = crate::runtime::program(program);
+    let mut command = Command::new(executable.as_deref().unwrap_or_else(|| Path::new(program)));
     command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    crate::runtime::configure(&mut command, program)?;
 
     let output = if live {
         command

@@ -103,6 +103,16 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             println!("created cluster definition");
             Ok(())
         }
+        "clusters.pull" => {
+            let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
+            let up = lifecycle
+                .into_up_args(manifest.default_project_root.clone())
+                .map_err(jsonrpc_to_error)?;
+            let assets = crate::pull::prepare(&up.into_cluster_spec()?)?;
+            println!("prepared assets: {}", assets.root.display());
+            println!("probe image: {}", assets.probe_image());
+            Ok(())
+        }
         "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
             let up = lifecycle
@@ -291,7 +301,7 @@ fn task_manifest_for_record(record: &TaskRecord) -> Result<TaskRunnerManifest> {
 
 fn task_cluster_name(manifest: &TaskRunnerManifest) -> Result<Option<String>> {
     match manifest.tool_name.as_str() {
-        "clusters.create" | "clusters.up" => {
+        "clusters.create" | "clusters.pull" | "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
             let args = lifecycle
                 .into_up_args(manifest.default_project_root.clone())
@@ -1312,8 +1322,13 @@ const TOOLS: &[ToolSpec] = &[
         task_support: TaskSupport::Required,
     },
     ToolSpec {
+        name: "clusters.pull",
+        description: "Prepare managed Lima tools, a sanitized node image, K3s and optional Cilium assets. May use a temporary OS builder VM, but creates no cluster VMs or cluster state. Match the lifecycle selection used for clusters.up.",
+        task_support: TaskSupport::Required,
+    },
+    ToolSpec {
         name: "clusters.up",
-        description: "Create the cluster if needed and boot the control-plane and worker nodes. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
+        description: "Create the cluster if needed and boot the control-plane and worker nodes. First prepare matching assets with clusters.pull. Default CNI is none; select addons [\"cni/cilium\"] for pod networking. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
         task_support: TaskSupport::Required,
     },
     ToolSpec {
@@ -1430,7 +1445,7 @@ fn input_schema(tool_name: &str) -> Value {
             "required": ["name", "workers"],
             "additionalProperties": false
         }),
-        "clusters.create" | "clusters.up" => lifecycle_schema(),
+        "clusters.create" | "clusters.pull" | "clusters.up" => lifecycle_schema(),
         "addons.list" => json!({
             "type": "object",
             "properties": {
@@ -2242,14 +2257,17 @@ fn task_command(
     let program = executable.display().to_string();
     let mut args = Vec::new();
     match tool_name {
-        "clusters.create" | "clusters.up" => {
+        "clusters.create" | "clusters.pull" | "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_tool_args(arguments.clone())?;
             let up = lifecycle.into_up_args(default_project_root)?;
-            args.push(if tool_name == "clusters.create" {
-                "create".to_owned()
-            } else {
-                "up".to_owned()
-            });
+            args.push(
+                match tool_name {
+                    "clusters.create" => "create",
+                    "clusters.pull" => "pull",
+                    _ => "up",
+                }
+                .to_owned(),
+            );
             append_up_args(&mut args, &up);
         }
         "clusters.down" => {
@@ -2515,6 +2533,17 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
                 json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
+        "clusters.pull" => {
+            let values = parse_key_value_lines(&stdout);
+            success_tool_result(
+                "Prepared boot assets.".to_owned(),
+                json!({
+                    "assetsRoot": values.get("prepared assets"),
+                    "probeImage": values.get("probe image"),
+                    "stdout": stdout, "stderr": stderr,
+                }),
+            )
+        }
         "clusters.up" => parse_up_result(&stdout).unwrap_or_else(|| {
             success_tool_result(
                 format!("Brought cluster up for task `{task_id}`."),
@@ -2950,6 +2979,23 @@ mod tests {
         linux_firecracker_sudo_guidance_from_args, parse_tool_args, task_command, tool_by_name,
         tool_definitions,
     };
+
+    #[test]
+    fn pull_tool_requires_a_task_and_reuses_the_lifecycle_cli_flags() {
+        assert!(matches!(
+            tool_by_name("clusters.pull").unwrap().task_support,
+            TaskSupport::Required
+        ));
+        let (_, args) = task_command(
+            "clusters.pull",
+            &json!({"addons": ["cni/cilium"], "workers": 2}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("pull"));
+        let cli = Cli::from_iter_safe(std::iter::once("kalisto".to_owned()).chain(args)).unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
+    }
 
     fn test_server() -> Arc<McpServer> {
         let _guard = env_lock();

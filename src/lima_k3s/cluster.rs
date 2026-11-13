@@ -94,6 +94,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
         network: effective_network(config),
         firecracker_kernel: None,
         firecracker_rootfs: None,
+        boot_assets_root: None,
         stream_vm_logs: false,
     };
 

@@ -104,7 +104,7 @@ impl ClusterSpec {
                 cpus: DEFAULT_WORKER_CPUS,
                 memory_gib: DEFAULT_WORKER_MEMORY_GIB,
             },
-            enable_rosetta: true,
+            enable_rosetta: false,
             network: default_network(backend),
             k3s_version: DEFAULT_K3S_VERSION.to_owned(),
             cni_plugin,
@@ -164,12 +164,10 @@ impl ClusterSpec {
             .join("k3s_server_probe.sh")
     }
 
-    pub fn runtime_root_for(workspace_root: &Path, name: &str) -> PathBuf {
-        workspace_root
-            .join("target")
-            .join("kalisto")
-            .join("clusters")
-            .join(name)
+    pub fn runtime_root_for(_workspace_root: &Path, name: &str) -> PathBuf {
+        Self::state_root_for(name)
+            .expect("data root should be resolvable")
+            .join("runtime")
     }
 }
 

@@ -59,6 +59,7 @@ fn real_main() -> Result<()> {
     telemetry::init(cli.log_level)?;
     match cli.command {
         Command::Create(args) => run_create(args),
+        Command::Pull(args) => run_pull(args),
         Command::Up(args) => run_up(args),
         Command::Test(args) => run_test(args),
         Command::Mcp(args) => run_mcp(args),
@@ -108,6 +109,14 @@ fn run_create(args: UpArgs) -> Result<()> {
     println!("state root: {}", state_root.display());
     println!("runtime root: {}", spec.runtime_root().display());
     println!("created cluster definition");
+    Ok(())
+}
+
+fn run_pull(args: UpArgs) -> Result<()> {
+    let spec = args.into_cluster_spec()?;
+    let assets = kalisto::pull::prepare(&spec)?;
+    println!("prepared assets: {}", assets.root.display());
+    println!("probe image: {}", assets.probe_image());
     Ok(())
 }
 
