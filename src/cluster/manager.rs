@@ -148,7 +148,11 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
     ));
     let resolved_spec = resolve_cluster_spec(spec, runner)?;
     let state_root = ClusterSpec::state_root_for(&resolved_spec.name)?;
+    let _operation = crate::operation::lock(&state_root)?;
     let state_file = ClusterState::state_file(&state_root);
+    if state_root.join("archive-import-incomplete").exists() && !state_file.exists() {
+        return Err(Error::InvalidArgs("interrupted archive import owns this destination; inspect it before retrying, do not overwrite".into()));
+    }
     if state_file.exists() {
         return Err(Error::InvalidArgs(format!(
             "cluster `{}` already exists at {}",
@@ -236,6 +240,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
         create_with_runner(spec, runner)?;
     }
+    let _operation = crate::operation::lock(&state_root)?;
     let state = ClusterState::load(&state_root)?;
     if cluster_has_running_nodes(runner, &state)? {
         info!(cluster = %state.name, "resuming existing cluster bring-up");
@@ -599,6 +604,26 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
+    if state_root.join("archive/assets/manifest.json").is_file()
+        && let Err(error) = crate::archive::wait_for_fresh_nodes(
+            backend,
+            runner,
+            &control_plane,
+            &nodes,
+            &control_plane_guest_kubeconfig,
+        )
+    {
+        return Err(rollback_failed_up(
+            backend,
+            runner,
+            &started_instances,
+            &state_root,
+            &runtime_root,
+            spec.keep_failed_runtime,
+            error,
+        ));
+    }
+
     let persisted_kubeconfig = state_root.join("kubeconfig.yaml");
     let persisted_token = state_root.join("node-token");
     persist_kubeconfig(
@@ -866,6 +891,7 @@ pub fn install_addon(name: &str, addon: &str) -> Result<AddonInstallOutcome> {
 pub fn down_with_runner(name: &str, force: bool, runner: &dyn CommandRunner) -> Result<()> {
     info!(cluster = %name, force, "starting cluster teardown");
     let state_root = require_cluster_state_root(name)?;
+    let _operation = crate::operation::lock(&state_root)?;
     down_at_root(&state_root, name, force, runner)
 }
 
@@ -885,6 +911,7 @@ fn down_at_root(
 pub fn destroy_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<()> {
     info!(cluster = %name, "starting cluster removal");
     let state_root = require_cluster_state_root(name)?;
+    let _operation = crate::operation::lock(&state_root)?;
     destroy_at_root(&state_root, name, runner)
 }
 
@@ -1010,6 +1037,7 @@ pub fn scale_with_runner(
     runner: &dyn CommandRunner,
 ) -> Result<ScaleOutcome> {
     let state_root = require_cluster_state_root(name)?;
+    let _operation = crate::operation::lock(&state_root)?;
     scale_at_root(&state_root, name, workers, runner)
 }
 
@@ -1019,6 +1047,7 @@ pub fn install_addon_with_runner(
     runner: &dyn CommandRunner,
 ) -> Result<AddonInstallOutcome> {
     let state_root = require_cluster_state_root(name)?;
+    let _operation = crate::operation::lock(&state_root)?;
     install_addon_at_root(&state_root, name, addon, runner)
 }
 

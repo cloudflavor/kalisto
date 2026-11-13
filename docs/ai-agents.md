@@ -137,7 +137,8 @@ Discover schemas through `tools/list`; lifecycle arguments use camelCase, such a
 `projectRoot`, `apiPort`, and `k3sVersion`.
 
 - **Task-required:** `clusters.create`, `clusters.pull`, `clusters.up`, `clusters.down`,
-  `clusters.destroy`, `clusters.scale`, `workloads.apply`, `addons.install`, `bench.run`,
+  `clusters.destroy`, `clusters.scale`, `clusters.export`, `clusters.import`,
+  `workloads.apply`, `addons.install`, `bench.run`,
   `probes.macos.lima`, `probes.macos.lima.k3s`.
 - **Read-only, task augmentation forbidden:** `clusters.list`, `clusters.status`,
   `clusters.stats`, `clusters.state`, `clusters.kubeconfig`, `clusters.logs`, `addons.list`.
@@ -153,6 +154,16 @@ cluster's K3s release against the cluster's kubeconfig, so host kubectl is no
 longer required. The managed binary is fetched on first use, not during `up`.
 
 Implementation references: [MCP server](../src/mcp.rs) and [CLI arguments](../src/cli.rs).
+
+Cold archives are also available through `clusters.export` (`name`, `output`,
+`stop`, optional `recipients` or `passphraseFile`) and `clusters.import` (`input`,
+`apiPort`, `maxBytes`, optional `identityFiles` or `passphraseFile`). Use native age
+public recipients or private files on the MCP host, never inline passwords/private
+keys. Malformed/inline-secret arguments are rejected before task persistence.
+No encryption flags leaves an unencrypted archive. They preserve identity,
+refuse overwrites, contain secrets, and leave nodes stopped. These tasks are not
+cancellable during copying/publication. Follow [archive safety rules](cluster-archives.md);
+never infer permission to stop a running cluster or delete the original to make room.
 
 ## Suggested skill / AGENTS checklist
 

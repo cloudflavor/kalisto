@@ -139,6 +139,22 @@ pub fn prepare_with_runner(
     };
     let resolved = artifact::pull_cluster_spec(spec, runner)?;
     validate_lima_template(&resolved.template)?;
+    if spec
+        .state_root()
+        .join("archive/assets/manifest.json")
+        .is_file()
+    {
+        let assets = load(spec)?;
+        for file in &assets.manifest.files {
+            artifact::verify_sha256(
+                runner,
+                &assets.root.join(&file.name),
+                &file.sha256,
+                &file.name,
+            )?;
+        }
+        return Ok(assets);
+    }
     if destination.exists() {
         let assets = load(spec).map_err(|error| invalid(format!("{error}; damaged cache at {}; stop clusters using this profile, remove only this cache directory, then rerun kalisto pull", destination.display())))?;
         for file in &assets.manifest.files {
@@ -333,8 +349,15 @@ pub fn prepare_with_runner(
 }
 
 pub fn load(spec: &ClusterSpec) -> Result<PreparedAssets> {
+    let imported = spec.state_root().join("archive/assets");
+    if imported.join("manifest.json").is_file() {
+        return load_from_root(spec, &imported);
+    }
+    load_from_root(spec, &cache_root()?.join(profile(spec)?))
+}
+
+pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<PreparedAssets> {
     let key = profile(spec)?;
-    let root = cache_root()?.join(&key);
     let content = fs::read(root.join("manifest.json")).map_err(|error| invalid(format!(
         "boot assets unavailable at {}: {error}; run `kalisto pull` with the same --arch, --k3s-version and --addons before up",
         root.display(),
@@ -412,6 +435,10 @@ pub fn load(spec: &ClusterSpec) -> Result<PreparedAssets> {
 }
 
 impl PreparedAssets {
+    pub(crate) fn filenames(&self) -> impl Iterator<Item = &str> {
+        self.manifest.files.iter().map(|file| file.name.as_str())
+    }
+
     pub fn probe_image(&self) -> &str {
         &self.manifest.probe_image
     }

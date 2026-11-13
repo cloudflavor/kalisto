@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod artifact;
 pub mod backend;
 pub mod cli;
@@ -10,6 +11,7 @@ pub mod kubectl;
 pub mod lima_k3s;
 pub mod mcp;
 mod native_image;
+mod operation;
 pub mod paths;
 pub mod plugin;
 pub mod probe;

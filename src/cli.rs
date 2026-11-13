@@ -31,6 +31,12 @@ pub enum Command {
     Create(UpArgs),
     /// Cache Lima node images, K3s and Cilium assets before starting fresh VMs.
     Pull(UpArgs),
+    /// Export stopped native VZ nodes, including credentials and VM-local data.
+    Export(ExportArgs),
+    /// Restore a trusted cold archive without overwriting or starting nodes.
+    Import(ImportArgs),
+    /// Generate a private native age identity; prints only its public recipient.
+    ArchiveKeygen(ArchiveKeygenArgs),
     Up(UpArgs),
     Test(TestArgs),
     Mcp(McpArgs),
@@ -325,6 +331,109 @@ fn resolve_base_cluster_spec(
         spec.name = name;
     }
     Ok(spec)
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ExportArgs {
+    #[structopt(long)]
+    pub name: String,
+    #[structopt(long, parse(from_os_str))]
+    pub output: PathBuf,
+    /// Authorize graceful shutdown; no forced power-off is used for export.
+    #[structopt(long)]
+    pub stop: bool,
+    /// Encrypt to a native age1... public key. Repeat for multiple recipients.
+    #[structopt(long = "recipient", conflicts_with_all = &["passphrase", "passphrase-file"])]
+    pub recipients: Vec<String>,
+    /// Prompt twice on the terminal; passphrase is never accepted as an argument.
+    #[structopt(long, conflicts_with = "passphrase-file")]
+    pub passphrase: bool,
+    /// Read a passphrase from a private mode-0600 file (automation/MCP).
+    #[structopt(long, parse(from_os_str))]
+    pub passphrase_file: Option<PathBuf>,
+}
+
+impl ExportArgs {
+    pub fn encryption(&self) -> crate::error::Result<crate::archive::ExportEncryption> {
+        if self.passphrase {
+            crate::archive::ExportEncryption::with_passphrase(prompt_archive_passphrase(true)?)
+        } else {
+            crate::archive::ExportEncryption::from_files(
+                &self.recipients,
+                self.passphrase_file.as_deref(),
+            )
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ArchiveKeygenArgs {
+    #[structopt(long, parse(from_os_str))]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ImportArgs {
+    #[structopt(parse(from_os_str))]
+    pub input: PathBuf,
+    #[structopt(long)]
+    pub api_port: Option<u16>,
+    /// Maximum total uncompressed payload size (default: 1 TiB).
+    #[structopt(long, default_value = "1099511627776")]
+    pub max_bytes: u64,
+    /// Private native age identity file. Repeat for multiple files.
+    #[structopt(long = "identity", parse(from_os_str), conflicts_with_all = &["passphrase", "passphrase-file"])]
+    pub identity_files: Vec<PathBuf>,
+    #[structopt(long, conflicts_with = "passphrase-file")]
+    pub passphrase: bool,
+    #[structopt(long, parse(from_os_str))]
+    pub passphrase_file: Option<PathBuf>,
+}
+
+impl ImportArgs {
+    pub fn decryption(&self) -> crate::error::Result<crate::archive::ImportDecryption> {
+        if self.passphrase {
+            Ok(crate::archive::ImportDecryption::Passphrase(
+                prompt_archive_passphrase(false)?,
+            ))
+        } else {
+            crate::archive::ImportDecryption::from_files(
+                &self.identity_files,
+                self.passphrase_file.as_deref(),
+            )
+        }
+    }
+}
+
+fn prompt_archive_passphrase(confirm: bool) -> crate::error::Result<age::secrecy::SecretString> {
+    use age::secrecy::ExposeSecret;
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(crate::error::Error::InvalidArgs(
+            "passphrase prompt requires a terminal; use a private --passphrase-file for automation"
+                .into(),
+        ));
+    }
+    let secret = age::secrecy::SecretString::from(
+        rpassword::prompt_password("Archive passphrase: ").map_err(|_| {
+            crate::error::Error::InvalidArgs("cannot read archive passphrase from terminal".into())
+        })?,
+    );
+    if confirm {
+        let repeated = age::secrecy::SecretString::from(
+            rpassword::prompt_password("Confirm archive passphrase: ").map_err(|_| {
+                crate::error::Error::InvalidArgs(
+                    "cannot read archive passphrase confirmation".into(),
+                )
+            })?,
+        );
+        if secret.expose_secret() != repeated.expose_secret() {
+            return Err(crate::error::Error::InvalidArgs(
+                "archive passphrases do not match".into(),
+            ));
+        }
+    }
+    Ok(secret)
 }
 
 #[derive(Debug, StructOpt)]
@@ -648,6 +757,138 @@ mod tests {
     use crate::cluster::spec::ImageArch;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn archive_encryption_flags_parse_and_refuse_conflicting_or_inline_secrets() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "export",
+            "--name",
+            "dev",
+            "--output",
+            "backup.age",
+            "--recipient",
+            "age1first",
+            "--recipient",
+            "age1second",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Export(args) => assert_eq!(args.recipients, vec!["age1first", "age1second"]),
+            _ => panic!("expected export"),
+        }
+        assert!(
+            Cli::from_iter_safe([
+                "kalisto",
+                "export",
+                "--name",
+                "dev",
+                "--output",
+                "backup.age",
+                "--recipient",
+                "age1first",
+                "--passphrase"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::from_iter_safe([
+                "kalisto",
+                "export",
+                "--name",
+                "dev",
+                "--output",
+                "backup.age",
+                "--passphrase",
+                "--passphrase-file",
+                "secret-file"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::from_iter_safe([
+                "kalisto",
+                "import",
+                "backup.age",
+                "--identity",
+                "dev.agekey",
+                "--passphrase-file",
+                "secret-file"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::from_iter_safe([
+                "kalisto",
+                "import",
+                "backup.age",
+                "--password",
+                "forbidden-inline-secret"
+            ])
+            .is_err()
+        );
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "import",
+            "backup.age",
+            "--identity",
+            "first.agekey",
+            "--identity",
+            "second.agekey",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Import(args) => assert_eq!(args.identity_files.len(), 2),
+            _ => panic!("expected import"),
+        }
+        assert!(matches!(
+            Cli::from_iter_safe(["kalisto", "archive-keygen", "--output", "dev.agekey"])
+                .unwrap()
+                .command,
+            Command::ArchiveKeygen(_)
+        ));
+    }
+
+    #[test]
+    fn archive_commands_parse_safe_defaults_and_explicit_shutdown_consent() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "export",
+            "--name",
+            "dev",
+            "--output",
+            "dev.kalisto",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Export(args) => assert!(!args.stop),
+            _ => panic!("expected export"),
+        }
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "export",
+            "--name",
+            "dev",
+            "--output",
+            "dev.kalisto",
+            "--stop",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Export(args) => assert!(args.stop),
+            _ => panic!("expected export"),
+        }
+        let cli = Cli::from_iter_safe(["kalisto", "import", "dev.kalisto", "--api-port", "16444"])
+            .unwrap();
+        match cli.command {
+            Command::Import(args) => {
+                assert_eq!(args.api_port, Some(16444));
+                assert_eq!(args.max_bytes, crate::archive::DEFAULT_MAX_BYTES);
+            }
+            _ => panic!("expected import"),
+        }
+        assert!(Cli::from_iter_safe(["kalisto", "import", "dev.kalisto", "--force"]).is_err());
+    }
 
     #[test]
     fn pull_accepts_the_same_cluster_asset_selection_as_up() {

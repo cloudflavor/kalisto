@@ -104,6 +104,48 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             println!("created cluster definition");
             Ok(())
         }
+        "clusters.export" => {
+            let request: ArchiveExportPayload = parse_task_runner_args(&manifest.arguments)?;
+            let encryption = crate::archive::ExportEncryption::from_files(
+                &request.recipients,
+                request.passphrase_file.as_deref(),
+            )?;
+            let outcome = crate::archive::export_encrypted(
+                &request.name,
+                &request.output,
+                request.stop,
+                &encryption,
+            )?;
+            println!(
+                "cluster: {}\narchive: {}\nnodes: {}\nbytes: {}\nencrypted: {}\ncontains secrets: true",
+                outcome.name,
+                outcome.path.display(),
+                outcome.nodes,
+                outcome.bytes,
+                outcome.encrypted
+            );
+            Ok(())
+        }
+        "clusters.import" => {
+            let request: ArchiveImportPayload = parse_task_runner_args(&manifest.arguments)?;
+            let credentials = crate::archive::ImportDecryption::from_files(
+                &request.identity_files,
+                request.passphrase_file.as_deref(),
+            )?;
+            let outcome = crate::archive::import_encrypted(
+                &request.input,
+                request.api_port,
+                request
+                    .max_bytes
+                    .unwrap_or(crate::archive::DEFAULT_MAX_BYTES),
+                &credentials,
+            )?;
+            println!(
+                "cluster: {}\nnodes: {}\nstate: stopped",
+                outcome.name, outcome.nodes
+            );
+            Ok(())
+        }
         "clusters.pull" => {
             let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
             let up = lifecycle
@@ -621,6 +663,10 @@ impl McpServer {
     ) -> std::result::Result<TaskRecord, JsonRpcError> {
         let tool = tool_by_name(tool_name)
             .ok_or_else(|| jsonrpc_error(-32601, format!("unknown tool `{tool_name}`")))?;
+        validate_archive_arguments(tool_name, &arguments)?;
+        // Open/validate secret files before persisting their paths, so accidentally
+        // placing a literal private key/password in a file-path field is rejected.
+        preflight_archive_secret_files(tool_name, &arguments)?;
         let task_id = self.next_task_id();
         let now = iso8601_now();
         let manifest_path = self.tasks_dir.join(format!("{task_id}.manifest.json"));
@@ -955,6 +1001,17 @@ impl McpServer {
         let Some(record) = self.task(&params.task_id) else {
             return self.write_error(id, -32602, format!("unknown task `{}`", params.task_id));
         };
+        if matches!(
+            record.request.tool_name.as_str(),
+            "clusters.export" | "clusters.import"
+        ) {
+            return self.write_error(
+                id,
+                -32602,
+                "archive tasks cannot be cancelled while copying/publishing; wait for completion"
+                    .to_owned(),
+            );
+        }
         if record.is_terminal() {
             return self.write_error(
                 id,
@@ -1349,6 +1406,16 @@ const TOOLS: &[ToolSpec] = &[
         task_support: TaskSupport::Required,
     },
     ToolSpec {
+        name: "clusters.export",
+        description: "Export a trusted cold Lima/VZ cluster archive containing credentials and VM-local application data. Requires stopped nodes unless stop=true authorizes clean shutdown. Never overwrites output; leaves nodes stopped. Select recipients or a private passphraseFile for native age encryption. Archive tasks are not cancellable.",
+        task_support: TaskSupport::Required,
+    },
+    ToolSpec {
+        name: "clusters.import",
+        description: "Verify and restore a trusted cold Lima/VZ archive with original identity and compatible architecture. Refuses existing cluster/VM destinations, leaves restored nodes stopped, and does not execute archived host configuration. May prepare verified host tools. Contains secrets; age decryption accepts identityFiles or a private passphraseFile, never inline secrets. Archive tasks are not cancellable.",
+        task_support: TaskSupport::Required,
+    },
+    ToolSpec {
         name: "clusters.up",
         description: "Create the cluster if needed and boot the control-plane and worker nodes. First prepare matching assets with clusters.pull. Default CNI is none; select addons [\"cni/cilium\"] for pod networking. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
         task_support: TaskSupport::Required,
@@ -1477,6 +1544,20 @@ fn input_schema(tool_name: &str) -> Value {
             "required": ["name", "workers"],
             "additionalProperties": false
         }),
+        "clusters.export" => {
+            json!({"type":"object","properties":{
+                "name":{"type":"string"},"output":{"type":"string"},"stop":{"type":"boolean","default":false},
+                "recipients":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Native age1... public recipients, mutually exclusive with passphraseFile"},
+                "passphraseFile":{"type":"string","description":"Private mode-0600 host file; never provide a raw passphrase"}
+            },"required":["name","output"],"additionalProperties":false})
+        }
+        "clusters.import" => {
+            json!({"type":"object","properties":{
+                "input":{"type":"string"},"apiPort":{"type":"integer","minimum":1,"maximum":65535},"maxBytes":{"type":"integer","minimum":1},
+                "identityFiles":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Private native age identity files on host, mutually exclusive with passphraseFile"},
+                "passphraseFile":{"type":"string","description":"Private mode-0600 host file; never provide a raw passphrase"}
+            },"required":["input"],"additionalProperties":false})
+        }
         "clusters.create" | "clusters.pull" | "clusters.up" => lifecycle_schema(),
         "addons.list" => json!({
             "type": "object",
@@ -2080,6 +2161,98 @@ fn jsonrpc_error(code: i64, message: String) -> JsonRpcError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveExportPayload {
+    name: String,
+    output: PathBuf,
+    #[serde(default)]
+    stop: bool,
+    #[serde(default)]
+    recipients: Vec<String>,
+    passphrase_file: Option<PathBuf>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveImportPayload {
+    input: PathBuf,
+    api_port: Option<u16>,
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    identity_files: Vec<PathBuf>,
+    passphrase_file: Option<PathBuf>,
+}
+
+// Reject inline secrets and malformed recipients before persisting any task
+// request/manifest. Do not echo rejected values through serde's error text.
+fn validate_archive_arguments(
+    name: &str,
+    arguments: &Value,
+) -> std::result::Result<(), JsonRpcError> {
+    let rejected = || {
+        jsonrpc_error(-32602, "invalid archive arguments; use native public recipients and private secret-file paths, never inline passwords/keys".into())
+    };
+    match name {
+        "clusters.export" => {
+            let request: ArchiveExportPayload =
+                serde_json::from_value(arguments.clone()).map_err(|_| rejected())?;
+            if request.recipients.len() > 64
+                || (!request.recipients.is_empty() && request.passphrase_file.is_some())
+                || request
+                    .recipients
+                    .iter()
+                    .any(|key| key.parse::<age::x25519::Recipient>().is_err())
+            {
+                return Err(rejected());
+            }
+        }
+        "clusters.import" => {
+            let request: ArchiveImportPayload =
+                serde_json::from_value(arguments.clone()).map_err(|_| rejected())?;
+            if request.identity_files.len() > 64
+                || (!request.identity_files.is_empty() && request.passphrase_file.is_some())
+                || request.api_port == Some(0)
+                || request.max_bytes == Some(0)
+            {
+                return Err(rejected());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn preflight_archive_secret_files(
+    name: &str,
+    arguments: &Value,
+) -> std::result::Result<(), JsonRpcError> {
+    let rejected = || {
+        jsonrpc_error(-32602, "archive secret inputs must reference existing private files on the MCP host; never put secrets in file-path fields".into())
+    };
+    match name {
+        "clusters.export" => {
+            let request: ArchiveExportPayload =
+                serde_json::from_value(arguments.clone()).map_err(|_| rejected())?;
+            crate::archive::ExportEncryption::from_files(
+                &request.recipients,
+                request.passphrase_file.as_deref(),
+            )
+            .map_err(|_| rejected())?;
+        }
+        "clusters.import" => {
+            let request: ArchiveImportPayload =
+                serde_json::from_value(arguments.clone()).map_err(|_| rejected())?;
+            crate::archive::ImportDecryption::from_files(
+                &request.identity_files,
+                request.passphrase_file.as_deref(),
+            )
+            .map_err(|_| rejected())?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolCallRequest {
     name: String,
     #[serde(default)]
@@ -2334,6 +2507,41 @@ fn task_command(
                 .to_owned(),
             );
             append_up_args(&mut args, &up);
+        }
+        "clusters.export" => {
+            let request: ArchiveExportPayload = parse_tool_args(arguments.clone())?;
+            args.extend([
+                "export".into(),
+                "--name".into(),
+                request.name,
+                "--output".into(),
+                request.output.display().to_string(),
+            ]);
+            if request.stop {
+                args.push("--stop".into());
+            }
+            for key in request.recipients {
+                args.extend(["--recipient".into(), key]);
+            }
+            if let Some(path) = request.passphrase_file {
+                args.extend(["--passphrase-file".into(), path.display().to_string()]);
+            }
+        }
+        "clusters.import" => {
+            let request: ArchiveImportPayload = parse_tool_args(arguments.clone())?;
+            args.extend(["import".into(), request.input.display().to_string()]);
+            if let Some(port) = request.api_port {
+                args.extend(["--api-port".into(), port.to_string()]);
+            }
+            if let Some(bytes) = request.max_bytes {
+                args.extend(["--max-bytes".into(), bytes.to_string()]);
+            }
+            for path in request.identity_files {
+                args.extend(["--identity".into(), path.display().to_string()]);
+            }
+            if let Some(path) = request.passphrase_file {
+                args.extend(["--passphrase-file".into(), path.display().to_string()]);
+            }
         }
         "clusters.down" => {
             let request: ClusterDownArgs = parse_tool_args(arguments.clone())?;
@@ -2619,6 +2827,13 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
                 }),
             )
         }
+        "clusters.export" | "clusters.import" => {
+            let values = parse_key_value_lines(&stdout);
+            success_tool_result(
+                "Cold archive operation completed.".into(),
+                json!({"cluster":values.get("cluster"),"archive":values.get("archive"),"nodes":values.get("nodes"),"state":values.get("state"),"containsSecrets":true,"encrypted":values.get("encrypted").map(|value| value=="true"),"stdout":stdout,"stderr":stderr}),
+            )
+        }
         "clusters.up" => parse_up_result(&stdout).unwrap_or_else(|| {
             success_tool_result(
                 format!("Brought cluster up for task `{task_id}`."),
@@ -2902,7 +3117,7 @@ impl TaskRecord {
             "updatedAt": self.last_updated_at,
             "lastUpdatedAt": self.last_updated_at,
             "ttl": self.ttl_millis,
-            "cancellable": !self.is_terminal() && self.child_id.is_some(),
+            "cancellable": !self.is_terminal() && self.child_id.is_some() && !matches!(self.request.tool_name.as_str(), "clusters.export" | "clusters.import"),
             "pollInterval": self.poll_interval_millis,
             "_meta": {
                 "toolName": self.request.tool_name,
@@ -3081,6 +3296,135 @@ mod tests {
         assert_eq!(args.first().map(String::as_str), Some("pull"));
         let cli = Cli::from_iter_safe(std::iter::once("kalisto".to_owned()).chain(args)).unwrap();
         assert!(matches!(cli.command, Command::Pull(_)));
+    }
+
+    #[test]
+    fn cold_archive_tools_require_tasks_and_expose_non_destructive_arguments() {
+        for name in ["clusters.export", "clusters.import"] {
+            assert_eq!(
+                tool_by_name(name).unwrap().task_support,
+                TaskSupport::Required
+            );
+            let schema = super::input_schema(name);
+            assert_eq!(schema["additionalProperties"], json!(false));
+            assert!(schema["properties"].get("force").is_none());
+        }
+        let (_, args) = task_command(
+            "clusters.export",
+            &json!({"name":"dev","output":"dev.kalisto","stop":true}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "export",
+                "--name",
+                "dev",
+                "--output",
+                "dev.kalisto",
+                "--stop"
+            ]
+        );
+        let (_, args) = task_command(
+            "clusters.import",
+            &json!({"input":"dev.kalisto","apiPort":16444}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(args, vec!["import", "dev.kalisto", "--api-port", "16444"]);
+    }
+
+    #[test]
+    fn archive_validation_rejects_inline_secrets_without_echoing_them() {
+        let secret = "must-not-enter-task-record-or-error";
+        for name in ["clusters.export", "clusters.import"] {
+            let args = if name == "clusters.export" {
+                json!({"name":"dev","output":"backup.age","passphrase":secret})
+            } else {
+                json!({"input":"backup.age","privateKey":secret})
+            };
+            let error = super::validate_archive_arguments(name, &args).unwrap_err();
+            assert!(!error.message.contains(secret));
+        }
+        assert!(
+            super::validate_archive_arguments(
+                "clusters.export",
+                &json!({"name":"dev","output":"backup.age","recipients":[secret]})
+            )
+            .is_err()
+        );
+        assert!(super::validate_archive_arguments("clusters.import",&json!({"input":"backup.age","identityFiles":["dev.agekey"],"passphraseFile":"secret-file"})).is_err());
+        assert!(
+            super::validate_archive_arguments(
+                "clusters.export",
+                &json!({"name":"dev","output":"backup.age","passphraseFile":"secret-file"})
+            )
+            .is_ok()
+        );
+        assert!(
+            super::validate_archive_arguments(
+                "clusters.import",
+                &json!({"input":"backup.age","identityFiles":["dev.agekey"]})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn literal_secrets_in_file_path_fields_fail_before_allocating_or_persisting_tasks() {
+        let server = test_server();
+        let secret = "AGE-SECRET-KEY-DUMMY-NOT-A-LOCAL-FILE";
+        for (name, arguments) in [
+            (
+                "clusters.export",
+                json!({"name":"dev","output":"backup.age","passphraseFile":secret}),
+            ),
+            (
+                "clusters.import",
+                json!({"input":"backup.age","identityFiles":[secret]}),
+            ),
+        ] {
+            let error = server.spawn_task(name, arguments).err().unwrap();
+            assert!(!error.message.contains(secret));
+        }
+        assert_eq!(
+            server
+                .next_task_counter
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(server.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_task_arguments_contain_only_public_recipients_or_private_file_paths() {
+        let key = age::x25519::Identity::generate();
+        let public = key.to_public().to_string();
+        let (_, args) = task_command(
+            "clusters.export",
+            &json!({"name":"dev","output":"backup.age","recipients":[public]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(args[args.len() - 2], "--recipient");
+        let (_, args) = task_command(
+            "clusters.import",
+            &json!({"input":"backup.age","identityFiles":["dev.agekey"]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(&args[args.len() - 2..], ["--identity", "dev.agekey"]);
+        assert!(
+            super::input_schema("clusters.export")["properties"]
+                .get("passphrase")
+                .is_none()
+        );
+        assert!(
+            super::input_schema("clusters.import")["properties"]
+                .get("privateKey")
+                .is_none()
+        );
     }
 
     fn test_server() -> Arc<McpServer> {
