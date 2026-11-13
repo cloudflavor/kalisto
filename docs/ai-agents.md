@@ -14,8 +14,10 @@ tasks.** No new server or duplicate orchestration layer is needed.
 | Structured inspection or a client without a general shell | Existing stdio MCP |
 | Long-running lifecycle operations over MCP | Task-capable MCP client |
 
-CLI output is human-readable; there is no `--json` flag currently. Use MCP's
-structured results when needed rather than treating CLI text as a stable JSON API.
+CLI output is human-readable by default. Pass the global `--json` flag to emit
+machine-readable JSON from the read-only inspection commands `list`, `status`,
+`stats` (without `--watch`), and `kubeconfig`. Treat JSON field names as stable;
+non-JSON CLI text remains a convenience format, not an API.
 
 ## Prepare once, then boot
 
@@ -47,10 +49,14 @@ export KUBECONFIG="$(kalisto kubeconfig --name "$CLUSTER" --path)"
 kubectl get nodes
 kubectl -n kube-system get pods
 kubectl apply -f app.yaml
+# or, without any host kubectl:
+kalisto apply --name "$CLUSTER" --manifest app.yaml
+kalisto kubectl --name "$CLUSTER" -- get nodes
 ```
 
-`kubectl` is a separately supplied Kubernetes client; Kalisto does not install host
-`kubectl`. `app.yaml` is user-provided. New workload images may require registry
+`app.yaml` is user-provided. A host `kubectl` is optional: `kalisto apply` and
+`kalisto kubectl` use a checksum-verified managed kubectl matching the cluster's
+K3s release instead. New workload images may require registry
 access after startup. Kalisto's startup cache is not a cache of every application.
 
 Concurrent clusters need distinct names **and free `--api-port` values**. Naming
@@ -131,14 +137,20 @@ Discover schemas through `tools/list`; lifecycle arguments use camelCase, such a
 `projectRoot`, `apiPort`, and `k3sVersion`.
 
 - **Task-required:** `clusters.create`, `clusters.pull`, `clusters.up`, `clusters.down`,
-  `clusters.destroy`, `clusters.scale`, `addons.install`, `bench.run`,
+  `clusters.destroy`, `clusters.scale`, `workloads.apply`, `addons.install`, `bench.run`,
   `probes.macos.lima`, `probes.macos.lima.k3s`.
 - **Read-only, task augmentation forbidden:** `clusters.list`, `clusters.status`,
   `clusters.stats`, `clusters.state`, `clusters.kubeconfig`, `clusters.logs`, `addons.list`.
 
 `clusters.logs` reads persisted logs; VM log streaming is unavailable over MCP stdio.
-The server manages lifecycle, inspection and add-ons, but has no generic workload
-manifest-apply tool. Use Kubernetes tooling separately for applications.
+Poll incrementally instead: pass `tailLines` to read only the last N lines of each
+log section and re-invoke with the same arguments as the node keeps working.
+
+`workloads.apply` applies a manifest file to a running cluster through the
+control plane's kubectl; it is task-required like other lifecycle mutations.
+`kalisto kubectl` runs a checksum-verified managed kubectl binary matching the
+cluster's K3s release against the cluster's kubeconfig, so host kubectl is no
+longer required. The managed binary is fetched on first use, not during `up`.
 
 Implementation references: [MCP server](../src/mcp.rs) and [CLI arguments](../src/cli.rs).
 

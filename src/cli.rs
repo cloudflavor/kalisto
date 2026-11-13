@@ -17,6 +17,10 @@ use crate::paths::{default_cluster_name, default_project_root, selected_cluster_
 pub struct Cli {
     #[structopt(long, parse(try_from_str = parse_log_level))]
     pub log_level: Option<Level>,
+    /// Emit machine-readable JSON from read-only inspection commands
+    /// (list, status, stats, kubeconfig).
+    #[structopt(long, global = true)]
+    pub json: bool,
     #[structopt(subcommand)]
     pub command: Command,
 }
@@ -32,6 +36,8 @@ pub enum Command {
     Mcp(McpArgs),
     #[structopt(name = "mcp-task-runner")]
     McpTaskRunner(McpTaskRunnerArgs),
+    /// Apply a Kubernetes workload manifest to a running cluster.
+    Apply(ApplyArgs),
     Down(ClusterLookupArgs),
     Destroy(DestroyArgs),
     Logs(NodeLogsArgs),
@@ -45,6 +51,8 @@ pub enum Command {
     Stats(StatsArgs),
     Status(ClusterLookupArgs),
     Kubeconfig(KubeconfigArgs),
+    /// Run the managed kubectl binary against a cluster with its kubeconfig.
+    Kubectl(KubectlArgs),
     Bench(BenchArgs),
     ProbeMacosLima(MacosLimaArgs),
     ProbeMacosLimaK3s(MacosLimaK3sArgs),
@@ -102,6 +110,46 @@ pub struct NodeLogsArgs {
 }
 
 impl NodeLogsArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ApplyArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+    /// Path to a Kubernetes manifest file to apply on the cluster.
+    #[structopt(long, parse(from_os_str))]
+    pub manifest: PathBuf,
+}
+
+impl ApplyArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(setting = structopt::clap::AppSettings::TrailingVarArg)]
+pub struct KubectlArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+    /// Print the managed kubectl binary path and exit.
+    #[structopt(long)]
+    pub path: bool,
+    /// Arguments passed through to the managed kubectl binary.
+    #[structopt(allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+impl KubectlArgs {
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),

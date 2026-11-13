@@ -5,12 +5,14 @@ use std::thread;
 use std::time::Duration;
 
 use structopt::StructOpt;
+use serde_json::json;
 
 use kalisto::cli::{
-    AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, BenchArgs, Cli, ClusterLookupArgs,
-    Command, CompletionsArgs, DestroyArgs, KubeconfigArgs, MacosLimaArgs, MacosLimaK3sArgs,
-    McpArgs, McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs, ScaleArgs, StatsArgs, TestArgs,
-    TestCommand, TestListArgs, TestRunArgs, UpArgs, apply_requested_addons,
+    AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, ApplyArgs, BenchArgs, Cli,
+    ClusterLookupArgs, Command, CompletionsArgs, DestroyArgs, KubeconfigArgs, KubectlArgs,
+    MacosLimaArgs, MacosLimaK3sArgs, McpArgs, McpTaskRunnerArgs, NamedClusterArgs, NodeLogsArgs,
+    ScaleArgs, StatsArgs, TestArgs, TestCommand, TestListArgs, TestRunArgs, UpArgs,
+    apply_requested_addons,
 };
 use kalisto::cluster::addon::CniPlugin;
 use kalisto::cluster::manager::{
@@ -64,6 +66,7 @@ fn real_main() -> Result<()> {
         Command::Test(args) => run_test(args),
         Command::Mcp(args) => run_mcp(args),
         Command::McpTaskRunner(args) => run_hidden_mcp_task_runner(args),
+        Command::Apply(args) => run_apply(args),
         Command::Down(args) => run_down(args),
         Command::Destroy(args) => run_destroy(args),
         Command::Logs(args) => run_logs(args),
@@ -72,10 +75,11 @@ fn real_main() -> Result<()> {
         Command::Use(args) => run_use(args),
         Command::Scale(args) => run_scale(args),
         Command::Completions(args) => run_completions(args),
-        Command::List => run_list(),
-        Command::Stats(args) => run_stats(args),
-        Command::Status(args) => run_status(args),
-        Command::Kubeconfig(args) => run_kubeconfig(args),
+        Command::Kubectl(args) => run_kubectl(args),
+        Command::List => run_list(cli.json),
+        Command::Stats(args) => run_stats(args, cli.json),
+        Command::Status(args) => run_status(args, cli.json),
+        Command::Kubeconfig(args) => run_kubeconfig(args, cli.json),
         Command::Bench(args) => run_bench(args),
         Command::ProbeMacosLima(args) => run_lima_probe(args),
         Command::ProbeMacosLimaK3s(args) => run_lima_k3s_probe(args),
@@ -414,9 +418,33 @@ fn run_completions(args: CompletionsArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_list() -> Result<()> {
+fn json_error(error: serde_json::Error) -> Error {
+    Error::InvalidArgs(format!("failed to serialize JSON output: {error}"))
+}
+
+fn run_list(json: bool) -> Result<()> {
     let clusters = cluster_list()?;
     let default_cluster = read_default_cluster_name()?;
+    if json {
+        let value = json!({
+            "defaultCluster": default_cluster,
+            "clusters": clusters.iter().map(|cluster| json!({
+                "name": cluster.name,
+                "isDefault": default_cluster.as_deref() == Some(cluster.name.as_str()),
+                "state": cluster_state_label(cluster),
+                "nodeCount": cluster.nodes.len(),
+                "kubeconfigPath": cluster.kubeconfig_path.display().to_string(),
+                "nodes": cluster.nodes.iter().map(|node| json!({
+                    "name": node.name,
+                    "role": role_label(node.role),
+                    "state": render_node_state(&node.backend_status),
+                    "detail": node.backend_status,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        return Ok(());
+    }
     if clusters.is_empty() {
         println!("no clusters");
         return Ok(());
@@ -468,9 +496,24 @@ fn run_list() -> Result<()> {
     Ok(())
 }
 
-fn run_status(args: ClusterLookupArgs) -> Result<()> {
+fn run_status(args: ClusterLookupArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let status = cluster_status(&name)?;
+    if json {
+        let value = json!({
+            "name": status.name,
+            "stateRoot": status.state_root.display().to_string(),
+            "kubeconfigPath": status.kubeconfig_path.display().to_string(),
+            "nodes": status.nodes.iter().map(|node| json!({
+                "name": node.name,
+                "role": role_label(node.role),
+                "state": render_node_state(&node.backend_status),
+                "detail": node.backend_status,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        return Ok(());
+    }
     println!("cluster: {}", status.name);
     println!("state root: {}", status.state_root.display());
     println!("kubeconfig: {}", status.kubeconfig_path.display());
@@ -493,9 +536,39 @@ fn run_status(args: ClusterLookupArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_stats(args: StatsArgs) -> Result<()> {
+fn run_stats(args: StatsArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
+    if json && args.watch {
+        return Err(Error::InvalidArgs(
+            "--json does not support --watch; run stats repeatedly instead".to_owned(),
+        ));
+    }
     let interval = Duration::from_secs(args.interval_secs.max(1));
+    if json {
+        let stats = cluster_stats(&name)?;
+        let value = json!({
+            "name": stats.name,
+            "stateRoot": stats.state_root.display().to_string(),
+            "kubeconfigPath": stats.kubeconfig_path.display().to_string(),
+            "nodes": stats.nodes.iter().map(|node| json!({
+                "name": node.name,
+                "role": role_label(node.role),
+                "state": node_state_label(&node.backend_status),
+                "backendStatus": node.backend_status,
+                "configuredCpus": node.configured_cpus,
+                "configuredMemoryGib": node.configured_memory_gib,
+                "pid": node.pid,
+                "guestIp": node.guest_ip,
+                "rssBytes": node.rss_bytes,
+                "vszBytes": node.vsz_bytes,
+                "rootfsBytes": node.rootfs_bytes,
+                "rxBytes": node.rx_bytes,
+                "txBytes": node.tx_bytes,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        return Ok(());
+    }
 
     if args.watch {
         loop {
@@ -511,14 +584,64 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
 }
 
-fn run_kubeconfig(args: KubeconfigArgs) -> Result<()> {
+fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let path = cluster_kubeconfig_path(&name)?;
+    if json {
+        let value = json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "exportCommand": kubeconfig_export_command(&path),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        return Ok(());
+    }
     if args.path {
         println!("{}", path.display());
     } else {
         println!("{}", kubeconfig_export_command(&path));
     }
+    Ok(())
+}
+
+fn run_apply(args: ApplyArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let manifest = fs::read_to_string(&args.manifest).map_err(|source| Error::CommandIo {
+        program: "read_to_string".to_owned(),
+        source,
+    })?;
+    let outcome = kalisto::cluster::workload::apply_manifest(&name, &manifest, &SystemRunner)?;
+    println!("cluster: {}", outcome.cluster);
+    println!("node: {}", outcome.node);
+    println!("applied: {}", args.manifest.display());
+    println!("{}", outcome.output);
+    Ok(())
+}
+
+fn run_kubectl(args: KubectlArgs) -> Result<()> {
+    let name = require_selected_cluster_name(args.cluster_name()?)?;
+    let state_root = kalisto::cluster::spec::ClusterSpec::state_root_for(&name)?;
+    let state = ClusterState::load(state_root.as_path())?;
+    let runner = SystemRunner;
+    let binary = kalisto::kubectl::binary(&state.k3s_version, &runner)?;
+    if args.path {
+        println!("{}", binary.display());
+        return Ok(());
+    }
+    let mut kubectl_args = args.args.as_slice();
+    if kubectl_args.first().map(|argument| argument == "--").unwrap_or(false) {
+        kubectl_args = &kubectl_args[1..];
+    }
+    if kubectl_args.is_empty() {
+        return Err(Error::InvalidArgs(
+            "no kubectl arguments provided; pass them after `kalisto kubectl --name <cluster> --`".to_owned(),
+        ));
+    }
+    let program = binary.to_string_lossy().to_string();
+    let output =
+        runner.run_with_env(&program, kubectl_args, &[("KUBECONFIG", &state.kubeconfig_path)])?;
+    print!("{}", output.stdout);
+    print!("{}", output.stderr);
     Ok(())
 }
 

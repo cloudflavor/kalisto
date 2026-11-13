@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod harness;
 pub mod k3s;
+pub mod kubectl;
 pub mod lima_k3s;
 pub mod mcp;
 mod native_image;

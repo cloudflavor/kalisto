@@ -2088,7 +2088,7 @@ fn start_and_join_workers_parallel(
     })
 }
 
-fn instance_status_is_running(status: &str) -> bool {
+pub(crate) fn instance_status_is_running(status: &str) -> bool {
     status.split_whitespace().any(|token| token == "Running")
 }
 
@@ -2363,7 +2363,7 @@ fn endpoint_host(api_endpoint: &str) -> String {
         .unwrap_or_else(|| api_endpoint.to_owned())
 }
 
-fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
     let state_root = ClusterSpec::state_root_for(name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.is_file() {

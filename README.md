@@ -67,6 +67,10 @@ kubectl -n kube-system get pods
 kubectl apply -f app.yaml
 ```
 
+Or work without a host Kubernetes client: `kalisto apply` ships a manifest to the
+running cluster, and `kalisto kubectl` runs a checksum-verified managed kubectl
+binary matching the cluster's K3s release (fetched on first use, not during `up`):
+
 `app.yaml` is user-provided. New workload images may require registry access after
 startup; the boot cache does not include every application. Ingress is not installed
 by default.
@@ -87,6 +91,9 @@ Use the installed binary; a checkout and `cargo run` are not required:
 kalisto pull --addons cni/cilium
 kalisto up --workers 2 --addons cni/cilium
 kalisto ls
+kalisto --json ls
+kalisto apply --name kalisto --manifest app.yaml
+kalisto kubectl --name kalisto -- get nodes
 kalisto down --name kalisto
 kalisto destroy --name kalisto
 kalisto status --name kalisto
