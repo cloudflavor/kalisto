@@ -39,7 +39,7 @@ use kalisto::probe::macos_lima::{
 use kalisto::probe::macos_lima_k3s::{
     ProbeConfig as MacosLimaK3sProbeConfig, run as run_macos_lima_k3s_probe,
 };
-use kalisto::process::SystemRunner;
+use kalisto::process::{CommandRunner, SystemRunner};
 use kalisto::shell::shell_escape;
 use kalisto::telemetry;
 
@@ -658,7 +658,7 @@ fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
 
 fn run_apply(args: ApplyArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
-    let manifest = fs::read_to_string(&args.manifest).map_err(|source| Error::CommandIo {
+    let manifest = std::fs::read_to_string(&args.manifest).map_err(|source| Error::CommandIo {
         program: "read_to_string".to_owned(),
         source,
     })?;
