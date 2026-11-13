@@ -1,0 +1,167 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Never cancel a release halfway through publication. Different tags are isolated.
+concurrency:
+  group: kalisto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 45
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-release-validation
+    steps:
+      - name: Checkout exact source and release tag
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
+          case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Validate release tooling and tag policy
+        run: |
+          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+          python3 scripts/release/release.py identity --ref "$GITHUB_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID"
+      - name: Rust checks
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked -- --test-threads=1
+
+  linux:
+    needs: validate
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-release-target
+      KALISTO_RELEASE_DIST: /tmp/kalisto-release-dist
+    steps:
+      - name: Checkout exact source and release tag
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
+          case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Install user-mode ARM64 smoke runner
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        run: |
+          set -eu
+          if ! command -v qemu-aarch64 >/dev/null; then
+            if [ "$(id -u)" = 0 ]; then
+              apt-get update -o Acquire::Retries=3
+              apt-get install -y --no-install-recommends qemu-user
+            else
+              sudo -n apt-get update -o Acquire::Retries=3
+              sudo -n apt-get install -y --no-install-recommends qemu-user
+            fi
+          fi
+      - name: Build static binary, verify architecture and smoke
+        run: bash scripts/release/build.sh '${{ matrix.target }}'
+      - name: Upload candidate archive
+        # Forgejo-compatible artifact v3; full verified commit pins.
+        uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: kalisto-${{ matrix.target }}
+          path: /tmp/kalisto-release-dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    needs: validate
+    # Never execute fork code on a shared native host.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      CARGO_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/cargo-home
+      RUSTUP_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-rustup
+      CARGO_TARGET_DIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-target/${{ matrix.target }}
+      TMPDIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/build-tmp
+    steps:
+      - name: Verify mounted external storage and checkout into owned workspace
+        run: |
+          set -eu
+          python3 -c 'import os; assert os.path.ismount("${{ vars.KALISTO_MACOS_VOLUME }}"), "external build volume not mounted; refusing internal storage"'
+          mkdir -p ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds "$TMPDIR"
+          workspace=$(mktemp -d ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/tomis.XXXXXX)
+          printf 'KALISTO_RELEASE_WORKSPACE=%s\nKALISTO_RELEASE_DIST=%s/dist\n' "$workspace" "$workspace" >> "$GITHUB_ENV"
+          cd "$workspace"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
+          case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Build binary, verify architecture and native smoke where supported
+        run: cd "$KALISTO_RELEASE_WORKSPACE" && bash scripts/release/build.sh '${{ matrix.target }}'
+      - name: Upload candidate archive
+        uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: kalisto-${{ matrix.target }}
+          path: ${{ env.KALISTO_RELEASE_DIST }}/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove only this job's owned workspace
+        if: always()
+        run: |
+          if [ -n "${KALISTO_RELEASE_WORKSPACE:-}" ]; then
+            case "$KALISTO_RELEASE_WORKSPACE" in
+              ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/tomis.*) rm -rf -- "$KALISTO_RELEASE_WORKSPACE" ;;
+              *) echo 'Refusing cleanup outside owned external workspace' >&2; exit 1 ;;
+            esac
+          fi
+
+  publish:
+    needs: [validate, linux, macos]
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 20
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+    steps:
+      - name: Checkout exact source
+        run: |
+          set -eu
+          git init -q .
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
+          case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Download all four candidates
+        uses: https://data.forgejo.org/actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
+        with:
+          path: /tmp/kalisto-release-candidates
+      - name: Verify complete candidate inventory without publishing on PR/manual runs
+        run: |
+          tag=$(python3 scripts/release/release.py identity --ref "$GITHUB_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID" | awk -F= '/^BUILD_TAG=/ {print $2}')
+          python3 scripts/release/release.py verify --root /tmp/kalisto-release-candidates --tag "$tag" --commit "$(git rev-parse HEAD)"
+      - name: Upload and read back draft assets, then publish only on a pushed tag
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          python3 scripts/release/release.py publish --root /tmp/kalisto-release-candidates \
+            --tag "${GITHUB_REF#refs/tags/}" --commit "$(git rev-parse HEAD)"
