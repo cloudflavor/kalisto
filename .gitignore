@@ -10,3 +10,4 @@
 /.opal/*
 !/.opal/config.toml
 skills
+worktrees/

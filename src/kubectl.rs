@@ -116,8 +116,8 @@ mod tests {
         let error = binary("..", &crate::process::SystemRunner)
             .expect_err("relative version must be rejected");
         assert!(matches!(error, Error::InvalidArgs(_)));
-        let error = binary("", &crate::process::SystemRunner)
-            .expect_err("empty version must be rejected");
+        let error =
+            binary("", &crate::process::SystemRunner).expect_err("empty version must be rejected");
         assert!(matches!(error, Error::InvalidArgs(_)));
     }
 
@@ -126,10 +126,8 @@ mod tests {
     fn expected_checksum_accepts_plain_digest() {
         use std::io::Write;
 
-        let temp = std::env::temp_dir().join(format!(
-            "kalisto-kubectl-checksum-{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("kalisto-kubectl-checksum-{}", std::process::id()));
         std::fs::create_dir_all(&temp).unwrap();
         let path = temp.join("kubectl.sha256");
         let mut file = std::fs::File::create(&path).unwrap();

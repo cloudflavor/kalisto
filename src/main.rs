@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use structopt::StructOpt;
 use serde_json::json;
+use structopt::StructOpt;
 
 use kalisto::cli::{
     AddonArgs, AddonCommand, AddonInstallArgs, AddonListArgs, ApplyArgs, BenchArgs, Cli,
@@ -442,7 +442,10 @@ fn run_list(json: bool) -> Result<()> {
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(json_error)?
+        );
         return Ok(());
     }
     if clusters.is_empty() {
@@ -511,7 +514,10 @@ fn run_status(args: ClusterLookupArgs, json: bool) -> Result<()> {
                 "detail": node.backend_status,
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(json_error)?
+        );
         return Ok(());
     }
     println!("cluster: {}", status.name);
@@ -566,7 +572,10 @@ fn run_stats(args: StatsArgs, json: bool) -> Result<()> {
                 "txBytes": node.tx_bytes,
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(json_error)?
+        );
         return Ok(());
     }
 
@@ -593,7 +602,10 @@ fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
             "path": path.display().to_string(),
             "exportCommand": kubeconfig_export_command(&path),
         });
-        println!("{}", serde_json::to_string_pretty(&value).map_err(json_error)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(json_error)?
+        );
         return Ok(());
     }
     if args.path {
@@ -629,17 +641,25 @@ fn run_kubectl(args: KubectlArgs) -> Result<()> {
         return Ok(());
     }
     let mut kubectl_args = args.args.as_slice();
-    if kubectl_args.first().map(|argument| argument == "--").unwrap_or(false) {
+    if kubectl_args
+        .first()
+        .map(|argument| argument == "--")
+        .unwrap_or(false)
+    {
         kubectl_args = &kubectl_args[1..];
     }
     if kubectl_args.is_empty() {
         return Err(Error::InvalidArgs(
-            "no kubectl arguments provided; pass them after `kalisto kubectl --name <cluster> --`".to_owned(),
+            "no kubectl arguments provided; pass them after `kalisto kubectl --name <cluster> --`"
+                .to_owned(),
         ));
     }
     let program = binary.to_string_lossy().to_string();
-    let output =
-        runner.run_with_env(&program, kubectl_args, &[("KUBECONFIG", &state.kubeconfig_path)])?;
+    let output = runner.run_with_env(
+        &program,
+        kubectl_args,
+        &[("KUBECONFIG", &state.kubeconfig_path)],
+    )?;
     print!("{}", output.stdout);
     print!("{}", output.stderr);
     Ok(())

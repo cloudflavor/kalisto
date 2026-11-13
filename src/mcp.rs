@@ -22,7 +22,7 @@ use crate::cluster::manager::{
 };
 use crate::cluster::spec::ImageArch;
 use crate::cluster::state::ClusterState;
-use crate::cluster::workload::{apply_manifest as cluster_apply_manifest, ManifestApplyOutcome};
+use crate::cluster::workload::{ManifestApplyOutcome, apply_manifest as cluster_apply_manifest};
 use crate::error::{Error, Result};
 use crate::k3s::ServerMode;
 use crate::paths::{
@@ -165,13 +165,12 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
         }
         "workloads.apply" => {
             let request: WorkloadApplyArgs = parse_task_runner_args(&manifest.arguments)?;
-            let manifest_content =
-                fs::read_to_string(&request.manifest_path).map_err(|error| {
-                    Error::InvalidArgs(format!(
-                        "failed to read workload manifest at {}: {error}",
-                        request.manifest_path.display()
-                    ))
-                })?;
+            let manifest_content = fs::read_to_string(&request.manifest_path).map_err(|error| {
+                Error::InvalidArgs(format!(
+                    "failed to read workload manifest at {}: {error}",
+                    request.manifest_path.display()
+                ))
+            })?;
             let outcome: ManifestApplyOutcome =
                 cluster_apply_manifest(&request.name, &manifest_content)?;
             println!("cluster: {}", outcome.cluster);
@@ -1681,17 +1680,21 @@ fn execute_direct_tool(
             let args: ClusterLogsArgs = parse_tool_args(arguments)?;
             let logs = crate::cluster::manager::logs(&args.name, &args.node)
                 .map_err(cluster_error_result)?;
-            let sections = logs.sections.iter().map(|section| {
-                let content = match args.tail_lines {
-                    Some(limit) => tail_lines(&section.content, limit),
-                    None => section.content.clone(),
-                };
-                json!({
-                    "label": section.label,
-                    "path": section.path.display().to_string(),
-                    "content": content
+            let sections = logs
+                .sections
+                .iter()
+                .map(|section| {
+                    let content = match args.tail_lines {
+                        Some(limit) => tail_lines(&section.content, limit),
+                        None => section.content.clone(),
+                    };
+                    json!({
+                        "label": section.label,
+                        "path": section.path.display().to_string(),
+                        "content": content
+                    })
                 })
-            }).collect::<Vec<_>>();
+                .collect::<Vec<_>>();
             Ok(success_tool_result(
                 format!(
                     "Loaded {} log section(s) for node `{}` in cluster `{}`.",

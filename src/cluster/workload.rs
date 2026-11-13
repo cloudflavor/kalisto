@@ -68,10 +68,8 @@ pub fn apply_manifest(
         )));
     }
 
-    let guest_artifacts = backend.guest_artifact_root(
-        &control_plane.name,
-        &control_plane.artifacts.root,
-    )?;
+    let guest_artifacts =
+        backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     let guest_kubeconfig = guest_artifacts.join("kubeconfig.yaml");
     let command = format!(
         "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl apply -f - <<'{delimiter}'\n{manifest}\n{delimiter}",
@@ -104,9 +102,7 @@ mod tests {
 
     #[test]
     fn rejects_reserved_delimiter() {
-        let manifest = format!(
-            "apiVersion: v1\nkind: ConfigMap\n{MANIFEST_HEREDOC_DELIMITER}\n"
-        );
+        let manifest = format!("apiVersion: v1\nkind: ConfigMap\n{MANIFEST_HEREDOC_DELIMITER}\n");
         let error = apply_manifest("unused", &manifest, &crate::process::SystemRunner)
             .expect_err("reserved delimiter must be rejected");
         assert!(matches!(error, crate::error::Error::InvalidArgs(_)));
