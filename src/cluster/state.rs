@@ -53,17 +53,19 @@ impl ClusterState {
             source,
         })?;
 
-        let content = serde_json::to_vec_pretty(&PersistedClusterState::from_state(self)).map_err(
-            |error| {
-                Error::InvalidArgs(format!(
-                    "failed to serialize cluster state for {}: {error}",
-                    self.name
-                ))
-            },
-        )?;
+        let content = self.to_bytes()?;
         fs::write(Self::state_file(root), content).map_err(|source| Error::CommandIo {
             program: "write".to_owned(),
             source,
+        })
+    }
+
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec_pretty(&PersistedClusterState::from_state(self)).map_err(|error| {
+            Error::InvalidArgs(format!(
+                "failed to serialize cluster state for {}: {error}",
+                self.name
+            ))
         })
     }
 
@@ -74,7 +76,11 @@ impl ClusterState {
                 source,
             })?;
 
-        let persisted: PersistedClusterState = serde_json::from_str(&content)
+        Self::from_bytes(content.as_bytes())
+    }
+
+    pub(crate) fn from_bytes(content: &[u8]) -> Result<Self> {
+        let persisted: PersistedClusterState = serde_json::from_slice(content)
             .map_err(|error| Error::InvalidArgs(format!("invalid cluster state json: {error}")))?;
         persisted.try_into_state()
     }

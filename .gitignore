@@ -3,6 +3,11 @@
 /artifacts/
 /target/
 /.kalisto/
+# Cold exports contain cluster credentials and application data.
+*.kalisto
+*.kalisto.age
+*.agekey
+.kalisto-archive-*/
 /notes/*
 !/notes/implementation-tracker.md
 

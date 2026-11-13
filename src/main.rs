@@ -60,6 +60,46 @@ fn real_main() -> Result<()> {
     match cli.command {
         Command::Create(args) => run_create(args),
         Command::Pull(args) => run_pull(args),
+        Command::Export(args) => {
+            let encryption = args.encryption()?;
+            let result = kalisto::archive::export_encrypted(
+                &args.name,
+                &args.output,
+                args.stop,
+                &encryption,
+            )?;
+            println!(
+                "cluster: {}\narchive: {}\nnodes: {}\nbytes: {}\nencrypted: {}\ncontains secrets: true",
+                result.name,
+                result.path.display(),
+                result.nodes,
+                result.bytes,
+                result.encrypted
+            );
+            Ok(())
+        }
+        Command::Import(args) => {
+            let credentials = args.decryption()?;
+            let result = kalisto::archive::import_encrypted(
+                &args.input,
+                args.api_port,
+                args.max_bytes,
+                &credentials,
+            )?;
+            println!(
+                "cluster: {}\nnodes: {}\nstate: stopped\nRun kalisto up --name {} to boot restored nodes",
+                result.name, result.nodes, result.name
+            );
+            Ok(())
+        }
+        Command::ArchiveKeygen(args) => {
+            let public = kalisto::archive::generate_identity(&args.output)?;
+            println!(
+                "recipient: {public}\nprivate key file: {}",
+                args.output.display()
+            );
+            Ok(())
+        }
         Command::Up(args) => run_up(args),
         Command::Test(args) => run_test(args),
         Command::Mcp(args) => run_mcp(args),

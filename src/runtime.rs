@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::paths::artifacts_root;
 use crate::process::CommandRunner;
 
-const LIMA_VERSION: &str = "2.2.1";
+pub(crate) const LIMA_VERSION: &str = "2.2.1";
 const HELM_VERSION: &str = "3.19.0";
 const CRANE_VERSION: &str = "0.22.1";
 
