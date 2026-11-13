@@ -172,7 +172,7 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
                 ))
             })?;
             let outcome: ManifestApplyOutcome =
-                cluster_apply_manifest(&request.name, &manifest_content)?;
+                cluster_apply_manifest(&request.name, &manifest_content, &SystemRunner)?;
             println!("cluster: {}", outcome.cluster);
             println!("node: {}", outcome.node);
             println!("applied: {}", request.manifest_path.display());
@@ -3062,8 +3062,8 @@ mod tests {
 
     use super::{
         McpServer, SUPPORTED_PROTOCOL_VERSION, TaskSupport, ToolCallRequest, execute_direct_tool,
-        linux_firecracker_sudo_guidance_from_args, parse_tool_args, task_command, tool_by_name,
-        tool_definitions,
+        linux_firecracker_sudo_guidance_from_args, parse_tool_args, tail_lines, task_command,
+        tool_by_name, tool_definitions,
     };
 
     #[test]
