@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: kalisto-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-fmt:
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 60
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-target-fmt
+    steps:
+      - name: Checkout exact revision
+        run: |
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          # Keep the job token out of the persisted remote URL.
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5 6; do
+            if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            sleep 10
+          done
+          git checkout -q FETCH_HEAD
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+      - name: Format
+        run: cargo fmt --all --check
+
+  rust-clippy:
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 60
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-target-clippy
+    steps:
+      - name: Checkout exact revision
+        run: |
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5 6; do
+            if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            sleep 10
+          done
+          git checkout -q FETCH_HEAD
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Compile cache stats
+        if: always()
+        run: sccache --show-stats
+
+  rust-test:
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 60
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-target-test
+    steps:
+      - name: Checkout exact revision
+        run: |
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5 6; do
+            if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            sleep 10
+          done
+          git checkout -q FETCH_HEAD
+      - name: Test
+        run: cargo test -- --test-threads=1
+
+  build-bin:
+    runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
+    timeout-minutes: 60
+    container:
+      image: ${{ vars.KALISTO_CI_IMAGE }}
+      options: ${{ vars.KALISTO_CI_CONTAINER_OPTIONS }}
+    env:
+      CARGO_TARGET_DIR: /tmp/kalisto-target-build
+    needs: [rust-fmt, rust-clippy, rust-test]
+    steps:
+      - name: Checkout exact revision
+        run: |
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5 6; do
+            if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            sleep 10
+          done
+          git checkout -q FETCH_HEAD
+      - name: Build release binary
+        run: cargo build --release --bin kalisto
+      - name: Smoke run
+        run: /tmp/kalisto-target-build/release/kalisto ls
