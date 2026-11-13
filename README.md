@@ -9,6 +9,14 @@ Current scope:
 - Kubernetes distro: `k3s`
 - image pipeline: native VZ OS preparation; optional legacy container builders
 
+## Binary releases
+
+Pushed version tags publish packages to [forgejo Releases](https://forgejo.example.test/cloudflavor/kalisto/releases):
+**macOS amd64/arm64 and static Linux amd64/arm64**, with SHA-256 checksums.
+All targets must build successfully before the release is published.
+See [release targets, verification and tagging](docs/releases.md). Linux backend
+support remains in progress; available binaries do not imply feature parity.
+
 ## Quick Start
 
 Install the standalone macOS binary, then run from any directory:
