@@ -71,6 +71,29 @@ kubectl apply -f app.yaml
 startup; the boot cache does not include every application. Ingress is not installed
 by default.
 
+## Save / restore installed clusters
+
+Installed workloads and VM-local data already survive `down` / `up`. To transfer a
+cold cluster with its disks, credentials and boot assets:
+
+```bash
+kalisto archive-keygen --output /secure/dev.agekey
+# Replace age1... with the printed public recipient:
+kalisto export --name dev --output /secure/dev.kalisto.age --recipient age1... --stop
+# On a compatible target without a same-name cluster or Lima instances:
+kalisto import /secure/dev.kalisto.age --identity /secure/dev.agekey
+kalisto up --name dev
+```
+
+Without `--stop`, export requires stopped nodes. Import never overwrites or boots
+anything, and preserves original cluster/node names. Native `age` encryption needs
+no external tools. Alternatively use `--passphrase` for terminal prompts or a private
+`--passphrase-file` for automation. Keep recovery keys separate from backups.
+**No encryption flags means an unencrypted, secret-bearing archive.** External host
+mounts/additional disks/custom provisioning are rejected rather than omitted.
+See [archive safety, compatibility and validation limits](docs/cluster-archives.md).
+Native restore evidence is still pending; mocked disk tests are not live VM proof.
+
 ## AI agents
 
 **CLI + a small skill/instruction layer is the default recommendation for coding
