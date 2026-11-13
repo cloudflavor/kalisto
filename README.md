@@ -1,69 +1,144 @@
 # Kalisto
 
-Early validation harness for a local-development Kubernetes runtime on macOS using Lima.
+Local-development Kubernetes runtime on macOS using native Lima/VZ.
 
 Current scope:
 
-- macOS backend: Lima (`vz` + Rosetta)
+- macOS backend: native Lima `vz` (Rosetta opt-in)
 - Linux backend: Firecracker (in progress)
 - Kubernetes distro: `k3s`
-- image pipeline: container-built seed image plus macOS finalization pass
+- image pipeline: native VZ OS preparation; optional legacy container builders
 
-## Harness examples
+## Quick Start
 
-Sample generic E2E harness projects live under [examples/](/Users/runner/projects/rust/kalisto/examples).
-
-Try:
+Install the standalone macOS binary, then run from any directory:
 
 ```bash
-cargo run -- test ls --project-root examples/harness/nginx-smoke
-cargo run -- test ls --project-root examples/harness/job-smoke
+kalisto pull --addons cni/cilium
+kalisto up --workers 2 --addons cni/cilium
 ```
+
+Preparation is per artifact profile (architecture, K3s/Cilium versions, and enabled
+components), **not per cluster or working directory**. Reuse that cache for fresh
+boots; rerun `pull` when the profile changes or cache is removed. Repeating `pull`
+verifies/reuses a complete cache rather than rebuilding the OS image. Bare
+`pull`/`up` do **not** select a CNI.
+
+`pull` fetches checksum-verified managed Lima, Helm, Crane, K3s, and
+platform-digest-pinned OCI images including a BusyBox diagnostic image. It prepares
+a sanitized compressed Ubuntu disk via a temporary native VZ VM, never starting
+Kubernetes or creating cluster state; the builder is deleted after use. Standard
+flow requires no checkout, manual templates, Homebrew, Docker, QEMU install, or
+host sudo. Cache lives under `artifacts/boot-v4` in user-scoped Kalisto data.
+Preparation can take several minutes and stays outside cold cluster startup timing.
+
+`up` requires a complete cache, mounts it read-only, imports local images on fresh
+VMs, and applies Cilium without Helm download jobs. The cached chart is rendered
+locally during `up` so generated Hubble TLS keys are unique to each cluster, not
+shared cache contents. Its private manifest is stored with mode `0600` in that
+cluster's runtime directory and reused on resume. All rendered DaemonSets and
+Deployments must finish rolling out. Cilium uses embedded Envoy with L7 policy
+support enabled rather than a separate proxy DaemonSet. Default CNI remains `none`:
+explicit Cilium selection is required for pod networking. MCP exposes the same
+preparation through `clusters.pull`, using the lifecycle arguments of `clusters.up`.
+
+The current prepared startup profile supports Lima, no CNI or Cilium, and optional
+`lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
+silently; install those explicitly after startup. Existing Helm-managed Cilium
+clusters require migration; prepared startup currently targets fresh clusters.
+
+The opt-in release benchmark in `tests/macos_three_node_boot_budget.rs` passed
+in **56.07s, 53.84s, 54.26s, and 54.83s** on the development Mac. Each run used the actual
+binary from an empty directory with system-only `PATH`, fresh three VMs, three
+Ready nodes, authenticated host API, Cilium rollouts, and DNS/Service HTTP probes
+from both workers. Image imports and VM creation remain inside the timer;
+`pull` preparation stays outside it. These measurements are not a universal
+hardware performance guarantee.
+
+## Install workloads
+
+After `up`, Cilium and CoreDNS provide pod networking and DNS. Supply a Kubernetes
+client such as `kubectl`; host `kubectl` is not installed automatically:
+
+```bash
+export KUBECONFIG="$(kalisto kubeconfig --path)"
+kubectl get nodes
+kubectl -n kube-system get pods
+kubectl apply -f app.yaml
+```
+
+Or work without a host Kubernetes client: `kalisto apply` ships a manifest to the
+running cluster, and `kalisto kubectl` runs a checksum-verified managed kubectl
+binary matching the cluster's K3s release (fetched on first use, not during `up`):
+
+`app.yaml` is user-provided. New workload images may require registry access after
+startup; the boot cache does not include every application. Ingress is not installed
+by default.
+
+## AI agents
+
+**CLI + a small skill/instruction layer is the default recommendation for coding
+agents with shell access.** Kalisto also already includes an optional stdio MCP
+server for structured tools and background lifecycle tasks. No new server is needed.
+Lifecycle MCP calls require a task-capable client; not every MCP integration supports
+that. See [AI agent workflows, MCP setup, and safety rules](docs/ai-agents.md).
 
 ## Product commands
 
-The first product-facing commands are available now:
+Use the installed binary; a checkout and `cargo run` are not required:
 
 ```bash
-cargo run -- up
-cargo run -- ls
-cargo run -- down --name kalisto
-cargo run -- destroy --name kalisto
-cargo run -- status --name kalisto
-cargo run -- kubeconfig --name kalisto
-cargo run -- bench --runs 3
+kalisto pull --addons cni/cilium
+kalisto up --workers 2 --addons cni/cilium
+kalisto ls
+kalisto --json ls
+kalisto apply --name kalisto --manifest app.yaml
+kalisto kubectl --name kalisto -- get nodes
+kalisto down --name kalisto
+kalisto destroy --name kalisto
+kalisto status --name kalisto
+kalisto kubeconfig --name kalisto
+kalisto bench --runs 3 --workers 2 --addons cni/cilium
 ```
+
+`down` stops VMs but retains state/disks. `destroy` deletes them irreversibly.
+`destroy --all` / `destroy -a` deletes all saved clusters; use only for an explicitly
+authorized full cleanup. Prepared artifacts remain cached.
 
 Lifecycle progress logs are enabled by default at `info` level, so `up`, `down`, and `bench`
 show stage transitions as they happen. Raw streamed Lima startup output and live `k3s`
 bootstrap logs are only shown at `debug`. Use `RUST_LOG` to raise or lower verbosity:
 
 ```bash
-RUST_LOG=debug cargo run -- up
-RUST_LOG=warn cargo run -- bench --runs 3
+RUST_LOG=debug kalisto up --addons cni/cilium
+RUST_LOG=warn kalisto bench --runs 3 --workers 2 --addons cni/cilium
 ```
 
 Optional `up` knobs:
 
 ```bash
-cargo run -- up \
+kalisto up \
+  --addons cni/cilium \
   --project-root . \
   --workers 0 \
-  --api-port 16443 \
-  --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
+  --api-port 16443
 ```
 
-Ingress add-ons can be enabled at cluster bring-up:
+Install ingress explicitly after prepared startup (these are online operations,
+not part of the prepared boot budget):
 
 ```bash
 # Traefik ingress + MetalLB
-cargo run -- up --addons ingress/traefik --addons lb/metallb
+kalisto addon install --name kalisto ingress/traefik
+kalisto addon install --name kalisto lb/metallb
 
-# Kong ingress + MetalLB
-cargo run -- up --addons ingress/kong --addons lb/metallb
+# Or Kong ingress + MetalLB
+kalisto addon install --name kalisto ingress/kong
+kalisto addon install --name kalisto lb/metallb
 ```
 
-MetalLB address configuration is config-only via `kalisto.toml`:
+MetalLB address configuration is config-only via `kalisto.toml`. Add this after
+prepared base startup; enabling it before `pull` selects an unsupported offline profile:
 
 ```toml
 [plugins.metallb]
@@ -103,7 +178,7 @@ To expose an app, create a Kubernetes `Ingress` and set `spec.rules[].host` to y
 Resolve ingress service IPs:
 
 ```bash
-KUBECONFIG_PATH="$(cargo run -- kubeconfig --path)"
+KUBECONFIG_PATH="$(kalisto kubeconfig --path)"
 kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system get svc traefik
 kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system get svc kong-kong-proxy
 ```
@@ -187,11 +262,58 @@ config: ~/.config/kalisto
 state:  ~/.local/share/kalisto/clusters/<name>/
 ```
 
-The benchmark command runs the real lifecycle path repeatedly and prints per-run timings:
+The optional benchmark command runs the real lifecycle path repeatedly and prints
+per-run timings:
 
 ```bash
-cargo run -- bench \
-  --runs 3
+kalisto bench --runs 3 --workers 2 --addons cni/cilium
+```
+
+This prints lifecycle timings; the functional three-node budget test below performs
+stronger API, DNS, and cross-node traffic checks.
+
+## Three-node cold-start budget
+
+The release test runs the actual CLI from an empty working directory with system-only
+`PATH`. `pull` runs outside the timer; all three fresh cluster VMs are created inside
+it. Managed native VZ preparation supplies the sanitized compressed raw node image:
+no manual template, hand-built qcow2, or host Helm/Crane installation is required.
+
+The same clock includes image imports, three Ready nodes, authenticated host API,
+every rendered Cilium DaemonSet/Deployment rollout, DNS from both workers, and
+cross-node HTTP through a Service. Cilium uses embedded Envoy with L7 policy support;
+there is no separate Envoy DaemonSet. Probe images use cached platform digests with
+`imagePullPolicy: Never`. Preparation never creates cluster state or benchmark VMs;
+precreated cluster VMs and manual `k3s` bootstrap do not qualify.
+
+Four development-Mac runs passed in **56.07s, 53.84s, 54.26s, and 54.83s**. These are
+measurements, not a universal hardware guarantee or a sub-minute claim for first-time
+preparation.
+
+Maintainer benchmark on a CI macOS runner:
+
+```bash
+KALISTO_LIVE_THREE_NODE_BOOT_BUDGET=1 \
+  cargo test --release --test macos_three_node_boot_budget -- --nocapture
+```
+
+The test supplies its own empty workdir and does not use `KALISTO_LIMA_TEMPLATE`.
+Evidence under `target/kalisto/boot-budget/` includes aggregate `summary.json`, per-run
+`result.json`, preparation/startup logs, pod/events JSON, and VM boot/image-import
+logs captured before cleanup. CI is the default execution path; local builds and
+benchmarks require explicit user authorization. On this development Mac, build/image
+artifacts, caches, and large temporaries must stay on `/Volumes/Builds/runner/`;
+cluster VM runtime disks may use the local SSD.
+
+## Contributor harness examples
+
+The examples below are source-checkout development commands, not installation
+prerequisites for binary users. Sample E2E harness projects live under
+[examples/](examples/):
+
+```bash
+cargo run -- test ls --project-root examples/harness/nginx-smoke
+cargo run -- test ls --project-root examples/harness/job-smoke
 ```
 
 ## Build versioning
@@ -219,24 +341,25 @@ To force a specific version string in CI or local builds:
 KALISTO_BUILD_VERSION=1.4.3-rc.1+build42 cargo build
 ```
 
-## Lima image pipeline
+## Advanced: legacy Lima image build helpers
 
-Kalisto uses a two-stage image flow:
+The standard binary-only path is `kalisto pull`: it prepares a sanitized compressed
+Ubuntu raw disk through native VZ without starting Kubernetes. No scripts in this
+section are required for that flow.
 
-1. a Linux-container seed image build that runs in GitLab or `opal`
-2. a macOS-only finalization pass that boots the seed once under Lima and exports a warmed node disk
+The optional maintainer scripts below provide a separate two-stage image flow:
+
+1. a Linux-container seed image build using the maintainer scripts / GitLab config
+2. a macOS finalization pass that boots the seed under Lima and exports a finalized OS disk
 
 Relevant files:
 
-- [images/macos/lima-node/ubuntu-24.04.yaml](/Users/runner/projects/rust/kalisto/images/macos/lima-node/ubuntu-24.04.yaml)
-- [scripts/macos/provision_lima_node.sh](/Users/runner/projects/rust/kalisto/scripts/macos/provision_lima_node.sh)
-- [scripts/macos/build_lima_node_image.sh](/Users/runner/projects/rust/kalisto/scripts/macos/build_lima_node_image.sh)
-- [scripts/macos/finalize_lima_node_image.sh](/Users/runner/projects/rust/kalisto/scripts/macos/finalize_lima_node_image.sh)
-- [scripts/macos/render_lima_artifact_template.sh](/Users/runner/projects/rust/kalisto/scripts/macos/render_lima_artifact_template.sh)
-- [/.opal/config.toml](/Users/runner/projects/rust/kalisto/.opal/config.toml)
-- [/.gitlab-ci.yml](/Users/runner/projects/rust/kalisto/.gitlab-ci.yml)
-
-The checked-in `opal` config raises the default Apple `container` job VM size for this repo to `6` CPUs and `8g` of memory, which keeps the `libguestfs` image build from running in the tiny default microVM.
+- [images/macos/lima-node/ubuntu-24.04.yaml](images/macos/lima-node/ubuntu-24.04.yaml)
+- [scripts/macos/provision_lima_node.sh](scripts/macos/provision_lima_node.sh)
+- [scripts/macos/build_lima_node_image.sh](scripts/macos/build_lima_node_image.sh)
+- [scripts/macos/finalize_lima_node_image.sh](scripts/macos/finalize_lima_node_image.sh)
+- [scripts/macos/render_lima_artifact_template.sh](scripts/macos/render_lima_artifact_template.sh)
+- [/.gitlab-ci.yml](.gitlab-ci.yml)
 
 Build the seed image:
 
@@ -272,9 +395,12 @@ Default artifacts:
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
 - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
 
-## Releasing Lima images
+## Advanced: releasing prebuilt Lima images
 
-For a usable Kalisto Lima release, the important runtime artifact is the finalized
+This optional publishing workflow uses the legacy helpers above, not the managed
+native preparation performed by `kalisto pull`.
+
+For a published prebuilt image, the important runtime artifact is the finalized
 disk image. Kalisto can render the matching Lima template locally from that image,
 so the minimum published artifact set is:
 
@@ -295,9 +421,9 @@ Build and finalize the release image with these scripts:
 sh scripts/macos/finalize_lima_node_image.sh
 ```
 
-The finalize step requires `qemu-img` because Kalisto now exports the warmed
-Lima VM disk as a compact finalized `qcow2` artifact instead of publishing the
-raw sparse disk directly.
+The legacy finalize script requires `qemu-img` to export a compact finalized
+`qcow2`. The standard native `kalisto pull` path instead exports compressed raw
+and does not require a host QEMU installation.
 
 The first script produces the seed image and manifest. The second script boots
 that seed once under Lima, waits for the guest to contain the Kalisto node-image
@@ -339,15 +465,15 @@ The Linux Firecracker path should reuse the same Ubuntu guest lineage as Lima, b
 Current shape:
 
 - shared guest provisioning script:
-  - [scripts/image/provision_kalisto_node.sh](/home/runner/projects/rust/kalisto/scripts/image/provision_kalisto_node.sh)
+  - [scripts/image/provision_kalisto_node.sh](scripts/image/provision_kalisto_node.sh)
 - Linux kernel builder:
-  - [scripts/linux/build_firecracker_kernel.sh](/home/runner/projects/rust/kalisto/scripts/linux/build_firecracker_kernel.sh)
+  - [scripts/linux/build_firecracker_kernel.sh](scripts/linux/build_firecracker_kernel.sh)
 - Linux rootfs builder:
-  - [scripts/linux/build_firecracker_rootfs.sh](/home/runner/projects/rust/kalisto/scripts/linux/build_firecracker_rootfs.sh)
+  - [scripts/linux/build_firecracker_rootfs.sh](scripts/linux/build_firecracker_rootfs.sh)
 - unified artifact manifest renderer:
-  - [scripts/linux/render_firecracker_artifact_manifest.sh](/home/runner/projects/rust/kalisto/scripts/linux/render_firecracker_artifact_manifest.sh)
+  - [scripts/linux/render_firecracker_artifact_manifest.sh](scripts/linux/render_firecracker_artifact_manifest.sh)
 - prerequisites:
-  - [docs/prerequisites-linux-firecracker.md](/home/runner/projects/rust/kalisto/docs/prerequisites-linux-firecracker.md)
+  - [docs/prerequisites-linux-firecracker.md](docs/prerequisites-linux-firecracker.md)
 
 For rootless Linux Firecracker networking, install `slirp4netns` and use
 `--network slirp4netns`.
@@ -445,7 +571,7 @@ Optional overrides:
 ```bash
 cargo run -- probe-macos-lima \
   --workspace-root . \
-  --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml \
+  --template /absolute/path/to/custom-node.yaml \
   --network vzNAT
 ```
 
@@ -478,24 +604,28 @@ Minimal multi-node probe:
 ```bash
 cargo run -- probe-macos-lima-k3s \
   --workspace-root . \
-  --template /Users/runner/projects/rust/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml \
+  --template /absolute/path/to/custom-node.yaml \
   --workers 1
 ```
 
-The current bootstrap baseline intentionally disables bundled add-ons at server start so they can become post-boot plugin boundaries:
+These legacy k3s probes use a different baseline from prepared `kalisto up`.
+Their default configuration disables these bundled components:
 
 - `traefik`
 - `servicelb`
 - `metrics-server`
 - `local-storage`
-- `coredns`
 - embedded network policy
 
-The current baseline keeps:
+The default probe baseline keeps:
 
 - `containerd`
 - `kube-proxy`
+- CoreDNS
 - Flannel
+
+Prepared product startup instead defaults to no CNI and requires explicit Cilium
+selection for networking; the probe defaults above do not describe that workflow.
 
 ## Live tests
 

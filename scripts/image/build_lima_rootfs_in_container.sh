@@ -30,7 +30,8 @@ EOF
 chmod 0755 /usr/sbin/policy-rc.d
 
 apt_retry update
-apt_retry install -y --no-install-recommends ${PACKAGE_LIST}
+# Lima must not download runtime prerequisites during a timed cluster boot.
+apt_retry install -y --no-install-recommends ${PACKAGE_LIST} dbus dbus-user-session systemd-resolved rsync lsb-release
 
 mkdir -p /etc/cloud/cloud.cfg.d /etc/kalisto /usr/local/lib/kalisto/cache /boot/efi /boot/grub /etc/systemd/network /etc/netplan
 mkdir -p /etc/systemd/system/ssh.service.d
@@ -41,31 +42,12 @@ preserve_hostname: false
 manage_etc_hosts: true
 EOF
 
-cat > /etc/cloud/cloud.cfg.d/99_kalisto_network.cfg <<'EOF'
-network:
-  config: disabled
-EOF
-
-cat > /etc/systemd/network/10-kalisto-dhcp.network <<'EOF'
-[Match]
-Type=ether
-
-[Network]
-DHCP=yes
-IPv6AcceptRA=yes
-EOF
-
-cat > /etc/netplan/10-kalisto-dhcp.yaml <<'EOF'
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    default-en:
-      match:
-        name: "en*"
-      dhcp4: true
-      dhcp6: true
-EOF
+# Lima supplies MAC-matched interface names, DHCP and DNS through NoCloud.
+# Disabling that config leaves wait-online waiting for eth0 while the NIC is
+# still named enp0s1; broad DHCP rules also wait for unavailable DHCPv6.
+rm -f /etc/cloud/cloud.cfg.d/99_kalisto_network.cfg \
+  /etc/systemd/network/10-kalisto-dhcp.network \
+  /etc/netplan/10-kalisto-dhcp.yaml
 
 cat > /etc/systemd/system/ssh.service.d/10-kalisto-hostkeys.conf <<'EOF'
 [Service]
@@ -89,8 +71,12 @@ find / -xdev \( -perm -4000 -o -perm -2000 \) -printf '%m %U %G %p\n' | sort > /
 
 ssh-keygen -A
 systemctl disable ssh.socket >/dev/null 2>&1 || true
-systemctl enable systemd-networkd.service ssh.service serial-getty@hvc0.service serial-getty@ttyAMA0.service
-systemctl enable systemd-resolved.service 2>/dev/null || true
+# systemd-getty-generator selects the consoles actually present. Explicitly
+# enabling ttyAMA0 on VZ holds cloud-final behind a 90-second device timeout.
+systemctl enable systemd-networkd.service ssh.service
+systemctl enable dbus.service systemd-resolved.service
+# The image assembly step creates resolv.conf after BuildKit export: this
+# path is a BuildKit-managed mount while the container RUN is executing.
 
 cat > /boot/grub/grub.cfg <<'EOF'
 search --no-floppy --label --set=root cloudimg-rootfs

@@ -43,6 +43,7 @@ pub struct BackendConfig {
     pub firecracker_kernel: Option<PathBuf>,
     pub firecracker_rootfs: Option<PathBuf>,
     pub stream_vm_logs: bool,
+    pub boot_assets_root: Option<crate::pull::PreparedAssets>,
 }
 
 #[derive(Debug, Clone)]

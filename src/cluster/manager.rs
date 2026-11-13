@@ -26,7 +26,7 @@ use crate::cluster::wait::{
 };
 use crate::config::load::load_project_config;
 use crate::error::{Error, Result};
-use crate::k3s::NodeRole;
+use crate::k3s::{NodeRole, ServerMode};
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
 use crate::shell::shell_escape;
 use crate::telemetry::raw_streams_enabled;
@@ -127,6 +127,7 @@ struct WorkerJoinContext<'a> {
     worker_memory_gib: u8,
     server_url: &'a str,
     server_token: &'a str,
+    prestarted_at: Option<Instant>,
 }
 
 pub fn up(spec: &ClusterSpec) -> Result<UpOutcome> {
@@ -158,7 +159,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
 
     ensure_path_exists(&resolved_spec.workspace_root)?;
     let workspace_root = canonicalize_path(&resolved_spec.workspace_root)?;
-    let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &resolved_spec.name);
+    let runtime_root = state_root.join("runtime");
 
     let backend = backend_for(resolved_spec.backend);
     debug_feedback(format!(
@@ -183,6 +184,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         network: resolved_spec.network.clone(),
         firecracker_kernel: resolved_spec.firecracker_kernel.clone(),
         firecracker_rootfs: resolved_spec.firecracker_rootfs.clone(),
+        boot_assets_root: None,
         stream_vm_logs: resolved_spec.stream_vm_logs,
     };
     let instance_names = state
@@ -223,6 +225,11 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.exists() {
+        if spec.backend == crate::backend::BackendKind::Lima {
+            crate::pull::load(spec)?;
+            let resolved = resolve_cluster_spec(spec, runner)?;
+            crate::pull::validate_lima_template(&resolved.template)?;
+        }
         debug_feedback(format!(
             "up: cluster `{}` has no persisted definition, creating it first",
             spec.name
@@ -231,13 +238,17 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
     let state = ClusterState::load(&state_root)?;
     if cluster_has_running_nodes(runner, &state)? {
-        return Err(Error::InvalidArgs(format!(
-            "cluster `{}` is already running",
-            state.name
-        )));
+        info!(cluster = %state.name, "resuming existing cluster bring-up");
     }
     let resolved_spec = resolve_up_spec(&state, spec);
     let spec = &resolved_spec;
+    let prepared = if spec.backend == crate::backend::BackendKind::Lima {
+        let assets = crate::pull::load(spec)?;
+        crate::pull::validate_lima_template(&spec.template)?;
+        Some(assets)
+    } else {
+        None
+    };
     let up_span = info_span!(
         "cluster_up",
         cluster = %spec.name,
@@ -258,7 +269,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     ensure_path_exists(&spec.workspace_root)?;
     let workspace_root = canonicalize_path(&spec.workspace_root)?;
 
-    let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+    let runtime_root = state_root.join("runtime");
 
     let backend = backend_for(spec.backend);
     backend.check_available(runner)?;
@@ -285,6 +296,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         network: spec.network.clone(),
         firecracker_kernel: spec.firecracker_kernel.clone(),
         firecracker_rootfs: spec.firecracker_rootfs.clone(),
+        boot_assets_root: prepared.clone(),
         stream_vm_logs: spec.stream_vm_logs,
     };
 
@@ -295,33 +307,28 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     );
     fs::create_dir_all(&control_plane.artifacts.root).map_err(io_error("create_dir_all"))?;
 
+    let worker_instances: Vec<Instance> = (0..spec.worker_count)
+        .map(|index| {
+            let name = format!("kalisto-{}-w{index}", spec.name);
+            Instance::new(name.clone(), NodeRole::Worker, runtime_root.join(&name))
+        })
+        .collect();
+    let nodes = std::iter::once(control_plane.clone())
+        .chain(worker_instances.iter().cloned())
+        .collect::<Vec<_>>();
     let mut started_instances = Vec::new();
     let cluster_started = Instant::now();
 
-    info!(
-        node = %control_plane.name,
-        cpus = spec.control_plane_resources.cpus,
-        memory_gib = spec.control_plane_resources.memory_gib,
-        "starting control-plane VM"
-    );
-    debug_feedback(format!(
-        "up: starting control-plane VM `{}` ({} vCPU, {} GiB)",
-        control_plane.name,
-        spec.control_plane_resources.cpus,
-        spec.control_plane_resources.memory_gib
-    ));
-    let control_plane_start = backend.start_instance(
+    // VM boot does not depend on the server join token. Start every VM now,
+    // then join the already-booted agents once the control-plane API is ready.
+    if let Err(error) = start_cluster_instances(
+        backend,
         runner,
         &base_config,
-        &InstanceConfig {
-            name: control_plane.name.clone(),
-            runtime_root: control_plane.artifacts.root.clone(),
-            host_port_forward: Some(spec.api_port),
-            cpus: spec.control_plane_resources.cpus,
-            memory_gib: spec.control_plane_resources.memory_gib,
-        },
-    );
-    if let Err(error) = control_plane_start {
+        spec,
+        &nodes,
+        &mut started_instances,
+    ) {
         return Err(rollback_failed_up(
             backend,
             runner,
@@ -332,11 +339,6 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
             error,
         ));
     }
-    started_instances.push(NodeState {
-        name: control_plane.name.clone(),
-        role: control_plane.role,
-        artifacts_root: control_plane.artifacts.root.clone(),
-    });
     info!(node = %control_plane.name, "control-plane VM started");
     debug_feedback(format!(
         "up: control-plane VM `{}` started, bootstrapping k3s",
@@ -464,8 +466,51 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
+    // Avoid the agent's connection backoff before the API first accepts requests.
+    // Agents can import images and retry their join while stable API checks
+    // run; the token already exists, and all final readiness gates remain below.
+    let server_token = fs::read_to_string(&control_plane.artifacts.token)
+        .map_err(io_error("read_to_string"))?
+        .trim()
+        .to_owned();
+    let server_url = format!("https://{control_plane_host}:6443");
+    if !worker_instances.is_empty() {
+        info!(
+            workers = worker_instances.len(),
+            "bootstrapping workers with join token"
+        );
+    }
+    if let Err(error) = start_and_join_workers(
+        backend,
+        runner,
+        WorkerJoinContext {
+            base_config: &base_config,
+            k3s_config: &k3s_config,
+            control_plane: &control_plane,
+            control_plane_guest_kubeconfig: &control_plane_guest_kubeconfig,
+            worker_cpus: spec.worker_resources.cpus,
+            worker_memory_gib: spec.worker_resources.memory_gib,
+            server_url: &server_url,
+            server_token: &server_token,
+            prestarted_at: Some(cluster_started),
+        },
+        &worker_instances,
+        &mut started_instances,
+        false,
+    ) {
+        return Err(rollback_failed_up(
+            backend,
+            runner,
+            &started_instances,
+            &state_root,
+            &runtime_root,
+            spec.keep_failed_runtime,
+            error,
+        ));
+    }
+
     let stable_ready_check = format!(
-        "KUBECONFIG={} /usr/local/bin/k3s kubectl get --raw=/livez",
+        "KUBECONFIG={} /usr/local/bin/k3s kubectl --request-timeout=5s get --raw=/readyz",
         shell_escape(
             control_plane_guest_kubeconfig
                 .as_os_str()
@@ -482,7 +527,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
             command: &stable_ready_check,
             timeout: Duration::from_secs(120),
             consecutive_successes: 3,
-            interval: Duration::from_secs(5),
+            interval: Duration::from_secs(1),
         },
         &mut control_plane_tail,
     ) {
@@ -527,42 +572,21 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         control_plane_ready
     ));
 
-    let server_token = fs::read_to_string(&control_plane.artifacts.token)
-        .map_err(io_error("read_to_string"))?
-        .trim()
-        .to_owned();
-    let server_url = format!("https://{control_plane_host}:6443");
-
-    let worker_instances: Vec<Instance> = (0..spec.worker_count)
-        .map(|index| {
-            let name = format!("kalisto-{}-w{index}", spec.name);
-            Instance::new(name.clone(), NodeRole::Worker, runtime_root.join(&name))
-        })
-        .collect();
-
-    if !worker_instances.is_empty() {
-        info!(workers = worker_instances.len(), "starting worker VMs");
-        debug_feedback(format!(
-            "up: starting {} worker VM(s)",
-            worker_instances.len()
-        ));
-    }
-    if let Err(error) = start_and_join_workers(
-        backend,
-        runner,
-        WorkerJoinContext {
-            base_config: &base_config,
-            k3s_config: &k3s_config,
+    if let Err(error) = install_addons_and_wait_for_nodes(
+        PostReadyAddonRequest {
+            backend,
+            runner,
             control_plane: &control_plane,
-            control_plane_guest_kubeconfig: &control_plane_guest_kubeconfig,
-            worker_cpus: spec.worker_resources.cpus,
-            worker_memory_gib: spec.worker_resources.memory_gib,
-            server_url: &server_url,
-            server_token: &server_token,
+            guest_kubeconfig: &control_plane_guest_kubeconfig,
+            cni: spec.cni_plugin,
+            builtin_flannel: !spec.component_toggles.flannel_backend_none,
+            cilium_version: &spec.cilium_version,
+            addons: &spec.addons,
+            metallb: &spec.metallb,
         },
         &worker_instances,
-        &mut started_instances,
-        spec.cni_plugin == CniPlugin::Flannel,
+        spec.server_mode,
+        prepared.as_ref(),
     ) {
         return Err(rollback_failed_up(
             backend,
@@ -573,55 +597,6 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
             spec.keep_failed_runtime,
             error,
         ));
-    }
-
-    if let Err(error) = install_post_ready_addons(PostReadyAddonRequest {
-        backend,
-        runner,
-        control_plane: &control_plane,
-        guest_kubeconfig: &control_plane_guest_kubeconfig,
-        cni: spec.cni_plugin,
-        cilium_version: &spec.cilium_version,
-        addons: &spec.addons,
-        metallb: &spec.metallb,
-    }) {
-        return Err(rollback_failed_up(
-            backend,
-            runner,
-            &started_instances,
-            &state_root,
-            &runtime_root,
-            spec.keep_failed_runtime,
-            error,
-        ));
-    }
-
-    if spec.cni_plugin == CniPlugin::Cilium {
-        for worker in &worker_instances {
-            info!(
-                node = %worker.name,
-                "waiting for worker readiness after cilium bootstrap"
-            );
-            if let Err(error) = wait_for_node_ready(
-                backend,
-                runner,
-                &control_plane.name,
-                &control_plane.artifacts.root,
-                &control_plane_guest_kubeconfig,
-                &worker.name,
-            ) {
-                return Err(rollback_failed_up(
-                    backend,
-                    runner,
-                    &started_instances,
-                    &state_root,
-                    &runtime_root,
-                    spec.keep_failed_runtime,
-                    error,
-                ));
-            }
-            info!(node = %worker.name, "worker is ready");
-        }
     }
 
     let persisted_kubeconfig = state_root.join("kubeconfig.yaml");
@@ -705,6 +680,169 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     })
 }
 
+fn start_planned_instance(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    config: &BackendConfig,
+    plan: &InstanceConfig,
+) -> Result<()> {
+    info!(
+        node = %plan.name,
+        cpus = plan.cpus,
+        memory_gib = plan.memory_gib,
+        "starting node VM"
+    );
+    let role = if plan.host_port_forward.is_some() {
+        NodeRole::ControlPlane
+    } else {
+        NodeRole::Worker
+    };
+    let node = Instance::new(plan.name.clone(), role, plan.runtime_root.clone());
+    start_node_instance(
+        backend,
+        runner,
+        config,
+        &node,
+        plan.host_port_forward,
+        plan.cpus,
+        plan.memory_gib,
+    )?;
+    info!(node = %plan.name, "node VM started");
+    Ok(())
+}
+
+fn start_cluster_instances(
+    backend: &'static dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    config: &BackendConfig,
+    spec: &ClusterSpec,
+    nodes: &[Instance],
+    instances: &mut Vec<NodeState>,
+) -> Result<()> {
+    let mut plans = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        fs::create_dir_all(&node.artifacts.root).map_err(io_error("create_dir_all"))?;
+        let resources = match node.role {
+            NodeRole::ControlPlane => spec.control_plane_resources,
+            NodeRole::Worker => spec.worker_resources,
+        };
+        plans.push(InstanceConfig {
+            name: node.name.clone(),
+            runtime_root: node.artifacts.root.clone(),
+            host_port_forward: (node.role == NodeRole::ControlPlane).then_some(spec.api_port),
+            cpus: resources.cpus,
+            memory_gib: resources.memory_gib,
+        });
+        // A failed start can still leave a live VM. Rollback owns every attempt.
+        instances.push(NodeState {
+            name: node.name.clone(),
+            role: node.role,
+            artifacts_root: node.artifacts.root.clone(),
+        });
+    }
+    let Some(system_runner) = runner.system_runner() else {
+        if spec.cni_plugin == CniPlugin::Cilium
+            && let Some(assets) = &config.boot_assets_root
+            && let Some(node) = nodes
+                .iter()
+                .find(|node| node.role == NodeRole::ControlPlane)
+        {
+            assets.prepare_cilium_manifest(runner, node)?;
+        }
+        for plan in plans {
+            start_planned_instance(backend, runner, config, &plan)?;
+        }
+        return Ok(());
+    };
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(io_error("tokio-runtime-build"))?;
+    runtime.block_on(async {
+        let mut joins = Vec::with_capacity(plans.len() + 1);
+        // Per-cluster RSA/TLS generation is independent of VM boot and must not
+        // add to the API-to-CNI critical path. Drain it with the VM tasks.
+        if spec.cni_plugin == CniPlugin::Cilium
+            && let Some(assets) = &config.boot_assets_root
+            && let Some(node) = nodes
+                .iter()
+                .find(|node| node.role == NodeRole::ControlPlane)
+        {
+            let assets = assets.clone();
+            let node = node.clone();
+            joins.push(tokio::task::spawn_blocking(move || {
+                assets
+                    .prepare_cilium_manifest(&system_runner, &node)
+                    .map(|_| ())
+            }));
+        }
+        for plan in plans {
+            let config = config.clone();
+            joins.push(tokio::task::spawn_blocking(move || {
+                start_planned_instance(backend, &system_runner, &config, &plan)
+            }));
+        }
+        let mut first_error = None;
+        // Drain every task before returning: cleanup must never race a VM
+        // that is still being created by a sibling task.
+        for join in joins {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(Error::InvalidArgs(format!(
+                    "node start task failed: {error}"
+                ))),
+            };
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
+}
+
+fn install_addons_and_wait_for_nodes(
+    mut request: PostReadyAddonRequest<'_>,
+    workers: &[Instance],
+    server_mode: ServerMode,
+    prepared: Option<&crate::pull::PreparedAssets>,
+) -> Result<()> {
+    let backend = request.backend;
+    let runner = request.runner;
+    let control_plane = request.control_plane;
+    let guest_kubeconfig = request.guest_kubeconfig;
+    let cni = request.cni;
+    if cni == CniPlugin::Cilium
+        && let Some(assets) = prepared
+    {
+        assets.install_cilium(backend, runner, control_plane, guest_kubeconfig)?;
+        request.cni = CniPlugin::None;
+    }
+    install_post_ready_addons(request)?;
+
+    // Agents must register before CNI installation, but cannot become Ready
+    // until CNI is installed. This applies to Flannel as well as Cilium.
+    if cni != CniPlugin::None && server_mode != ServerMode::Agentless {
+        for node in std::iter::once(control_plane).chain(workers.iter()) {
+            info!(node = %node.name, "waiting for node readiness after CNI bootstrap");
+            wait_for_node_ready(
+                backend,
+                runner,
+                &control_plane.name,
+                &control_plane.artifacts.root,
+                guest_kubeconfig,
+                &node.name,
+            )?;
+            info!(node = %node.name, "node is ready");
+        }
+    }
+    Ok(())
+}
+
 pub fn down(name: &str, force: bool) -> Result<()> {
     let runner = SystemRunner;
     down_with_runner(name, force, &runner)
@@ -752,7 +890,7 @@ pub fn destroy_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<()>
 
 fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) -> Result<()> {
     let state = ClusterState::load(state_root)?;
-    let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
+    let runtime_root = state_root.join("runtime");
     let backend = backend_for(state.backend);
     let base_config = BackendConfig {
         template: state.template.clone(),
@@ -761,9 +899,21 @@ fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) ->
         network: state.network.clone(),
         firecracker_kernel: state.firecracker_kernel.clone(),
         firecracker_rootfs: state.firecracker_rootfs.clone(),
+        boot_assets_root: None,
         stream_vm_logs: false,
     };
-    delete_instances(backend, runner, &state.nodes);
+    let mut failures = Vec::new();
+    for node in state.nodes.iter().rev() {
+        if let Err(error) = backend.delete_instance(runner, &node.name, &node.artifacts_root) {
+            failures.push(format!("{}: {error}", node.name));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(Error::InvalidArgs(format!(
+            "cluster `{name}` definition retained because node removal failed: {}",
+            failures.join("; "),
+        )));
+    }
     let instance_names = state
         .nodes
         .iter()
@@ -796,6 +946,34 @@ pub fn logs(name: &str, node_name: &str) -> Result<NodeLogs> {
 pub fn list() -> Result<Vec<ClusterStatus>> {
     let runner = SystemRunner;
     list_with_runner(&runner)
+}
+
+pub fn defined_cluster_names() -> Result<Vec<String>> {
+    defined_cluster_names_at_root(&ClusterSpec::clusters_root_for()?)
+}
+
+fn defined_cluster_names_at_root(root: &Path) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("read_dir")(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_error("read_dir"))?;
+        let path = entry.path();
+        if path.is_dir() && ClusterState::state_file(&path).is_file() {
+            let name = entry.file_name().into_string().map_err(|_| {
+                Error::InvalidArgs(format!(
+                    "cluster directory is not UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn logs_at_root(state_root: &Path, node_name: &str) -> Result<NodeLogs> {
@@ -846,7 +1024,7 @@ pub fn install_addon_with_runner(
 
 fn scale_at_root(
     state_root: &Path,
-    name: &str,
+    _name: &str,
     workers: usize,
     runner: &dyn CommandRunner,
 ) -> Result<ScaleOutcome> {
@@ -878,7 +1056,7 @@ fn scale_at_root(
         });
     }
 
-    let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
+    let runtime_root = state_root.join("runtime");
     let backend = backend_for(state.backend);
     let control_plane_state = state
         .nodes
@@ -932,6 +1110,17 @@ fn scale_at_root(
         network: state.network.clone(),
         firecracker_kernel: state.firecracker_kernel.clone(),
         firecracker_rootfs: state.firecracker_rootfs.clone(),
+        boot_assets_root: if state.backend == BackendKind::Lima {
+            let mut asset_spec = cluster_spec_from_state(&state);
+            asset_spec.addons.clear();
+            match state.cni_plugin {
+                CniPlugin::Cilium => Some(crate::pull::load(&asset_spec)?),
+                CniPlugin::None => crate::pull::load(&asset_spec).ok(),
+                CniPlugin::Flannel => None,
+            }
+        } else {
+            None
+        },
         stream_vm_logs: false,
     };
 
@@ -975,6 +1164,7 @@ fn scale_at_root(
             worker_memory_gib: state.worker_resources.memory_gib,
             server_url: &server_url,
             server_token: &server_token,
+            prestarted_at: None,
         },
         &new_workers,
         &mut state.nodes,
@@ -1048,7 +1238,7 @@ fn collect_node_log_sections(node: &NodeState) -> Result<Vec<NodeLogSection>> {
 
 fn install_addon_at_root(
     state_root: &Path,
-    name: &str,
+    _name: &str,
     addon: &str,
     runner: &dyn CommandRunner,
 ) -> Result<AddonInstallOutcome> {
@@ -1067,7 +1257,7 @@ fn install_addon_at_root(
         metallb_config.validate()?;
     }
     validate_addon_install_allowed(&state, addon_id)?;
-    let runtime_root = ClusterSpec::runtime_root_for(&state.workspace_root, name);
+    let runtime_root = state_root.join("runtime");
     let backend = backend_for(state.backend);
     let control_plane_state = state
         .nodes
@@ -1097,6 +1287,16 @@ fn install_addon_at_root(
     let control_plane_guest_artifacts =
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
+
+    if addon_id == AddonId::CniFlannel
+        && state.cni_plugin == CniPlugin::Flannel
+        && !state.component_toggles.flannel_backend_none
+    {
+        return Ok(AddonInstallOutcome {
+            cluster: state.name,
+            addon: addon_id.as_str().to_owned(),
+        });
+    }
 
     info!(
         cluster = %state.name,
@@ -1696,16 +1896,24 @@ fn start_and_join_workers(
         );
     }
 
-    let started_workers = start_worker_instances(
-        backend,
-        runner,
-        context.base_config,
-        worker_instances,
-        context.worker_cpus,
-        context.worker_memory_gib,
-        instances,
-    )
-    .map_err(|error| Error::InvalidArgs(error.detail))?;
+    let started_workers = if let Some(boot_started) = context.prestarted_at {
+        worker_instances
+            .iter()
+            .cloned()
+            .map(|node| StartedWorker { node, boot_started })
+            .collect()
+    } else {
+        start_worker_instances(
+            backend,
+            runner,
+            context.base_config,
+            worker_instances,
+            context.worker_cpus,
+            context.worker_memory_gib,
+            instances,
+        )
+        .map_err(|error| Error::InvalidArgs(error.detail))?
+    };
 
     for started_worker in started_workers {
         let worker = started_worker.node;
@@ -1761,56 +1969,65 @@ fn start_and_join_workers_parallel(
     let worker_memory_gib = context.worker_memory_gib;
     let workers = worker_instances.to_vec();
 
-    let mut started_workers = runtime.block_on(async move {
-        let mut joins = Vec::with_capacity(workers.len());
-        for worker in workers {
-            let base_config = base_config.clone();
-            joins.push(tokio::task::spawn_blocking(
-                move || -> Result<StartedWorker> {
-                    fs::create_dir_all(&worker.artifacts.root)
-                        .map_err(io_error("create_dir_all"))?;
-                    let boot_started = Instant::now();
-                    info!(
-                        node = %worker.name,
-                        cpus = worker_cpus,
-                        memory_gib = worker_memory_gib,
-                        "starting worker VM"
-                    );
-                    start_node_instance(
-                        backend,
-                        &runner,
-                        &base_config,
-                        &worker,
-                        None,
-                        worker_cpus,
-                        worker_memory_gib,
-                    )
-                    .map_err(|error| Error::InvalidArgs(format!("{}: {error}", worker.name)))?;
-                    info!(node = %worker.name, "worker VM started");
-                    Ok(StartedWorker {
-                        node: worker,
-                        boot_started,
-                    })
-                },
-            ));
-        }
+    let mut started_workers = if let Some(boot_started) = context.prestarted_at {
+        workers
+            .into_iter()
+            .map(|node| StartedWorker { node, boot_started })
+            .collect()
+    } else {
+        runtime.block_on(async move {
+            let mut joins = Vec::with_capacity(workers.len());
+            for worker in workers {
+                let base_config = base_config.clone();
+                joins.push(tokio::task::spawn_blocking(
+                    move || -> Result<StartedWorker> {
+                        fs::create_dir_all(&worker.artifacts.root)
+                            .map_err(io_error("create_dir_all"))?;
+                        let boot_started = Instant::now();
+                        info!(
+                            node = %worker.name,
+                            cpus = worker_cpus,
+                            memory_gib = worker_memory_gib,
+                            "starting worker VM"
+                        );
+                        start_node_instance(
+                            backend,
+                            &runner,
+                            &base_config,
+                            &worker,
+                            None,
+                            worker_cpus,
+                            worker_memory_gib,
+                        )
+                        .map_err(|error| Error::InvalidArgs(format!("{}: {error}", worker.name)))?;
+                        info!(node = %worker.name, "worker VM started");
+                        Ok(StartedWorker {
+                            node: worker,
+                            boot_started,
+                        })
+                    },
+                ));
+            }
 
-        let mut started = Vec::new();
-        for join in joins {
-            let started_worker = join.await.map_err(|error| {
-                Error::InvalidArgs(format!("worker start task failed: {error}"))
-            })??;
-            started.push(started_worker);
-        }
-        Ok::<Vec<StartedWorker>, Error>(started)
-    })?;
+            let mut started = Vec::new();
+            for join in joins {
+                let started_worker = join.await.map_err(|error| {
+                    Error::InvalidArgs(format!("worker start task failed: {error}"))
+                })??;
+                started.push(started_worker);
+            }
+            Ok::<Vec<StartedWorker>, Error>(started)
+        })?
+    };
 
-    for started_worker in &started_workers {
-        instances.push(NodeState {
-            name: started_worker.node.name.clone(),
-            role: started_worker.node.role,
-            artifacts_root: started_worker.node.artifacts.root.clone(),
-        });
+    if context.prestarted_at.is_none() {
+        for started_worker in &started_workers {
+            instances.push(NodeState {
+                name: started_worker.node.name.clone(),
+                role: started_worker.node.role,
+                artifacts_root: started_worker.node.artifacts.root.clone(),
+            });
+        }
     }
 
     let k3s_config = context.k3s_config.clone();
@@ -1871,7 +2088,7 @@ fn start_and_join_workers_parallel(
     })
 }
 
-fn instance_status_is_running(status: &str) -> bool {
+pub(crate) fn instance_status_is_running(status: &str) -> bool {
     status.split_whitespace().any(|token| token == "Running")
 }
 
@@ -1916,6 +2133,7 @@ fn cluster_spec_from_state(state: &ClusterState) -> ClusterSpec {
 
 fn resolve_up_spec(state: &ClusterState, requested: &ClusterSpec) -> ClusterSpec {
     let mut resolved_spec = cluster_spec_from_state(state);
+    resolved_spec.image_arch = requested.image_arch;
     if let Some(workers) = requested.requested_worker_count {
         resolved_spec.worker_count = workers;
         resolved_spec.requested_worker_count = Some(workers);
@@ -1930,7 +2148,7 @@ fn cluster_state_from_spec(
     workspace_root: std::path::PathBuf,
     state_root: &Path,
 ) -> ClusterState {
-    let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+    let runtime_root = state_root.join("runtime");
     let control_plane_name = spec.control_plane_name();
     let mut nodes = Vec::with_capacity(spec.worker_count + 1);
     nodes.push(NodeState {
@@ -2007,7 +2225,11 @@ fn rollback_failed_up(
             "cluster bring-up failed; preserving cluster definition"
         );
     }
-    cleanup_instances(backend, runner, started_instances);
+    // A retry may be resuming existing VMs with user data. Failed bring-up
+    // must never delete their disks; only an explicit destroy may do that.
+    if !keep_failed_runtime {
+        stop_instances(backend, runner, started_instances, true);
+    }
     error
 }
 
@@ -2141,7 +2363,7 @@ fn endpoint_host(api_endpoint: &str) -> String {
         .unwrap_or_else(|| api_endpoint.to_owned())
 }
 
-fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
     let state_root = ClusterSpec::state_root_for(name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.is_file() {
@@ -2173,7 +2395,9 @@ mod tests {
     use std::path::Path;
 
     use crate::backend::BackendKind;
-    use crate::cluster::addon::{AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig};
+    use crate::cluster::addon::{
+        AddonId, CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig, PostReadyAddonRequest,
+    };
     use crate::cluster::node::Instance;
     use crate::cluster::spec::{ClusterSpec, NodeResources};
     use crate::cluster::state::{ClusterState, NodeState};
@@ -2285,6 +2509,274 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    #[test]
+    fn cluster_start_tracks_all_attempts_for_rollback() {
+        let _guard = env_lock();
+        let root =
+            std::env::temp_dir().join(format!("kalisto-start-attempts-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let spec = ClusterSpec::new("attempts".to_owned(), root.clone());
+        let config = crate::backend::BackendConfig {
+            template: "template://default".to_owned(),
+            workspace_root: root.clone(),
+            enable_rosetta: false,
+            network: "lima:user-v2".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            boot_assets_root: None,
+            stream_vm_logs: false,
+        };
+        let nodes = [
+            Instance::new("cp".to_owned(), NodeRole::ControlPlane, root.join("cp")),
+            Instance::new("w0".to_owned(), NodeRole::Worker, root.join("w0")),
+            Instance::new("w1".to_owned(), NodeRole::Worker, root.join("w1")),
+        ];
+        let runner = FakeRunner::with_invocation_failure_containing([], "start");
+        let mut attempts = Vec::new();
+        let result = super::start_cluster_instances(
+            &crate::backend::lima::BACKEND,
+            &runner,
+            &config,
+            &spec,
+            &nodes,
+            &mut attempts,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prestarted_workers_join_without_starting_vms_again() {
+        let runner = FakeRunner::default();
+        let control_plane = Instance::new(
+            "cp".to_owned(),
+            NodeRole::ControlPlane,
+            "/runtime/cp".into(),
+        );
+        let worker = Instance::new("w0".to_owned(), NodeRole::Worker, "/runtime/w0".into());
+        let config = crate::backend::BackendConfig {
+            template: "template://default".to_owned(),
+            workspace_root: "/runtime".into(),
+            enable_rosetta: false,
+            network: "lima:user-v2".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            boot_assets_root: None,
+            stream_vm_logs: false,
+        };
+        let k3s_config = crate::cluster::node::K3sBootstrapConfig {
+            k3s_version: "v1.33.5+k3s1".to_owned(),
+            server_mode: ServerMode::Standard,
+            component_toggles: ComponentToggles::default(),
+        };
+        super::start_and_join_workers(
+            &crate::backend::lima::BACKEND,
+            &runner,
+            super::WorkerJoinContext {
+                base_config: &config,
+                k3s_config: &k3s_config,
+                control_plane: &control_plane,
+                control_plane_guest_kubeconfig: Path::new("/runtime/cp/kubeconfig.yaml"),
+                worker_cpus: 2,
+                worker_memory_gib: 3,
+                server_url: "https://cp.example.test:6443",
+                server_token: "test-token",
+                prestarted_at: Some(std::time::Instant::now()),
+            },
+            &[worker],
+            &mut Vec::new(),
+            false,
+        )
+        .unwrap();
+        let invocations = runner.invocations.lock().unwrap();
+        assert!(
+            invocations
+                .iter()
+                .all(|(_, args)| args.iter().all(|arg| arg != "start"))
+        );
+        assert!(
+            invocations
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg.contains("k3s.pid")))
+        );
+    }
+
+    #[test]
+    fn cni_is_installed_before_all_three_nodes_are_checked_for_readiness() {
+        for cni in [CniPlugin::Flannel, CniPlugin::Cilium] {
+            let runner = FakeRunner::default();
+            let control_plane = Instance::new(
+                "cp".to_owned(),
+                NodeRole::ControlPlane,
+                "/runtime/cp".into(),
+            );
+            let workers = ["w0", "w1"].map(|name| {
+                Instance::new(
+                    name.to_owned(),
+                    NodeRole::Worker,
+                    format!("/runtime/{name}").into(),
+                )
+            });
+            super::install_addons_and_wait_for_nodes(
+                PostReadyAddonRequest {
+                    backend: &crate::backend::lima::BACKEND,
+                    runner: &runner,
+                    control_plane: &control_plane,
+                    guest_kubeconfig: Path::new("/runtime/cp/kubeconfig.yaml"),
+                    cni,
+                    builtin_flannel: false,
+                    cilium_version: DEFAULT_CILIUM_VERSION,
+                    addons: &[],
+                    metallb: &MetalLbConfig::default(),
+                },
+                &workers,
+                ServerMode::Standard,
+                None,
+            )
+            .unwrap();
+
+            let invocations = runner.invocations.lock().unwrap();
+            let install = invocations
+                .iter()
+                .position(|(_, args)| args.iter().any(|arg| arg.contains("cat <<'EOF'")))
+                .expect("CNI manifest should be installed");
+            let readiness = invocations
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, args))| args.iter().any(|arg| arg.contains("Ready=True")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                readiness.len(),
+                3,
+                "all three nodes must be checked for {cni:?}"
+            );
+            assert!(readiness.iter().all(|(index, _)| *index > install));
+        }
+    }
+
+    #[test]
+    fn builtin_flannel_does_not_install_a_second_cni() {
+        let runner = FakeRunner::default();
+        let control_plane = Instance::new(
+            "cp".to_owned(),
+            NodeRole::ControlPlane,
+            "/runtime/cp".into(),
+        );
+        super::install_addons_and_wait_for_nodes(
+            PostReadyAddonRequest {
+                backend: &crate::backend::lima::BACKEND,
+                runner: &runner,
+                control_plane: &control_plane,
+                guest_kubeconfig: Path::new("/runtime/cp/kubeconfig.yaml"),
+                cni: CniPlugin::Flannel,
+                builtin_flannel: true,
+                cilium_version: DEFAULT_CILIUM_VERSION,
+                addons: &[],
+                metallb: &MetalLbConfig::default(),
+            },
+            &[],
+            ServerMode::Standard,
+            None,
+        )
+        .unwrap();
+        let invocations = runner.invocations.lock().unwrap();
+        assert!(
+            invocations
+                .iter()
+                .all(|(_, args)| { args.iter().all(|arg| !arg.contains("kalisto-flannel.yaml")) })
+        );
+        assert!(
+            invocations
+                .iter()
+                .any(|(_, args)| { args.iter().any(|arg| arg.contains("Ready=True")) })
+        );
+    }
+
+    #[test]
+    fn failed_cni_install_does_not_report_node_readiness() {
+        let runner = FakeRunner::with_invocation_failure_containing([], "kalisto-flannel.yaml");
+        let control_plane = Instance::new(
+            "cp".to_owned(),
+            NodeRole::ControlPlane,
+            "/runtime/cp".into(),
+        );
+        let result = super::install_addons_and_wait_for_nodes(
+            PostReadyAddonRequest {
+                backend: &crate::backend::lima::BACKEND,
+                runner: &runner,
+                control_plane: &control_plane,
+                guest_kubeconfig: Path::new("/runtime/cp/kubeconfig.yaml"),
+                cni: CniPlugin::Flannel,
+                builtin_flannel: false,
+                cilium_version: DEFAULT_CILIUM_VERSION,
+                addons: &[],
+                metallb: &MetalLbConfig::default(),
+            },
+            &[],
+            ServerMode::Standard,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            runner
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, args)| { args.iter().all(|arg| !arg.contains("Ready=True")) })
+        );
+    }
+
+    #[test]
+    fn failed_node_deletion_preserves_cluster_definition() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-destroy-failed-{}", std::process::id()));
+        let state_root = root.join("workspace/.kalisto/clusters/broken");
+        save_state(
+            &state_root,
+            "broken",
+            vec![("cp", NodeRole::ControlPlane), ("worker", NodeRole::Worker)],
+        );
+        let runner = FakeRunner::with_invocation_failure_containing([], "delete");
+        assert!(super::destroy_at_root(&state_root, "broken", &runner).is_err());
+        assert!(ClusterState::state_file(&state_root).exists());
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(
+            invocations
+                .iter()
+                .filter(|(_, args)| args.iter().any(|arg| arg == "delete"))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn defined_names_include_saved_clusters_without_probing_backends() {
+        let root = std::env::temp_dir().join(format!("kalisto-defined-{}", std::process::id()));
+        let clusters = root.join("workspace/.kalisto/clusters");
+        save_state(&clusters.join("second"), "second", vec![]);
+        save_state(&clusters.join("first"), "first", vec![]);
+        fs::create_dir_all(clusters.join("not-a-cluster")).unwrap();
+        assert_eq!(
+            super::defined_cluster_names_at_root(&clusters).unwrap(),
+            vec!["first".to_owned(), "second".to_owned()],
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn defined_names_are_empty_when_no_clusters_directory_exists() {
+        let root =
+            std::env::temp_dir().join(format!("kalisto-no-definitions-{}", std::process::id()));
+        assert!(
+            super::defined_cluster_names_at_root(&root)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2967,7 +3459,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
         spec.template = template.display().to_string();
 
         let state_root = ClusterSpec::state_root_for(&spec.name).unwrap();
-        let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+        let runtime_root = state_root.join("runtime");
 
         let error = super::create_with_runner(&spec, &FakeRunner::with_limactl_version_failure())
             .unwrap_err();
@@ -3004,8 +3496,16 @@ addresses = ["10.20.0.200-10.20.0.220"]
 
         let state_root = ClusterSpec::state_root_for(&spec.name).unwrap();
         let state_file = ClusterState::state_file(&state_root);
-        let runtime_root = ClusterSpec::runtime_root_for(&workspace_root, &spec.name);
+        let runtime_root = state_root.join("runtime");
 
+        let image = template_root.join("node.qcow2");
+        fs::write(&image, "image").unwrap();
+        fs::write(
+            &template,
+            format!("vmType: vz\nimages:\n  - location: {}\n", image.display()),
+        )
+        .unwrap();
+        crate::pull::test_fixture(&spec);
         let runner = FakeRunner::with_invocation_failure_containing([], "start");
         let error = super::up_with_runner(&spec, &runner).unwrap_err();
         assert!(matches!(error, Error::CommandFailed { .. }));

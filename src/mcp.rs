@@ -22,6 +22,7 @@ use crate::cluster::manager::{
 };
 use crate::cluster::spec::ImageArch;
 use crate::cluster::state::ClusterState;
+use crate::cluster::workload::{ManifestApplyOutcome, apply_manifest as cluster_apply_manifest};
 use crate::error::{Error, Result};
 use crate::k3s::ServerMode;
 use crate::paths::{
@@ -103,6 +104,16 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             println!("created cluster definition");
             Ok(())
         }
+        "clusters.pull" => {
+            let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
+            let up = lifecycle
+                .into_up_args(manifest.default_project_root.clone())
+                .map_err(jsonrpc_to_error)?;
+            let assets = crate::pull::prepare(&up.into_cluster_spec()?)?;
+            println!("prepared assets: {}", assets.root.display());
+            println!("probe image: {}", assets.probe_image());
+            Ok(())
+        }
         "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
             let up = lifecycle
@@ -150,6 +161,21 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             let outcome = cluster_install_addon(&request.name, &request.addon)?;
             println!("cluster: {}", outcome.cluster);
             println!("installed add-on: {}", outcome.addon);
+            Ok(())
+        }
+        "workloads.apply" => {
+            let request: WorkloadApplyArgs = parse_task_runner_args(&manifest.arguments)?;
+            let manifest_content = fs::read_to_string(&request.manifest_path).map_err(|error| {
+                Error::InvalidArgs(format!(
+                    "failed to read workload manifest at {}: {error}",
+                    request.manifest_path.display()
+                ))
+            })?;
+            let outcome: ManifestApplyOutcome =
+                cluster_apply_manifest(&request.name, &manifest_content, &SystemRunner)?;
+            println!("cluster: {}", outcome.cluster);
+            println!("node: {}", outcome.node);
+            println!("applied: {}", request.manifest_path.display());
             Ok(())
         }
         "bench.run" => {
@@ -291,14 +317,15 @@ fn task_manifest_for_record(record: &TaskRecord) -> Result<TaskRunnerManifest> {
 
 fn task_cluster_name(manifest: &TaskRunnerManifest) -> Result<Option<String>> {
     match manifest.tool_name.as_str() {
-        "clusters.create" | "clusters.up" => {
+        "clusters.create" | "clusters.pull" | "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_task_runner_args(&manifest.arguments)?;
             let args = lifecycle
                 .into_up_args(manifest.default_project_root.clone())
                 .map_err(jsonrpc_to_error)?;
             Ok(Some(args.into_cluster_spec()?.name))
         }
-        "clusters.down" | "clusters.destroy" | "clusters.scale" | "addons.install" => {
+        "clusters.down" | "clusters.destroy" | "clusters.scale" | "addons.install"
+        | "workloads.apply" => {
             let name = manifest
                 .arguments
                 .get("name")
@@ -1303,8 +1330,13 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "clusters.logs",
-        description: "Read locally persisted node log files for a specific cluster node.",
+        description: "Read locally persisted node log files for a specific cluster node, optionally limited to the last tailLines lines of each section for incremental polling.",
         task_support: TaskSupport::Forbidden,
+    },
+    ToolSpec {
+        name: "workloads.apply",
+        description: "Apply a Kubernetes workload manifest file to a running Kalisto cluster through the control plane's kubectl. The cluster must already be up.",
+        task_support: TaskSupport::Required,
     },
     ToolSpec {
         name: "clusters.create",
@@ -1312,8 +1344,13 @@ const TOOLS: &[ToolSpec] = &[
         task_support: TaskSupport::Required,
     },
     ToolSpec {
+        name: "clusters.pull",
+        description: "Prepare managed Lima tools, a sanitized node image, K3s and optional Cilium assets. May use a temporary OS builder VM, but creates no cluster VMs or cluster state. Match the lifecycle selection used for clusters.up.",
+        task_support: TaskSupport::Required,
+    },
+    ToolSpec {
         name: "clusters.up",
-        description: "Create the cluster if needed and boot the control-plane and worker nodes. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
+        description: "Create the cluster if needed and boot the control-plane and worker nodes. First prepare matching assets with clusters.pull. Default CNI is none; select addons [\"cni/cilium\"] for pod networking. On Linux with the firecracker backend, run the MCP server itself with sudo only when using `--network bridge`; the default firecracker mode is rootless `slirp4netns`.",
         task_support: TaskSupport::Required,
     },
     ToolSpec {
@@ -1406,9 +1443,19 @@ fn input_schema(tool_name: &str) -> Value {
             "type": "object",
             "properties": {
                 "name": { "type": "string" },
-                "node": { "type": "string" }
+                "node": { "type": "string" },
+                "tailLines": { "type": "integer", "minimum": 1 }
             },
             "required": ["name", "node"],
+            "additionalProperties": false
+        }),
+        "workloads.apply" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "manifestPath": { "type": "string" }
+            },
+            "required": ["name", "manifestPath"],
             "additionalProperties": false
         }),
         "clusters.down" => json!({
@@ -1430,7 +1477,7 @@ fn input_schema(tool_name: &str) -> Value {
             "required": ["name", "workers"],
             "additionalProperties": false
         }),
-        "clusters.create" | "clusters.up" => lifecycle_schema(),
+        "clusters.create" | "clusters.pull" | "clusters.up" => lifecycle_schema(),
         "addons.list" => json!({
             "type": "object",
             "properties": {
@@ -1633,6 +1680,21 @@ fn execute_direct_tool(
             let args: ClusterLogsArgs = parse_tool_args(arguments)?;
             let logs = crate::cluster::manager::logs(&args.name, &args.node)
                 .map_err(cluster_error_result)?;
+            let sections = logs
+                .sections
+                .iter()
+                .map(|section| {
+                    let content = match args.tail_lines {
+                        Some(limit) => tail_lines(&section.content, limit),
+                        None => section.content.clone(),
+                    };
+                    json!({
+                        "label": section.label,
+                        "path": section.path.display().to_string(),
+                        "content": content
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(success_tool_result(
                 format!(
                     "Loaded {} log section(s) for node `{}` in cluster `{}`.",
@@ -1643,11 +1705,7 @@ fn execute_direct_tool(
                 json!({
                     "cluster": logs.cluster,
                     "node": logs.node,
-                    "sections": logs.sections.iter().map(|section| json!({
-                        "label": section.label,
-                        "path": section.path.display().to_string(),
-                        "content": section.content
-                    })).collect::<Vec<_>>()
+                    "sections": sections
                 }),
             ))
         }
@@ -1673,6 +1731,19 @@ fn execute_direct_tool(
             format!("tool `{tool_name}` only supports task-backed execution"),
         )),
     }
+}
+
+fn tail_lines(content: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+    let mut result = lines[start..].join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
 }
 
 fn cluster_status_payload(status: &crate::cluster::manager::ClusterStatus) -> Value {
@@ -2050,6 +2121,15 @@ struct OptionalClusterArgs {
 struct ClusterLogsArgs {
     name: String,
     node: String,
+    #[serde(default)]
+    tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadApplyArgs {
+    name: String,
+    manifest_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2242,14 +2322,17 @@ fn task_command(
     let program = executable.display().to_string();
     let mut args = Vec::new();
     match tool_name {
-        "clusters.create" | "clusters.up" => {
+        "clusters.create" | "clusters.pull" | "clusters.up" => {
             let lifecycle: ClusterLifecycleArgs = parse_tool_args(arguments.clone())?;
             let up = lifecycle.into_up_args(default_project_root)?;
-            args.push(if tool_name == "clusters.create" {
-                "create".to_owned()
-            } else {
-                "up".to_owned()
-            });
+            args.push(
+                match tool_name {
+                    "clusters.create" => "create",
+                    "clusters.pull" => "pull",
+                    _ => "up",
+                }
+                .to_owned(),
+            );
             append_up_args(&mut args, &up);
         }
         "clusters.down" => {
@@ -2281,6 +2364,16 @@ fn task_command(
                 "--name".to_owned(),
                 request.name,
                 request.addon,
+            ]);
+        }
+        "workloads.apply" => {
+            let request: WorkloadApplyArgs = parse_tool_args(arguments.clone())?;
+            args.extend([
+                "apply".to_owned(),
+                "--name".to_owned(),
+                request.name,
+                "--manifest".to_owned(),
+                request.manifest_path.display().to_string(),
             ]);
         }
         "bench.run" => {
@@ -2515,6 +2608,17 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
                 json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
+        "clusters.pull" => {
+            let values = parse_key_value_lines(&stdout);
+            success_tool_result(
+                "Prepared boot assets.".to_owned(),
+                json!({
+                    "assetsRoot": values.get("prepared assets"),
+                    "probeImage": values.get("probe image"),
+                    "stdout": stdout, "stderr": stderr,
+                }),
+            )
+        }
         "clusters.up" => parse_up_result(&stdout).unwrap_or_else(|| {
             success_tool_result(
                 format!("Brought cluster up for task `{task_id}`."),
@@ -2547,6 +2651,17 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
                 json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
+        "workloads.apply" => {
+            let values = parse_key_value_lines(&stdout);
+            let cluster = values
+                .get("cluster")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_owned());
+            success_tool_result(
+                format!("Applied workload manifest to cluster `{cluster}`."),
+                json!({ "cluster": cluster, "stdout": stdout, "stderr": stderr }),
+            )
+        }
         "bench.run" => parse_bench_result(&stdout).unwrap_or_else(|| {
             success_tool_result(
                 format!("Completed benchmark task `{task_id}`."),
@@ -2947,9 +3062,26 @@ mod tests {
 
     use super::{
         McpServer, SUPPORTED_PROTOCOL_VERSION, TaskSupport, ToolCallRequest, execute_direct_tool,
-        linux_firecracker_sudo_guidance_from_args, parse_tool_args, task_command, tool_by_name,
-        tool_definitions,
+        linux_firecracker_sudo_guidance_from_args, parse_tool_args, tail_lines, task_command,
+        tool_by_name, tool_definitions,
     };
+
+    #[test]
+    fn pull_tool_requires_a_task_and_reuses_the_lifecycle_cli_flags() {
+        assert!(matches!(
+            tool_by_name("clusters.pull").unwrap().task_support,
+            TaskSupport::Required
+        ));
+        let (_, args) = task_command(
+            "clusters.pull",
+            &json!({"addons": ["cni/cilium"], "workers": 2}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("pull"));
+        let cli = Cli::from_iter_safe(std::iter::once("kalisto".to_owned()).chain(args)).unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
+    }
 
     fn test_server() -> Arc<McpServer> {
         let _guard = env_lock();
@@ -3030,6 +3162,22 @@ mod tests {
         assert!(names.contains(&"clusters.state"));
         assert!(names.contains(&"addons.list"));
         assert!(names.contains(&"addons.install"));
+        assert!(names.contains(&"workloads.apply"));
+    }
+
+    #[test]
+    fn workloads_apply_requires_task_execution() {
+        let tool = tool_by_name("workloads.apply").expect("tool spec");
+        assert!(matches!(tool.task_support, TaskSupport::Required));
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_lines_and_trailing_newline() {
+        let content = "line1\nline2\nline3\n";
+        assert_eq!(tail_lines(content, 2), "line2\nline3\n");
+        assert_eq!(tail_lines(content, 10), content);
+        assert_eq!(tail_lines(content, 0), "");
+        assert_eq!(tail_lines("line1", 1), "line1");
     }
 
     #[test]

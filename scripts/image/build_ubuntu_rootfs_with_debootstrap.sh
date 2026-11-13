@@ -76,7 +76,7 @@ EOF
 chmod 0755 "${ROOTFS_DIR}/usr/sbin/policy-rc.d"
 
 chroot "${ROOTFS_DIR}" apt-get update
-chroot "${ROOTFS_DIR}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${PACKAGE_LIST}
+chroot "${ROOTFS_DIR}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${PACKAGE_LIST} dbus dbus-user-session systemd-resolved rsync lsb-release
 
 mkdir -p \
   "${ROOTFS_DIR}/etc/cloud/cloud.cfg.d" \
@@ -115,8 +115,10 @@ initrd /initrd.img
 boot
 EOF
 
+chroot "${ROOTFS_DIR}" systemctl enable dbus.service systemd-resolved.service
+ln -sfn /run/systemd/resolve/stub-resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
+
 rm -f \
-  "${ROOTFS_DIR}/etc/resolv.conf" \
   "${ROOTFS_DIR}/usr/sbin/policy-rc.d" \
   "${ROOTFS_DIR}/etc/ssh/ssh_host_"* \
   "${ROOTFS_DIR}/var/lib/dbus/machine-id"

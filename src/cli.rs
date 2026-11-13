@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use structopt::StructOpt;
@@ -16,6 +17,10 @@ use crate::paths::{default_cluster_name, default_project_root, selected_cluster_
 pub struct Cli {
     #[structopt(long, parse(try_from_str = parse_log_level))]
     pub log_level: Option<Level>,
+    /// Emit machine-readable JSON from read-only inspection commands
+    /// (list, status, stats, kubeconfig).
+    #[structopt(long, global = true)]
+    pub json: bool,
     #[structopt(subcommand)]
     pub command: Command,
 }
@@ -24,13 +29,17 @@ pub struct Cli {
 #[structopt(rename_all = "kebab")]
 pub enum Command {
     Create(UpArgs),
+    /// Cache Lima node images, K3s and Cilium assets before starting fresh VMs.
+    Pull(UpArgs),
     Up(UpArgs),
     Test(TestArgs),
     Mcp(McpArgs),
     #[structopt(name = "mcp-task-runner")]
     McpTaskRunner(McpTaskRunnerArgs),
+    /// Apply a Kubernetes workload manifest to a running cluster.
+    Apply(ApplyArgs),
     Down(ClusterLookupArgs),
-    Destroy(ClusterLookupArgs),
+    Destroy(DestroyArgs),
     Logs(NodeLogsArgs),
     Addon(AddonArgs),
     Plugin(AddonArgs),
@@ -42,6 +51,8 @@ pub enum Command {
     Stats(StatsArgs),
     Status(ClusterLookupArgs),
     Kubeconfig(KubeconfigArgs),
+    /// Run the managed kubectl binary against a cluster with its kubeconfig.
+    Kubectl(KubectlArgs),
     Bench(BenchArgs),
     ProbeMacosLima(MacosLimaArgs),
     ProbeMacosLimaK3s(MacosLimaK3sArgs),
@@ -99,6 +110,46 @@ pub struct NodeLogsArgs {
 }
 
 impl NodeLogsArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ApplyArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+    /// Path to a Kubernetes manifest file to apply on the cluster.
+    #[structopt(long, parse(from_os_str))]
+    pub manifest: PathBuf,
+}
+
+impl ApplyArgs {
+    pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
+        match &self.name {
+            Some(name) => Ok(Some(name.clone())),
+            None => selected_cluster_name(),
+        }
+    }
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(setting = structopt::clap::AppSettings::TrailingVarArg)]
+pub struct KubectlArgs {
+    #[structopt(long)]
+    pub name: Option<String>,
+    /// Print the managed kubectl binary path and exit.
+    #[structopt(long)]
+    pub path: bool,
+    /// Arguments passed through to the managed kubectl binary.
+    #[structopt(allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+impl KubectlArgs {
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -245,7 +296,9 @@ impl UpArgs {
             spec.server_mode = ServerMode::Agentless;
             spec.worker_count = 0;
         }
-        spec.enable_rosetta = !self.no_rosetta;
+        if self.no_rosetta {
+            spec.enable_rosetta = false;
+        }
         Ok(spec)
     }
 }
@@ -353,6 +406,39 @@ fn parse_log_level(value: &str) -> std::result::Result<Level, String> {
         _ => Err(format!(
             "unsupported log level `{value}`; expected one of: trace, debug, info, warn, error"
         )),
+    }
+}
+
+#[derive(Debug, StructOpt)]
+pub struct DestroyArgs {
+    /// Cluster names, separated by commas; defaults to the selected cluster.
+    #[structopt(long, conflicts_with = "all")]
+    pub name: Option<String>,
+    /// Destroy every saved cluster definition.
+    #[structopt(short = "a", long, conflicts_with = "name")]
+    pub all: bool,
+    #[structopt(long)]
+    pub force: bool,
+}
+
+impl DestroyArgs {
+    pub fn cluster_names(&self) -> crate::error::Result<Option<Vec<String>>> {
+        let Some(value) = &self.name else {
+            return Ok(selected_cluster_name()?.map(|name| vec![name]));
+        };
+        let mut seen = HashSet::new();
+        let mut names = Vec::new();
+        for name in value.split(',').map(str::trim) {
+            if name.is_empty() {
+                return Err(crate::error::Error::InvalidArgs(
+                    "cluster names must not be empty in --name".to_owned(),
+                ));
+            }
+            if seen.insert(name) {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(Some(names))
     }
 }
 
@@ -562,6 +648,28 @@ mod tests {
     use crate::cluster::spec::ImageArch;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn pull_accepts_the_same_cluster_asset_selection_as_up() {
+        let cli = Cli::from_iter_safe([
+            "kalisto",
+            "pull",
+            "--backend",
+            "lima",
+            "--arch",
+            "arm64",
+            "--addons",
+            "cni/cilium",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Pull(args) => {
+                assert_eq!(args.image_arch, Some(ImageArch::Aarch64));
+                assert_eq!(args.addons, vec!["cni/cilium"]);
+            }
+            other => panic!("expected pull command, got {other:?}"),
+        }
+    }
 
     #[test]
     fn up_flags_parse_runtime_debug_options() {
@@ -1051,6 +1159,46 @@ command = "kubectl get pods"
         match cli.command {
             Command::Destroy(args) => assert_eq!(args.name.as_deref(), Some("dev")),
             other => panic!("expected destroy command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_accepts_all_short_and_long_flags() {
+        for flag in ["-a", "--all"] {
+            let cli = Cli::from_iter_safe(["kalisto", "destroy", flag]).unwrap();
+            match cli.command {
+                Command::Destroy(args) => assert!(args.all),
+                other => panic!("expected destroy command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_all_conflicts_with_named_clusters() {
+        assert!(Cli::from_iter_safe(["kalisto", "destroy", "-a", "--name", "one,two"]).is_err());
+    }
+
+    #[test]
+    fn destroy_splits_trims_and_deduplicates_names() {
+        let cli = Cli::from_iter_safe(["kalisto", "destroy", "--name", "one, two,one"]).unwrap();
+        match cli.command {
+            Command::Destroy(args) => assert_eq!(
+                args.cluster_names().unwrap(),
+                Some(vec!["one".to_owned(), "two".to_owned()]),
+            ),
+            other => panic!("expected destroy command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_rejects_empty_names_before_any_cleanup() {
+        for value in ["", "one,", ",one", "one,,two", "one,   ,two"] {
+            let args = super::DestroyArgs {
+                name: Some(value.to_owned()),
+                all: false,
+                force: false,
+            };
+            assert!(args.cluster_names().is_err());
         }
     }
 

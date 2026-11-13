@@ -115,6 +115,22 @@ impl ManifestData {
     }
 }
 
+pub fn pull_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
+    if let Some(template) = crate::native_image::pack_cached_template(spec)? {
+        let mut resolved = spec.clone();
+        resolved.template = template.display().to_string();
+        return Ok(resolved);
+    }
+    if spec.backend == BackendKind::Lima && spec.template == "template://default" {
+        let mut resolved = spec.clone();
+        resolved.template = resolve_lima_template(spec, runner, true)?
+            .display()
+            .to_string();
+        return Ok(resolved);
+    }
+    resolve_cluster_spec(spec, runner)
+}
+
 pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
     if spec.backend == BackendKind::Lima {
         if spec.template != "template://default" {
@@ -122,7 +138,9 @@ pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> R
         }
 
         let mut resolved_spec = spec.clone();
-        resolved_spec.template = resolve_lima_template(spec, runner)?.display().to_string();
+        resolved_spec.template = resolve_lima_template(spec, runner, false)?
+            .display()
+            .to_string();
         return Ok(resolved_spec);
     }
 
@@ -139,7 +157,11 @@ pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> R
     Ok(resolved_spec)
 }
 
-fn resolve_lima_template(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf> {
+fn resolve_lima_template(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+    allow_download: bool,
+) -> Result<PathBuf> {
     let cache_root = artifacts_root()?.join(LIMA_ARTIFACT_DIR);
     let search_roots = lima_search_roots(&spec.workspace_root)?;
 
@@ -164,6 +186,12 @@ fn resolve_lima_template(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Resu
         let image_filename = std::env::var("KALISTO_LIMA_IMAGE_FILENAME")
             .unwrap_or_else(|_| default_lima_image_filename(&image_url));
         let image_sha256 = std::env::var("KALISTO_LIMA_IMAGE_SHA256").ok();
+        let cached = cache_root.join(url_file_name(&image_url).unwrap_or(&image_filename));
+        if !allow_download && !cached.is_file() {
+            return Err(Error::InvalidArgs(
+                "Lima image is not cached; run `kalisto pull` before up".to_owned(),
+            ));
+        }
         let image = fetch_into_cache(
             runner,
             &cache_root,
@@ -179,8 +207,12 @@ fn resolve_lima_template(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Resu
         );
     }
 
+    if allow_download {
+        return crate::native_image::prepare(spec, runner);
+    }
+
     Err(Error::InvalidArgs(
-        "no managed Lima template found for Kalisto; install Kalisto Lima artifacts under ~/.local/share/kalisto/artifacts/lima-node, place them under <project>/artifacts/lima-node, set KALISTO_LIMA_IMAGE_URL to fetch them automatically, or pass --template explicitly"
+        "no managed Lima template found for Kalisto; install Kalisto Lima artifacts under ~/.local/share/kalisto/artifacts/lima-node, place them under <project>/artifacts/lima-node, set KALISTO_LIMA_IMAGE_URL and run kalisto pull, or pass --template explicitly"
             .to_owned(),
     ))
 }
@@ -683,7 +715,7 @@ impl ArtifactManagerConfig {
     }
 }
 
-fn fetch_into_cache(
+pub(crate) fn fetch_into_cache(
     runner: &dyn CommandRunner,
     cache_root: &Path,
     url: &str,
@@ -804,7 +836,7 @@ fn maybe_materialize_rootfs(
     Ok(output)
 }
 
-fn verify_sha256(
+pub(crate) fn verify_sha256(
     runner: &dyn CommandRunner,
     path: &Path,
     expected: &str,
@@ -821,7 +853,7 @@ fn verify_sha256(
     }
 }
 
-fn file_sha256(runner: &dyn CommandRunner, path: &Path) -> Result<String> {
+pub(crate) fn file_sha256(runner: &dyn CommandRunner, path: &Path) -> Result<String> {
     if let Ok(output) = runner.run("sha256sum", &[path.display().to_string()]) {
         return parse_checksum_output(&output.stdout, path);
     }
@@ -1272,7 +1304,7 @@ mod tests {
         spec.image_arch = Some(ImageArch::Aarch64);
 
         let runner = FakeRunner::default();
-        let resolved = resolve_cluster_spec(&spec, &runner).unwrap();
+        let resolved = super::pull_cluster_spec(&spec, &runner).unwrap();
         let template_path = PathBuf::from(&resolved.template);
         let cached_image = data_home
             .join("kalisto")

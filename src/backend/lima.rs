@@ -67,7 +67,12 @@ impl ClusterBackend for LimaBackend {
     }
 
     fn guest_artifact_root(&self, _instance_name: &str, runtime_root: &Path) -> Result<PathBuf> {
-        Ok(runtime_root.to_path_buf())
+        // Older VMs may not mount the external target/ symlink destination.
+        // Use its physical path so bootstrap can create a guest-local fallback;
+        // kubeconfig and token synchronization already use guest file copies.
+        Ok(runtime_root
+            .canonicalize()
+            .unwrap_or_else(|_| runtime_root.to_path_buf()))
     }
 
     fn guest_shell(
@@ -121,6 +126,7 @@ pub fn start_instance(
         "starting lima instance"
     );
     if instance_exists(runner, &instance.name)? {
+        repair_stopped_instance_mount(runner, config, instance)?;
         let restart_args = vec!["start".into(), "--tty=false".into(), instance.name.clone()];
         return runner.run_live("limactl", &restart_args);
     }
@@ -134,10 +140,25 @@ pub fn start_instance(
         "--containerd=none".into(),
         "--vm-type=vz".into(),
         "--mount-type=virtiofs".into(),
-        format!("--mount-only={}:w", config.workspace_root.display()),
         format!("--network={}", config.network),
         "--timeout=10m".into(),
     ];
+    // Prepared clusters need only their own runtime files and read-only assets,
+    // never the checkout or a caller's whole home directory.
+    if config.boot_assets_root.is_none() {
+        args.push(format!(
+            "--mount-only={}:w",
+            config.workspace_root.display()
+        ));
+    }
+    if let Ok(runtime_root) = canonicalize_path(&instance.runtime_root)
+        && (config.boot_assets_root.is_some() || !runtime_root.starts_with(&config.workspace_root))
+    {
+        args.push(format!("--mount-only={}:w", runtime_root.display()));
+    }
+    if let Some(assets) = &config.boot_assets_root {
+        args.push(format!("--mount-only={}", assets.root.display()));
+    }
     if config.enable_rosetta {
         args.push("--rosetta".into());
     }
@@ -146,6 +167,68 @@ pub fn start_instance(
     }
     args.push(config.template.clone());
     runner.run_live("limactl", &args)
+}
+
+fn repair_stopped_instance_mount(
+    runner: &dyn CommandRunner,
+    config: &BackendConfig,
+    instance: &InstanceConfig,
+) -> Result<()> {
+    let mut mounts = Vec::new();
+    if let Ok(runtime_root) = instance.runtime_root.canonicalize()
+        && (config.boot_assets_root.is_some() || !runtime_root.starts_with(&config.workspace_root))
+    {
+        mounts.push((runtime_root, true));
+    }
+    if let Some(assets) = &config.boot_assets_root {
+        mounts.push((assets.root.clone(), false));
+    }
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    let output = runner.run(
+        "limactl",
+        &["list".into(), "--json".into(), instance.name.clone()],
+    )?;
+    let metadata: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| Error::InvalidArgs(format!("invalid Lima instance metadata: {error}")))?;
+    for (root, writable) in mounts {
+        let covered = metadata["config"]["mounts"]
+            .as_array()
+            .is_some_and(|mounts| {
+                mounts.iter().any(|mount| {
+                    mount["mountPoint"]
+                        .as_str()
+                        .filter(|path| !path.is_empty())
+                        .or_else(|| mount["location"].as_str())
+                        .is_some_and(|path| root.starts_with(path))
+                        && mount["writable"].as_bool().unwrap_or(false) == writable
+                })
+            });
+        if !covered {
+            if metadata["status"] == "Running" {
+                return Err(Error::InvalidArgs(format!(
+                    "running Lima instance {} lacks mount {}; stop it before retrying up",
+                    instance.name,
+                    root.display()
+                )));
+            }
+            runner.run(
+                "limactl",
+                &[
+                    "edit".into(),
+                    "--tty=false".into(),
+                    format!(
+                        "--mount={}{}",
+                        root.display(),
+                        if writable { ":w" } else { "" }
+                    ),
+                    instance.name.clone(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn instance_exists(runner: &dyn CommandRunner, instance_name: &str) -> Result<bool> {
@@ -220,7 +303,7 @@ pub fn stop_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<
 
 pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "deleting lima instance");
-    runner.run(
+    match runner.run(
         "limactl",
         &[
             "-y".into(),
@@ -228,8 +311,11 @@ pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Resul
             "--force".into(),
             instance_name.to_owned(),
         ],
-    )?;
-    Ok(())
+    ) {
+        Ok(_) => Ok(()),
+        Err(Error::CommandFailed { stderr, .. }) if is_missing_instance_error(&stderr) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn query_instance_status(runner: &dyn CommandRunner, instance_name: &str) -> Result<String> {
@@ -392,6 +478,7 @@ mod tests {
             network: "lima:user-v2".to_owned(),
             firecracker_kernel: None,
             firecracker_rootfs: None,
+            boot_assets_root: None,
             stream_vm_logs: false,
         };
         let instance = InstanceConfig {
@@ -431,6 +518,57 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn start_instance_mounts_runtime_outside_the_checkout() {
+        let root = std::env::temp_dir().join(format!("kalisto-lima-mount-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::os::unix::fs::symlink(&external, workspace.join("target")).unwrap();
+        let runtime_root = workspace.join("target/cluster/control-plane");
+        std::fs::create_dir_all(&runtime_root).unwrap();
+        let runner = SequencedRunner {
+            results: Mutex::new(vec![
+                Ok(Output {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                Ok(Output {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            ]),
+            invocations: Mutex::new(Vec::new()),
+        };
+        let config = BackendConfig {
+            template: "template://ubuntu".to_owned(),
+            workspace_root: workspace.canonicalize().unwrap(),
+            enable_rosetta: false,
+            network: "lima:user-v2".to_owned(),
+            firecracker_kernel: None,
+            firecracker_rootfs: None,
+            boot_assets_root: None,
+            stream_vm_logs: false,
+        };
+        let instance = InstanceConfig {
+            name: "kalisto-mount-cp".to_owned(),
+            runtime_root: runtime_root.clone(),
+            host_port_forward: Some(16443),
+            cpus: 2,
+            memory_gib: 3,
+        };
+        start_instance(&runner, &config, &instance).unwrap();
+        let invocations = runner.invocations.lock().unwrap();
+        let expected = format!(
+            "--mount-only={}:w",
+            runtime_root.canonicalize().unwrap().display()
+        );
+        assert!(invocations[1].1.contains(&expected));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn start_instance_creates_missing_instance_from_template() {
         let runner = SequencedRunner {
@@ -466,6 +604,7 @@ mod tests {
             network: "lima:user-v2".to_owned(),
             firecracker_kernel: None,
             firecracker_rootfs: None,
+            boot_assets_root: None,
             stream_vm_logs: false,
         };
         let instance = InstanceConfig {

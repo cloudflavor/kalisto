@@ -210,13 +210,14 @@ pub struct PostReadyAddonRequest<'a> {
     pub control_plane: &'a Instance,
     pub guest_kubeconfig: &'a Path,
     pub cni: CniPlugin,
+    pub builtin_flannel: bool,
     pub cilium_version: &'a str,
     pub addons: &'a [String],
     pub metallb: &'a MetalLbConfig,
 }
 
 pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<()> {
-    if request.cni == CniPlugin::Flannel {
+    if request.cni == CniPlugin::Flannel && !request.builtin_flannel {
         install_flannel(
             request.backend,
             request.runner,

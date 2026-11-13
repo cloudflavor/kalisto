@@ -152,7 +152,7 @@ pub fn start_node_instance(
     cpus: u8,
     memory_gib: u8,
 ) -> Result<Output> {
-    backend.start_instance(
+    let output = backend.start_instance(
         runner,
         base_config,
         &InstanceConfig {
@@ -162,7 +162,11 @@ pub fn start_node_instance(
             cpus,
             memory_gib,
         },
-    )
+    )?;
+    if let Some(assets) = &base_config.boot_assets_root {
+        assets.stage_node(backend, runner, node)?;
+    }
+    Ok(output)
 }
 
 pub fn start_worker_instances(
@@ -236,14 +240,16 @@ fn ensure_guest_bootstrap_prereqs(
         &node.artifacts.root,
         &format!(
             concat!(
+                "set -eu\n",
                 "mkdir -p {artifact_dir} /etc/kalisto /etc/rancher/k3s /var/lib/rancher/k3s\n",
                 "cat <<'EOF' > {kubelet_resolv_conf}\n",
                 "{kubelet_resolv_contents}",
                 "EOF\n",
-                "rm -f /etc/resolv.conf\n",
-                "cat <<'EOF' > /etc/resolv.conf\n",
-                "{kubelet_resolv_contents}",
-                "EOF"
+                "if [ ! -L /etc/resolv.conf ] && ",
+                "cmp -s /etc/resolv.conf {kubelet_resolv_conf} && ",
+                "[ -s /run/systemd/resolve/stub-resolv.conf ]; then\n",
+                "ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf\n",
+                "fi"
             ),
             artifact_dir = artifact_dir,
             kubelet_resolv_conf = kubelet_resolv_conf,
@@ -258,7 +264,7 @@ fn k3s_process_running(
     node: &Instance,
     artifact_dir: &Path,
 ) -> Result<bool> {
-    match backend.guest_shell(
+    match backend.guest_sudo_shell(
         runner,
         &node.name,
         &node.artifacts.root,
@@ -309,18 +315,18 @@ fn running_check_command(artifact_dir: &Path, role: NodeRole) -> String {
             .to_string_lossy()
             .as_ref(),
     );
-    let ps_fallback = match role {
+    let process_match = match role {
         NodeRole::ControlPlane => {
-            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])server([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
+            "$2 == \"k3s-server\" || ($2 == \"k3s\" && $0 ~ /(^|[[:space:]])server([[:space:]]|$)/)"
         }
         NodeRole::Worker => {
-            "ps -eo comm=,args= | awk '$1 == \"k3s\" && $0 ~ /(^|[[:space:]])agent([[:space:]]|$)/ { found = 1 } END { exit found ? 0 : 1 }'"
+            "$2 == \"k3s-agent\" || ($2 == \"k3s\" && $0 ~ /(^|[[:space:]])agent([[:space:]]|$)/)"
         }
     };
+    // Do not trust a stale PID or signal a root-owned process as an unprivileged
+    // user. Discover the actual role process and repair its runtime PID file.
     format!(
-        "if [ -s {pid_file} ]; then pid=$(cat {pid_file}); test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null && exit 0; fi; if command -v ps >/dev/null 2>&1; then {ps_fallback}; fi; exit 1",
-        pid_file = pid_file,
-        ps_fallback = ps_fallback,
+        "pid=$(ps -eo pid=,comm=,args= | awk '{process_match} {{ print $1; exit }}'); test -n \"$pid\" && printf '%s\\n' \"$pid\" > {pid_file}",
     )
 }
 
@@ -452,12 +458,48 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::k3s::{ComponentToggles, NodeRole, ServerMode};
+    use crate::process::{CommandRunner, Output};
 
     use super::{
         Artifacts, Instance, K3sBootstrapConfig, K3sCommandSpec, build_k3s_command,
-        control_plane_runtime_artifact_sync_command, launch_k3s_process_command,
-        start_worker_instances,
+        control_plane_runtime_artifact_sync_command, ensure_guest_bootstrap_prereqs,
+        launch_k3s_process_command, start_worker_instances,
     };
+
+    #[derive(Default)]
+    struct RecordingRunner(std::sync::Mutex<Vec<String>>);
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _program: &str, args: &[String]) -> crate::error::Result<Output> {
+            self.0.lock().unwrap().extend_from_slice(args);
+            Ok(Output {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn bootstrap_preserves_guest_dns_for_internal_worker_join_names() {
+        let runner = RecordingRunner::default();
+        let worker = Instance::new(
+            "worker".to_owned(),
+            NodeRole::Worker,
+            PathBuf::from("/runtime/worker"),
+        );
+        ensure_guest_bootstrap_prereqs(
+            &crate::backend::lima::BACKEND,
+            &runner,
+            &worker,
+            &worker.artifacts.root,
+        )
+        .unwrap();
+        let commands = runner.0.lock().unwrap();
+        let command = commands.last().unwrap();
+        assert!(command.contains("/etc/kalisto/kubelet-resolv.conf"));
+        assert!(!command.contains("rm -f /etc/resolv.conf"));
+        assert!(command.contains("cmp -s /etc/resolv.conf"));
+    }
 
     #[test]
     fn worker_launch_command_runs_k3s_directly() {
@@ -531,6 +573,7 @@ mod tests {
                 network: "lima:user-v2".to_owned(),
                 firecracker_kernel: None,
                 firecracker_rootfs: None,
+                boot_assets_root: None,
                 stream_vm_logs: false,
             },
             &[],

@@ -79,10 +79,19 @@ pub fn write_default_cluster_name(name: &str) -> Result<()> {
 
 pub fn clear_default_cluster_name_if_matches(name: &str) -> Result<()> {
     let path = default_cluster_file()?;
-    let Some(current) = read_default_cluster_name()? else {
-        return Ok(());
+    // The state may already have been deleted by destroy. Read the selection
+    // directly rather than discarding it as stale before it can be cleared.
+    let current = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::CommandIo {
+                program: "read_to_string".to_owned(),
+                source,
+            });
+        }
     };
-    if current != name || !path.exists() {
+    if current.trim() != name {
         return Ok(());
     }
 
@@ -310,6 +319,8 @@ mod tests {
         write_default_cluster_name("missing").unwrap();
         assert_eq!(read_default_cluster_name().unwrap(), None);
         assert_eq!(selected_cluster_name().unwrap(), None);
+        clear_default_cluster_name_if_matches("missing").unwrap();
+        assert!(!super::default_cluster_file().unwrap().exists());
 
         restore_env("XDG_CONFIG_HOME", original_xdg_config_home);
         restore_env("XDG_DATA_HOME", original_xdg_data_home);
