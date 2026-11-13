@@ -22,6 +22,7 @@ use crate::cluster::manager::{
 };
 use crate::cluster::spec::ImageArch;
 use crate::cluster::state::ClusterState;
+use crate::cluster::workload::{ManifestApplyOutcome, apply_manifest as cluster_apply_manifest};
 use crate::error::{Error, Result};
 use crate::k3s::ServerMode;
 use crate::paths::{
@@ -204,6 +205,21 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             println!("installed add-on: {}", outcome.addon);
             Ok(())
         }
+        "workloads.apply" => {
+            let request: WorkloadApplyArgs = parse_task_runner_args(&manifest.arguments)?;
+            let manifest_content = fs::read_to_string(&request.manifest_path).map_err(|error| {
+                Error::InvalidArgs(format!(
+                    "failed to read workload manifest at {}: {error}",
+                    request.manifest_path.display()
+                ))
+            })?;
+            let outcome: ManifestApplyOutcome =
+                cluster_apply_manifest(&request.name, &manifest_content, &SystemRunner)?;
+            println!("cluster: {}", outcome.cluster);
+            println!("node: {}", outcome.node);
+            println!("applied: {}", request.manifest_path.display());
+            Ok(())
+        }
         "bench.run" => {
             let request: BenchArgsPayload = parse_task_runner_args(&manifest.arguments)?;
             let bench = request
@@ -350,7 +366,8 @@ fn task_cluster_name(manifest: &TaskRunnerManifest) -> Result<Option<String>> {
                 .map_err(jsonrpc_to_error)?;
             Ok(Some(args.into_cluster_spec()?.name))
         }
-        "clusters.down" | "clusters.destroy" | "clusters.scale" | "addons.install" => {
+        "clusters.down" | "clusters.destroy" | "clusters.scale" | "addons.install"
+        | "workloads.apply" => {
             let name = manifest
                 .arguments
                 .get("name")
@@ -1370,8 +1387,13 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "clusters.logs",
-        description: "Read locally persisted node log files for a specific cluster node.",
+        description: "Read locally persisted node log files for a specific cluster node, optionally limited to the last tailLines lines of each section for incremental polling.",
         task_support: TaskSupport::Forbidden,
+    },
+    ToolSpec {
+        name: "workloads.apply",
+        description: "Apply a Kubernetes workload manifest file to a running Kalisto cluster through the control plane's kubectl. The cluster must already be up.",
+        task_support: TaskSupport::Required,
     },
     ToolSpec {
         name: "clusters.create",
@@ -1488,9 +1510,19 @@ fn input_schema(tool_name: &str) -> Value {
             "type": "object",
             "properties": {
                 "name": { "type": "string" },
-                "node": { "type": "string" }
+                "node": { "type": "string" },
+                "tailLines": { "type": "integer", "minimum": 1 }
             },
             "required": ["name", "node"],
+            "additionalProperties": false
+        }),
+        "workloads.apply" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "manifestPath": { "type": "string" }
+            },
+            "required": ["name", "manifestPath"],
             "additionalProperties": false
         }),
         "clusters.down" => json!({
@@ -1729,6 +1761,21 @@ fn execute_direct_tool(
             let args: ClusterLogsArgs = parse_tool_args(arguments)?;
             let logs = crate::cluster::manager::logs(&args.name, &args.node)
                 .map_err(cluster_error_result)?;
+            let sections = logs
+                .sections
+                .iter()
+                .map(|section| {
+                    let content = match args.tail_lines {
+                        Some(limit) => tail_lines(&section.content, limit),
+                        None => section.content.clone(),
+                    };
+                    json!({
+                        "label": section.label,
+                        "path": section.path.display().to_string(),
+                        "content": content
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(success_tool_result(
                 format!(
                     "Loaded {} log section(s) for node `{}` in cluster `{}`.",
@@ -1739,11 +1786,7 @@ fn execute_direct_tool(
                 json!({
                     "cluster": logs.cluster,
                     "node": logs.node,
-                    "sections": logs.sections.iter().map(|section| json!({
-                        "label": section.label,
-                        "path": section.path.display().to_string(),
-                        "content": section.content
-                    })).collect::<Vec<_>>()
+                    "sections": sections
                 }),
             ))
         }
@@ -1769,6 +1812,19 @@ fn execute_direct_tool(
             format!("tool `{tool_name}` only supports task-backed execution"),
         )),
     }
+}
+
+fn tail_lines(content: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+    let mut result = lines[start..].join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
 }
 
 fn cluster_status_payload(status: &crate::cluster::manager::ClusterStatus) -> Value {
@@ -2238,6 +2294,15 @@ struct OptionalClusterArgs {
 struct ClusterLogsArgs {
     name: String,
     node: String,
+    #[serde(default)]
+    tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadApplyArgs {
+    name: String,
+    manifest_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2507,6 +2572,16 @@ fn task_command(
                 "--name".to_owned(),
                 request.name,
                 request.addon,
+            ]);
+        }
+        "workloads.apply" => {
+            let request: WorkloadApplyArgs = parse_tool_args(arguments.clone())?;
+            args.extend([
+                "apply".to_owned(),
+                "--name".to_owned(),
+                request.name,
+                "--manifest".to_owned(),
+                request.manifest_path.display().to_string(),
             ]);
         }
         "bench.run" => {
@@ -2791,6 +2866,17 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
                 json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
+        "workloads.apply" => {
+            let values = parse_key_value_lines(&stdout);
+            let cluster = values
+                .get("cluster")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_owned());
+            success_tool_result(
+                format!("Applied workload manifest to cluster `{cluster}`."),
+                json!({ "cluster": cluster, "stdout": stdout, "stderr": stderr }),
+            )
+        }
         "bench.run" => parse_bench_result(&stdout).unwrap_or_else(|| {
             success_tool_result(
                 format!("Completed benchmark task `{task_id}`."),
@@ -3191,8 +3277,8 @@ mod tests {
 
     use super::{
         McpServer, SUPPORTED_PROTOCOL_VERSION, TaskSupport, ToolCallRequest, execute_direct_tool,
-        linux_firecracker_sudo_guidance_from_args, parse_tool_args, task_command, tool_by_name,
-        tool_definitions,
+        linux_firecracker_sudo_guidance_from_args, parse_tool_args, tail_lines, task_command,
+        tool_by_name, tool_definitions,
     };
 
     #[test]
@@ -3420,6 +3506,22 @@ mod tests {
         assert!(names.contains(&"clusters.state"));
         assert!(names.contains(&"addons.list"));
         assert!(names.contains(&"addons.install"));
+        assert!(names.contains(&"workloads.apply"));
+    }
+
+    #[test]
+    fn workloads_apply_requires_task_execution() {
+        let tool = tool_by_name("workloads.apply").expect("tool spec");
+        assert!(matches!(tool.task_support, TaskSupport::Required));
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_lines_and_trailing_newline() {
+        let content = "line1\nline2\nline3\n";
+        assert_eq!(tail_lines(content, 2), "line2\nline3\n");
+        assert_eq!(tail_lines(content, 10), content);
+        assert_eq!(tail_lines(content, 0), "");
+        assert_eq!(tail_lines("line1", 1), "line1");
     }
 
     #[test]
