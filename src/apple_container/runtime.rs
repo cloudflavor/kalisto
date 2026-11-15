@@ -400,7 +400,7 @@ fn verify_signatures(runner: &dyn CommandRunner, install: &Path) -> Result<()> {
         ));
     }
     let canonical = install.canonicalize().map_err(io_error)?;
-    let requirement = format!("anchor apple generic and certificate leaf[subject.OU] = \"{TEAM}\"");
+    let requirement = format!("=anchor apple generic and certificate leaf[subject.OU] = \"{TEAM}\"");
     for executable in REQUIRED_BINARIES {
         let executable = install.join(executable);
         if !executable

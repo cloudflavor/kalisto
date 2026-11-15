@@ -132,8 +132,8 @@ jobs:
           mkdir -p ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds "$TMPDIR"
           workspace=$(mktemp -d ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/kalisto-apple.XXXXXX)
           data=$(mktemp -d "$HOME/Library/Caches/kalisto-apple-ci.XXXXXX")
-          mkdir -p "$data/kalisto" "$workspace/artifacts" "$workspace/config" "$CARGO_TARGET_DIR"
-          ln -s "$workspace/artifacts" "$data/kalisto/artifacts"
+          mkdir -p "$data/kalisto" "$workspace/config" "$CARGO_TARGET_DIR" ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/artifacts
+          ln -s ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/artifacts "$data/kalisto/artifacts"
           printf 'KALISTO_APPLE_WORKSPACE=%s\nXDG_DATA_HOME=%s\nXDG_CONFIG_HOME=%s/config\n' "$workspace" "$data" "$workspace" >> "$GITHUB_ENV"
           cd "$workspace"
           git init -q .
