@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use kalisto::backend::BackendKind;
 use kalisto::cluster::manager;
 use kalisto::cluster::spec::ClusterSpec;
 
@@ -20,7 +21,7 @@ impl Drop for OwnedCluster {
                 ("pods.json", vec!["get", "pods", "-A", "-o", "json"]),
                 ("events.json", vec!["get", "events", "-A", "-o", "json"]),
             ] {
-                if let Ok(output) = Command::new("kubectl")
+                if let Ok(output) = Command::new(managed_kubectl())
                     .arg("--kubeconfig")
                     .arg(&kubeconfig)
                     .arg("--request-timeout=5s")
@@ -89,7 +90,7 @@ impl Drop for OwnedCluster {
 }
 
 fn kubectl(kubeconfig: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("kubectl")
+    let output = Command::new(managed_kubectl())
         .arg("--kubeconfig")
         .arg(kubeconfig)
         .arg("--request-timeout=5s")
@@ -104,13 +105,37 @@ fn kubectl(kubeconfig: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
+fn managed_kubectl() -> PathBuf {
+    kalisto::kubectl::binary(
+        kalisto::cluster::spec::DEFAULT_K3S_VERSION,
+        &kalisto::process::SystemRunner,
+    )
+    .expect("matching managed kubectl should be prepared")
+}
+
 #[test]
 fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute() {
     if std::env::var("KALISTO_LIVE_THREE_NODE_BOOT_BUDGET").as_deref() != Ok("1") {
-        eprintln!("skipping opt-in three-node cold boot budget benchmark");
+        eprintln!("skipping opt-in Lima cold boot budget benchmark");
         return;
     }
+    cold_cli_boot(BackendKind::Lima);
+}
+
+#[test]
+fn apple_container_k3s_has_functional_three_node_cilium_under_one_minute() {
+    if std::env::var("KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET").as_deref() != Ok("1") {
+        eprintln!("skipping opt-in Apple container cold boot budget benchmark");
+        return;
+    }
+    cold_cli_boot(BackendKind::AppleContainer);
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Cold startup and network proofs share one clock."
+)]
+fn cold_cli_boot(backend: BackendKind) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -121,7 +146,8 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
     let workspace = evidence.join("empty-cwd");
     fs::create_dir_all(&workspace).unwrap();
     let workspace = workspace.canonicalize().unwrap();
-    let spec = ClusterSpec::new(name.clone(), workspace.clone());
+    let mut spec = ClusterSpec::new(name.clone(), workspace.clone());
+    spec.backend = backend;
     assert!(
         !spec.state_root().exists(),
         "cold benchmark must not reuse any persisted cluster state"
@@ -131,11 +157,13 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
         || PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".lima"),
         PathBuf::from,
     );
-    for suffix in ["cp", "w0", "w1"] {
-        assert!(
-            !lima_home.join(format!("{prefix}{suffix}")).exists(),
-            "cold benchmark must not reuse any provisioned VM"
-        );
+    if backend == BackendKind::Lima {
+        for suffix in ["cp", "w0", "w1"] {
+            assert!(
+                !lima_home.join(format!("{prefix}{suffix}")).exists(),
+                "cold benchmark must not reuse any provisioned VM"
+            );
+        }
     }
     let _cleanup = OwnedCluster(name.clone(), evidence.clone());
     let up_log = fs::File::create(evidence.join("up.log")).unwrap();
@@ -147,7 +175,7 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
         .args([
             "up",
             "--backend",
-            "lima",
+            backend.as_str(),
             "--workers",
             "2",
             "--addons",
@@ -184,20 +212,40 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
         !spec.state_root().exists(),
         "pull must not create cluster state"
     );
-    let after_pull =
-        Command::new(kalisto::runtime::program("limactl").expect("pull installs Lima"))
-            .args(["list", "--format", "{{ .Name }}"])
-            .output()
-            .expect("Lima should list instances after pull");
-    assert!(after_pull.status.success());
-    assert!(
-        String::from_utf8_lossy(&after_pull.stdout)
-            .lines()
-            .all(|instance| !instance.starts_with(&prefix)),
-        "pull must not pre-create benchmark VMs"
-    );
+    if backend == BackendKind::Lima {
+        let after_pull =
+            Command::new(kalisto::runtime::program("limactl").expect("pull installs Lima"))
+                .args(["list", "--format", "{{ .Name }}"])
+                .output()
+                .expect("Lima should list instances after pull");
+        assert!(after_pull.status.success());
+        assert!(
+            String::from_utf8_lossy(&after_pull.stdout)
+                .lines()
+                .all(|instance| !instance.starts_with(&prefix)),
+            "pull must not pre-create benchmark VMs"
+        );
+    } else {
+        use kalisto::process::CommandRunner;
+        let after_pull = kalisto::process::SystemRunner
+            .run(
+                "container",
+                &[
+                    "list".into(),
+                    "--all".into(),
+                    "--format".into(),
+                    "json".into(),
+                ],
+            )
+            .expect("Apple runtime should list containers after pull");
+        assert!(
+            !after_pull.stdout.contains(&prefix),
+            "pull must not pre-create benchmark nodes"
+        );
+    }
+    managed_kubectl();
     let mut prepared_spec = spec.clone();
-    prepared_spec.backend = kalisto::backend::BackendKind::Lima;
+    prepared_spec.backend = backend;
     prepared_spec.cni_plugin = kalisto::cluster::addon::CniPlugin::Cilium;
     let prepared = kalisto::pull::load(&prepared_spec).unwrap();
 
@@ -346,6 +394,7 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
         serde_json::to_vec_pretty(&serde_json::json!({
             "seconds": elapsed.as_secs_f64(),
             "fresh_vm_definitions": true,
+            "backend": backend.as_str(),
             "ready_nodes": 3,
             "cni": "cilium",
             "cni_rollouts_ready": true,
@@ -363,5 +412,59 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
     assert!(
         elapsed < Duration::from_secs(60),
         "cold CLI boot, API and functional CNI exceeded 60 seconds: {elapsed:?}"
+    );
+    if backend == BackendKind::AppleContainer {
+        prove_persistent_restart_and_worker_scale(&name, &prepared_spec, &kubeconfig);
+    }
+}
+
+fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kubeconfig: &Path) {
+    kubectl(
+        kubeconfig,
+        &[
+            "create",
+            "configmap",
+            "boot-budget-state",
+            "--from-literal=value=persisted",
+        ],
+    );
+    manager::down(name, false).expect("Apple nodes should stop without deleting disks");
+    let stopped = manager::status(name).expect("stopped cluster should remain defined");
+    assert!(
+        stopped.nodes.iter().all(|node| node
+            .backend_status
+            .split_whitespace()
+            .any(|word| word == "Stopped")),
+        "down must stop every Apple node"
+    );
+    manager::up(spec).expect("Apple cluster should resume its persisted node disks");
+    assert_eq!(
+        kubectl(
+            kubeconfig,
+            &[
+                "get",
+                "configmap",
+                "boot-budget-state",
+                "-o",
+                "jsonpath={.data.value}"
+            ]
+        ),
+        b"persisted",
+        "resume must retain Kubernetes datastore contents"
+    );
+    manager::scale(name, 3).expect("Apple cluster should add a worker on its existing network");
+    let nodes: serde_json::Value =
+        serde_json::from_slice(&kubectl(kubeconfig, &["get", "nodes", "-o", "json"])).unwrap();
+    let nodes = nodes["items"].as_array().unwrap();
+    assert_eq!(nodes.len(), 4);
+    assert!(
+        nodes.iter().all(|node| {
+            node["status"]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| condition["type"] == "Ready" && condition["status"] == "True")
+        }),
+        "the added worker must join with a functional CNI"
     );
 }

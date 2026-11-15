@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: kalisto-ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/feat/apple-container-k3s' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   rust-fmt:
@@ -112,3 +112,68 @@ jobs:
         run: cargo build --release --bin kalisto
       - name: Smoke run
         run: /tmp/kalisto-target-build/release/kalisto ls
+
+  apple-container-live:
+    needs: [rust-fmt, rust-clippy, rust-test]
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/feat/apple-container-k3s') }}
+    runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/cargo-home
+      RUSTUP_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-rustup
+      CARGO_TARGET_DIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target
+      TMPDIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/tmp
+      KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET: '1'
+    steps:
+      - name: Verify external storage and prepare isolated checkout
+        run: |
+          set -eu
+          python3 -c 'import os; assert os.path.ismount("${{ vars.KALISTO_MACOS_VOLUME }}"), "external build volume is not mounted"'
+          mkdir -p ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds "$TMPDIR"
+          workspace=$(mktemp -d ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/kalisto-apple.XXXXXX)
+          data=$(mktemp -d "$HOME/Library/Caches/kalisto-apple-ci.XXXXXX")
+          mkdir -p "$data/kalisto" "$workspace/artifacts" "$workspace/config" "$CARGO_TARGET_DIR"
+          ln -s "$workspace/artifacts" "$data/kalisto/artifacts"
+          printf 'KALISTO_APPLE_WORKSPACE=%s\nXDG_DATA_HOME=%s\nXDG_CONFIG_HOME=%s/config\n' "$workspace" "$data" "$workspace" >> "$GITHUB_ENV"
+          cd "$workspace"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Prove cold k3s and functional three-node Cilium within sixty seconds
+        run: |
+          set -eu
+          cd "$KALISTO_APPLE_WORKSPACE"
+          cargo test --locked --release --test macos_three_node_boot_budget \
+            apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
+      - name: Upload benchmark measurements
+        if: always()
+        uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: apple-container-boot-budget
+          path: |
+            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/result.json
+            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/*-image-timings.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Clean only this job's clusters and service
+        if: always()
+        run: |
+          set -eu
+          if [ -z "${KALISTO_APPLE_WORKSPACE:-}" ] || [ -z "${XDG_DATA_HOME:-}" ]; then exit 0; fi
+          case "$KALISTO_APPLE_WORKSPACE" in ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/kalisto-apple.*) ;; *) exit 1 ;; esac
+          case "$XDG_DATA_HOME" in "$HOME"/Library/Caches/kalisto-apple-ci.*) ;; *) exit 1 ;; esac
+          if [ -x "$CARGO_TARGET_DIR/release/kalisto" ]; then
+            "$CARGO_TARGET_DIR/release/kalisto" destroy --all
+          fi
+          export CONTAINER_INSTALL_ROOT="$XDG_DATA_HOME/kalisto/artifacts/runtime-v1/apple-container-1.7.1-arm64/install"
+          export CONTAINER_APP_ROOT="$XDG_DATA_HOME/kalisto/apple-container"
+          binary="$CONTAINER_INSTALL_ROOT/bin/container"
+          if [ -x "$binary" ]; then
+            status=$("$binary" system status --format json)
+            printf '%s' "$status" | python3 -c 'import json,os,sys; s=json.load(sys.stdin); p=s.get("paths",{}); assert s.get("status") == "running" and all(os.path.realpath(p.get(k,"")) == os.path.realpath(os.environ[e]) for k,e in [("appRoot","CONTAINER_APP_ROOT"),("installRoot","CONTAINER_INSTALL_ROOT")]), "service ownership not verified; retaining isolated data"'
+            "$binary" system stop
+          fi
+          rm -rf -- "$XDG_DATA_HOME" "$KALISTO_APPLE_WORKSPACE"
