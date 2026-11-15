@@ -6,6 +6,7 @@ use crate::k3s::ServerMode;
 
 use super::config::Config;
 
+#[must_use]
 pub fn initial_readiness_command(server_mode: ServerMode, kubeconfig_path: &Path) -> String {
     match server_mode {
         ServerMode::Standard => format!(
@@ -19,6 +20,7 @@ pub fn initial_readiness_command(server_mode: ServerMode, kubeconfig_path: &Path
     }
 }
 
+#[must_use]
 pub fn effective_network(config: &Config) -> String {
     config.network.clone().unwrap_or_else(|| {
         if config.worker_count > 0 {
@@ -29,6 +31,7 @@ pub fn effective_network(config: &Config) -> String {
     })
 }
 
+#[must_use]
 pub fn acceptable_apiserver_status(status: &str) -> bool {
     matches!(status.trim(), "200" | "401" | "403")
 }
@@ -36,10 +39,10 @@ pub fn acceptable_apiserver_status(status: &str) -> bool {
 pub fn first_line(text: &str, fallback: &'static str) -> String {
     text.lines()
         .find(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.to_owned())
+        .map_or_else(|| fallback.to_owned(), ToOwned::to_owned)
 }
 
+#[must_use]
 pub fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_owned()
@@ -49,6 +52,7 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+#[must_use]
 pub fn format_duration(duration: Duration) -> String {
     let total_millis = duration.as_millis();
     let seconds = total_millis / 1000;
@@ -56,6 +60,7 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{seconds}.{millis:03}s")
 }
 
+#[must_use]
 pub fn unique_suffix() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

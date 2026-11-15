@@ -12,7 +12,7 @@ use crate::telemetry::raw_streams_enabled;
 
 use super::util::acceptable_apiserver_status;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct GuestWait<'a> {
     pub instance_name: &'a str,
     pub runtime_root: &'a Path,
@@ -22,7 +22,7 @@ pub struct GuestWait<'a> {
     pub interval: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct GuestFileCopy<'a> {
     pub instance_name: &'a str,
     pub runtime_root: &'a Path,
@@ -47,6 +47,9 @@ impl LiveLogTail {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn emit_pending(&mut self) -> Result<()> {
         if !self.path.is_file() {
             return Ok(());
@@ -84,6 +87,9 @@ impl LiveLogTail {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_path_with_tail(
     path: &Path,
     timeout: Duration,
@@ -92,11 +98,7 @@ pub fn wait_for_path_with_tail(
     let started = SystemTime::now();
     loop {
         tail.emit_pending()?;
-        if path.is_file()
-            && fs::metadata(path)
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-        {
+        if path.is_file() && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             tail.emit_pending()?;
             return Ok(());
         }
@@ -111,6 +113,9 @@ pub fn wait_for_path_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_guest_text_file_copy(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -155,6 +160,9 @@ pub fn wait_for_guest_text_file_copy(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_stable_guest_success_with_tail(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -186,6 +194,9 @@ pub fn wait_for_stable_guest_success_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_stable_guest_success(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -213,6 +224,9 @@ pub fn wait_for_stable_guest_success(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_host_http_with_tail(
     runner: &dyn CommandRunner,
     url: &str,
@@ -259,6 +273,9 @@ pub fn wait_for_host_http_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_worker_process(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -275,7 +292,6 @@ pub fn wait_for_worker_process(
     );
     let command = format!(
         "test -s {pid_file} && pid=$(cat {pid_file}) && test -n \"$pid\" && kill -0 \"$pid\" 2>/dev/null",
-        pid_file = pid_file,
     );
     wait_for_stable_guest_success(
         backend,
@@ -291,6 +307,9 @@ pub fn wait_for_worker_process(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_node_ready(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,

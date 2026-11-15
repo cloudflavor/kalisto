@@ -17,6 +17,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             template: "template://default".to_owned(),

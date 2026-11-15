@@ -25,6 +25,7 @@ pub struct Artifacts {
 }
 
 impl Artifacts {
+    #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self {
             kubeconfig: root.join("kubeconfig.yaml"),
@@ -44,6 +45,7 @@ pub struct Instance {
 }
 
 impl Instance {
+    #[must_use]
     pub fn new(name: String, role: NodeRole, root: PathBuf) -> Self {
         Self {
             name,
@@ -91,6 +93,9 @@ impl Display for WorkerStartError {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn bootstrap_server(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -118,6 +123,9 @@ pub fn bootstrap_server(
     launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn bootstrap_worker(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -143,6 +151,9 @@ pub fn bootstrap_worker(
     launch_k3s_process(backend, runner, worker, &artifact_dir, &command)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn start_node_instance(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -169,6 +180,9 @@ pub fn start_node_instance(
     Ok(output)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn start_worker_instances(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,

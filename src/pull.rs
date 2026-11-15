@@ -1,6 +1,7 @@
 //! Prepare immutable Lima boot assets without creating cluster state or VMs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -54,6 +55,9 @@ pub struct PreparedAssets {
     manifest: Manifest,
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn cache_root() -> Result<PathBuf> {
     Ok(artifacts_root()?.join(format!("boot-v{SCHEMA}")))
 }
@@ -109,12 +113,19 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
     ))
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn prepare(spec: &ClusterSpec) -> Result<PreparedAssets> {
     profile(spec)?;
     crate::runtime::prepare(&SystemRunner, spec.cni_plugin == CniPlugin::Cilium)?;
     prepare_with_runner(spec, &SystemRunner)
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn prepare_with_runner(
     spec: &ClusterSpec,
     runner: &dyn CommandRunner,
@@ -348,6 +359,9 @@ pub fn prepare_with_runner(
     load(spec)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn load(spec: &ClusterSpec) -> Result<PreparedAssets> {
     let imported = spec.state_root().join("archive/assets");
     if imported.join("manifest.json").is_file() {
@@ -439,6 +453,7 @@ impl PreparedAssets {
         self.manifest.files.iter().map(|file| file.name.as_str())
     }
 
+    #[must_use]
     pub fn probe_image(&self) -> &str {
         &self.manifest.probe_image
     }
@@ -450,6 +465,9 @@ impl PreparedAssets {
             .map(|rollout| (rollout.namespace.as_str(), rollout.resource.as_str()))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn stage_node(
         &self,
         backend: &dyn ClusterBackend,
@@ -461,10 +479,11 @@ impl PreparedAssets {
         let mut command = format!(
             "set -eu\nif [ -e /var/lib/rancher/k3s/server/manifests/kalisto-cilium.yaml ]; then echo 'legacy Helm-managed Cilium requires migration; use a fresh cluster for prepared startup' >&2; exit 1; fi\ncurrent=$(/usr/local/bin/k3s --version 2>/dev/null | awk 'NR==1 {{print $3}}')\nif [ \"$current\" != {version} ]; then\n  if ps -eo comm= | grep -Eq '^[[:space:]]*k3s-(server|agent)$'; then echo 'stop the cluster before changing k3s version' >&2; exit 1; fi\n  install -m 0755 {binary} /usr/local/bin/k3s\nfi\nmkdir -p /var/lib/rancher/k3s/agent/images\ntouch /var/lib/rancher/k3s/agent/images/.cache.json\n"
         );
-        command.push_str(&format!(
-            "ln -sfn {} /var/lib/rancher/k3s/agent/images/kalisto-images.tar\n",
+        let _ = writeln!(
+            command,
+            "ln -sfn {} /var/lib/rancher/k3s/agent/images/kalisto-images.tar",
             shell_escape(&self.root.join("images.tar").display().to_string()),
-        ));
+        );
         backend.guest_sudo_shell(runner, &node.name, &node.artifacts.root, &command)?;
         Ok(())
     }
@@ -485,7 +504,12 @@ impl PreparedAssets {
                 .manifest
                 .files
                 .iter()
-                .find(|file| file.name.ends_with(".tgz"))
+                // Cache manifest file names are generated locally and always lowercase.
+                .find(|file| {
+                    std::path::Path::new(&file.name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
+                })
                 .ok_or_else(|| invalid("cached Cilium chart is missing"))?;
             let mut documents = render_cilium(
                 runner,
@@ -509,6 +533,9 @@ impl PreparedAssets {
         Ok(host_manifest)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn install_cilium(
         &self,
         backend: &dyn ClusterBackend,
@@ -533,17 +560,21 @@ impl PreparedAssets {
             shell_escape(&guest_manifest.display().to_string())
         );
         for rollout in &self.manifest.rollouts {
-            command.push_str(&format!(
+            let _ = write!(
+                command,
                 " && {kubectl} -n {} rollout status {} --timeout=60s",
                 shell_escape(&rollout.namespace),
                 shell_escape(&rollout.resource)
-            ));
+            );
         }
         backend.guest_sudo_shell(runner, &node.name, &node.artifacts.root, &command)?;
         Ok(())
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn validate_lima_template(template: &str) -> Result<()> {
     let path = Path::new(template);
     let content = fs::read_to_string(path).map_err(|error| {
@@ -654,8 +685,7 @@ fn required_k3s_images(inventory: &str, spec: &ClusterSpec) -> Result<BTreeSet<S
     {
         let repository = image
             .rsplit_once(':')
-            .map(|(repository, _)| repository)
-            .unwrap_or(image);
+            .map_or(image, |(repository, _)| repository);
         if !image.starts_with("docker.io/rancher/") {
             continue;
         }
@@ -706,8 +736,8 @@ fn write_private_manifest(path: &Path, content: &[u8]) -> Result<()> {
     let mut file = options.open(&temporary).map_err(io_error)?;
     let result = file
         .write_all(content)
-        .and_then(|_| file.sync_all())
-        .and_then(|_| fs::rename(&temporary, path));
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }

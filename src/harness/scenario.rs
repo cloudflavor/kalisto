@@ -19,6 +19,7 @@ impl HarnessConfig {
         }
     }
 
+    #[must_use]
     pub fn scenario(&self, name: &str) -> Option<&ScenarioConfig> {
         self.scenarios.iter().find(|scenario| scenario.name == name)
     }
@@ -51,6 +52,9 @@ impl Default for ScenarioConfig {
 }
 
 impl ScenarioConfig {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.name.trim().is_empty() {
             return Err(crate::error::Error::InvalidArgs(
@@ -131,6 +135,7 @@ pub enum WaitConfig {
 }
 
 impl WaitConfig {
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::Deployment { name, .. } => format!("deployment/{name}"),
@@ -148,6 +153,7 @@ pub enum ProbeConfig {
 }
 
 impl ProbeConfig {
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Command(probe) => &probe.name,

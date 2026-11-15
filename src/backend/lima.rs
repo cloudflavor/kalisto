@@ -12,6 +12,9 @@ pub struct LimaBackend;
 
 pub const BACKEND: LimaBackend = LimaBackend;
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|source| Error::CommandIo {
         program: "canonicalize".to_owned(),
@@ -109,6 +112,9 @@ impl ClusterBackend for LimaBackend {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn start_instance(
     runner: &dyn CommandRunner,
     config: &BackendConfig,
@@ -248,6 +254,9 @@ fn instance_exists(runner: &dyn CommandRunner, instance_name: &str) -> Result<bo
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn guest_shell(
     runner: &dyn CommandRunner,
     instance_name: &str,
@@ -267,6 +276,9 @@ pub fn guest_shell(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn guest_sudo_shell(
     runner: &dyn CommandRunner,
     instance_name: &str,
@@ -287,6 +299,9 @@ pub fn guest_sudo_shell(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn stop_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "stopping lima instance");
     runner.run(
@@ -301,6 +316,9 @@ pub fn stop_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Result<()> {
     debug!(instance = %instance_name, "deleting lima instance");
     match runner.run(
@@ -318,6 +336,9 @@ pub fn delete_instance(runner: &dyn CommandRunner, instance_name: &str) -> Resul
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn query_instance_status(runner: &dyn CommandRunner, instance_name: &str) -> Result<String> {
     debug!(instance = %instance_name, "querying lima instance status");
     let args = vec![
@@ -337,8 +358,7 @@ pub fn query_instance_status(runner: &dyn CommandRunner, instance_name: &str) ->
         .stdout
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "unknown".to_owned()))
+        .map_or_else(|| "unknown".to_owned(), ToOwned::to_owned))
 }
 
 fn is_missing_instance_error(stderr: &str) -> bool {
@@ -346,10 +366,12 @@ fn is_missing_instance_error(stderr: &str) -> bool {
     normalized.contains("no instance matching") || normalized.contains("unmatched instances")
 }
 
+#[must_use]
 pub fn internal_hostname(instance_name: &str) -> String {
     format!("lima-{instance_name}.internal")
 }
 
+#[must_use]
 pub fn shell_escape(input: &str) -> String {
     shared_shell_escape(input)
 }

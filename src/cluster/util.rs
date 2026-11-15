@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::k3s::ServerMode;
 use crate::shell::shell_escape;
 
+#[must_use]
 pub fn initial_readiness_command(server_mode: ServerMode, kubeconfig_path: &Path) -> String {
     match server_mode {
         ServerMode::Standard => format!(
@@ -17,10 +18,12 @@ pub fn initial_readiness_command(server_mode: ServerMode, kubeconfig_path: &Path
     }
 }
 
+#[must_use]
 pub fn acceptable_apiserver_status(status: &str) -> bool {
     matches!(status.trim(), "200" | "401" | "403")
 }
 
+#[must_use]
 pub fn format_duration(duration: Duration) -> String {
     let total_millis = duration.as_millis();
     let seconds = total_millis / 1000;

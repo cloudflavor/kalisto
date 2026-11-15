@@ -15,12 +15,21 @@ pub struct Output {
 }
 
 pub trait CommandRunner {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn run(&self, program: &str, args: &[String]) -> Result<Output>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn run_live(&self, program: &str, args: &[String]) -> Result<Output> {
         self.run(program, args)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn run_with_env(
         &self,
         program: &str,
@@ -61,6 +70,9 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn ensure_path_exists(path: &Path) -> Result<()> {
     if path.exists() {
         Ok(())

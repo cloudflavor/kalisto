@@ -5,10 +5,14 @@ use crate::error::{Error, Result};
 
 use super::schema::KalistoConfig;
 
+#[must_use]
 pub fn config_path(project_root: &Path) -> PathBuf {
     project_root.join("kalisto.toml")
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn load_project_config(project_root: &Path) -> Result<Option<KalistoConfig>> {
     let path = config_path(project_root);
     if !path.is_file() {

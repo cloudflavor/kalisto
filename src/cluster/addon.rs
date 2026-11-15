@@ -51,6 +51,7 @@ pub enum CniPlugin {
 }
 
 impl CniPlugin {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -59,6 +60,7 @@ impl CniPlugin {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "none" => Some(Self::None),
@@ -70,17 +72,7 @@ impl CniPlugin {
 
     pub fn apply_component_defaults(self, toggles: &mut ComponentToggles) {
         match self {
-            Self::None => {
-                toggles.flannel_backend_none = true;
-                toggles.disable_coredns = false;
-                toggles.disable_network_policy = true;
-            }
-            Self::Flannel => {
-                toggles.flannel_backend_none = true;
-                toggles.disable_coredns = false;
-                toggles.disable_network_policy = true;
-            }
-            Self::Cilium => {
+            Self::None | Self::Flannel | Self::Cilium => {
                 toggles.flannel_backend_none = true;
                 toggles.disable_coredns = false;
                 toggles.disable_network_policy = true;
@@ -95,12 +87,14 @@ pub enum MetalLbMode {
 }
 
 impl MetalLbMode {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Layer2 => "layer2",
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "layer2" => Some(Self::Layer2),
@@ -117,10 +111,14 @@ pub struct MetalLbConfig {
 }
 
 impl MetalLbConfig {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.mode.is_none() && self.addresses.is_empty() && self.config_file.is_none()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn validate(&self) -> Result<()> {
         if self.addresses.is_empty() && self.mode.is_some() && self.config_file.is_none() {
             return Err(Error::InvalidArgs(
@@ -169,6 +167,7 @@ pub enum AddonId {
 }
 
 impl AddonId {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CniFlannel => "cni/flannel",
@@ -182,6 +181,7 @@ impl AddonId {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "cni/flannel" => Some(Self::CniFlannel),
@@ -197,6 +197,7 @@ impl AddonId {
     }
 }
 
+#[derive(Clone, Copy)]
 struct RemoteYamlAddonSpec<'a> {
     addon: AddonId,
     url: &'a str,
@@ -204,6 +205,7 @@ struct RemoteYamlAddonSpec<'a> {
     timeout: Duration,
 }
 
+#[derive(Clone, Copy)]
 pub struct PostReadyAddonRequest<'a> {
     pub backend: &'a dyn ClusterBackend,
     pub runner: &'a dyn CommandRunner,
@@ -216,6 +218,9 @@ pub struct PostReadyAddonRequest<'a> {
     pub metallb: &'a MetalLbConfig,
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<()> {
     if request.cni == CniPlugin::Flannel && !request.builtin_flannel {
         install_flannel(
@@ -253,6 +258,9 @@ pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<(
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn install_catalog_addon(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -271,6 +279,9 @@ pub fn install_catalog_addon(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn install_catalog_addon_with_cilium_version(
     backend: &dyn ClusterBackend,
     runner: &dyn CommandRunner,
@@ -686,10 +697,7 @@ fn install_remote_yaml_addon(
 }
 
 fn should_wait_for_addons() -> bool {
-    std::env::var("KALISTO_WAIT_FOR_ADDONS")
-        .ok()
-        .map(|value| parse_truthy_flag(&value))
-        .unwrap_or(false)
+    std::env::var("KALISTO_WAIT_FOR_ADDONS").is_ok_and(|value| parse_truthy_flag(&value))
 }
 
 fn parse_truthy_flag(value: &str) -> bool {
@@ -713,8 +721,6 @@ fn apply_guest_manifest(
 ) -> Result<()> {
     let install_command = format!(
         "mkdir -p /var/lib/rancher/k3s/server/manifests\ncat <<'EOF' > {manifest_path}\n{manifest}\nEOF",
-        manifest_path = manifest_path,
-        manifest = manifest,
     );
     backend.guest_sudo_shell(
         runner,

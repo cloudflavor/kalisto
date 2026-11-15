@@ -85,6 +85,7 @@ fn tool_root(tool: &Tool) -> Result<PathBuf> {
 }
 
 /// Resolve installed managed tools without downloading anything during startup.
+#[must_use]
 pub fn program(name: &str) -> Option<PathBuf> {
     tools()
         .ok()?
@@ -96,6 +97,9 @@ pub fn program(name: &str) -> Option<PathBuf> {
         })
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn prepare(runner: &dyn CommandRunner, cilium: bool) -> Result<()> {
     let root = root()?;
     fs::create_dir_all(&root).map_err(io_error)?;
@@ -177,6 +181,9 @@ pub fn prepare(runner: &dyn CommandRunner, cilium: bool) -> Result<()> {
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 /// Built-in public images must not depend on Docker or its credential helpers.
 pub fn configure(command: &mut Command, program: &str) -> Result<()> {
     if let Some(executable) = self::program(program)

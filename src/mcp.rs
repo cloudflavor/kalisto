@@ -50,15 +50,21 @@ const TASK_STATUS_CANCELLED: &str = "cancelled";
 const META_RELATED_TASK: &str = "io.modelcontextprotocol/related-task";
 const META_IMMEDIATE_RESPONSE: &str = "io.modelcontextprotocol/model-immediate-response";
 
+/// # Errors
+///
+/// Returns an error when the MCP server cannot load its state or the stdio loop fails.
 pub fn run(project_root: Option<PathBuf>) -> Result<()> {
     let server = McpServer::load(project_root)?;
     server.serve()
 }
 
-pub fn run_task_runner(manifest_path: PathBuf, exit_path: PathBuf) -> Result<()> {
-    let manifest = load_task_manifest(&manifest_path)?;
+/// # Errors
+///
+/// Returns an error when the task manifest cannot be loaded or the tool execution fails.
+pub fn run_task_runner(manifest_path: &Path, exit_path: &Path) -> Result<()> {
+    let manifest = load_task_manifest(manifest_path)?;
     let result = execute_task_runner_manifest(&manifest);
-    write_task_exit_record(&exit_path, &result)?;
+    write_task_exit_record(exit_path, &result)?;
     result
 }
 
@@ -86,6 +92,7 @@ fn load_task_manifest(path: &std::path::Path) -> Result<TaskRunnerManifest> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
     match manifest.tool_name.as_str() {
         "clusters.create" => {
@@ -317,7 +324,7 @@ fn write_task_exit_record(path: &std::path::Path, result: &Result<()>) -> Result
         fs::create_dir_all(parent).map_err(io_error("create_dir_all"))?;
     }
     let record = TaskExitRecord {
-        exit_code: Some(if result.is_ok() { 0 } else { 1 }),
+        exit_code: Some(i32::from(!result.is_ok())),
         error: result.as_ref().err().map(ToString::to_string),
         finished_at: iso8601_now(),
     };
@@ -500,21 +507,21 @@ impl McpServer {
             if let Some(mode) = framing {
                 self.set_framing_mode(mode)?;
             }
-            self.handle_value(value)?;
+            self.handle_value(&value)?;
         }
         Ok(())
     }
 
-    fn handle_value(self: &Arc<Self>, value: Value) -> Result<()> {
+    fn handle_value(self: &Arc<Self>, value: &Value) -> Result<()> {
         let Some(message) = value.as_object() else {
-            self.write_error(Value::Null, -32600, "invalid JSON-RPC message".to_owned())?;
+            self.write_error(&Value::Null, -32600, "invalid JSON-RPC message")?;
             return Ok(());
         };
         if message.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
             self.write_error(
-                message.get("id").cloned().unwrap_or(Value::Null),
+                &message.get("id").cloned().unwrap_or(Value::Null),
                 -32600,
-                "unsupported jsonrpc version".to_owned(),
+                "unsupported jsonrpc version",
             )?;
             return Ok(());
         }
@@ -528,39 +535,40 @@ impl McpServer {
         if !self.is_initialized() && method != "initialize" && method != "ping" {
             if let Some(id) = id {
                 self.write_error(
-                    id,
+                    &id,
                     -32002,
-                    "server is not initialized; call `initialize` first".to_owned(),
+                    "server is not initialized; call `initialize` first",
                 )?;
             }
             return Ok(());
         }
 
-        match id {
-            Some(id) => self.handle_request(id, method, params),
-            None => self.handle_notification(method),
+        if let Some(id) = &id {
+            self.handle_request(id, method, params)
+        } else {
+            self.handle_notification(method);
+            Ok(())
         }
     }
 
-    fn handle_request(self: &Arc<Self>, id: Value, method: &str, params: Value) -> Result<()> {
+    fn handle_request(self: &Arc<Self>, id: &Value, method: &str, params: Value) -> Result<()> {
         match method {
-            "initialize" => self.write_result(id, self.initialize_result()),
-            "ping" => self.write_result(id, json!({})),
-            "tools/list" => self.write_result(id, json!({ "tools": tool_definitions() })),
+            "initialize" => self.write_result(id, &self.initialize_result()),
+            "ping" => self.write_result(id, &json!({})),
+            "tools/list" => self.write_result(id, &json!({ "tools": tool_definitions() })),
             "tools/call" => self.handle_tools_call(id, params),
             "tasks/get" => self.handle_task_get(id, params),
             "tasks/list" => self.handle_task_list(id, params),
             "tasks/result" => self.handle_task_result(id, params),
             "tasks/cancel" => self.handle_task_cancel(id, params),
-            _ => self.write_error(id, -32601, format!("method not found: {method}")),
+            _ => self.write_error(id, -32601, &format!("method not found: {method}")),
         }
     }
 
-    fn handle_notification(&self, method: &str) -> Result<()> {
+    fn handle_notification(&self, method: &str) {
         if method == "notifications/initialized" {
             self.set_initialized(true);
         }
-        Ok(())
     }
 
     fn initialize_result(&self) -> Value {
@@ -594,13 +602,13 @@ impl McpServer {
         })
     }
 
-    fn handle_tools_call(self: &Arc<Self>, id: Value, params: Value) -> Result<()> {
+    fn handle_tools_call(self: &Arc<Self>, id: &Value, params: Value) -> Result<()> {
         let request: ToolCallRequest = match parse_params(params) {
             Ok(request) => request,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
         let Some(tool) = tool_by_name(&request.name) else {
-            return self.write_error(id, -32601, format!("unknown tool `{}`", request.name));
+            return self.write_error(id, -32601, &format!("unknown tool `{}`", request.name));
         };
 
         let wants_task = request.task.is_some();
@@ -609,14 +617,14 @@ impl McpServer {
                 return self.write_error(
                     id,
                     -32601,
-                    format!("tool `{}` requires task-augmented requests", request.name),
+                    &format!("tool `{}` requires task-augmented requests", request.name),
                 );
             }
             TaskSupport::Forbidden if wants_task => {
                 return self.write_error(
                     id,
                     -32601,
-                    format!(
+                    &format!(
                         "tool `{}` does not support task-augmented requests",
                         request.name
                     ),
@@ -630,19 +638,16 @@ impl McpServer {
         if wants_task {
             let task = match self.spawn_task(&request.name, arguments) {
                 Ok(task) => task,
-                Err(error) => return self.write_error(id, error.code, error.message),
+                Err(error) => return self.write_error(id, error.code, &error.message),
             };
-            return self.write_result(
-                id,
-                attach_related_task_meta(
+            return self.write_result(id, &attach_related_task_meta(
                     json!({ "task": task.public_view() }),
                     &task.task_id,
                     Some(format!(
                         "Task `{}` accepted for tool `{}`. Poll `tasks/get` and fetch the final result with `tasks/result`.",
                         task.task_id, request.name
                     )),
-                ),
-            );
+                ));
         }
 
         let result = match execute_direct_tool(
@@ -651,11 +656,12 @@ impl McpServer {
             self.default_project_root.clone(),
         ) {
             Ok(result) => result,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
-        self.write_result(id, result)
+        self.write_result(id, &result)
     }
 
+    #[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
     fn spawn_task(
         self: &Arc<Self>,
         tool_name: &str,
@@ -695,7 +701,7 @@ impl McpServer {
             exit_path: exit_path.display().to_string(),
             child_id: None,
         };
-        self.store_task(record.clone())?;
+        self.store_task(&record.clone())?;
         self.notify_task(&record);
 
         let manifest = TaskRunnerManifest {
@@ -788,8 +794,7 @@ impl McpServer {
                     .refresh_task_state(&task_id_for_thread, execution_for_thread.as_ref())
                     .ok()
                     .flatten()
-                    .map(|record| record.is_terminal())
-                    .unwrap_or(false);
+                    .is_some_and(|record| record.is_terminal());
                 if terminal {
                     if let Ok(mut executions) = server.executions.lock() {
                         executions.remove(&task_id_for_thread);
@@ -807,8 +812,7 @@ impl McpServer {
         let prior_record = self.task(task_id);
         let already_cancelled = prior_record
             .as_ref()
-            .map(|record| record.status == TASK_STATUS_CANCELLED)
-            .unwrap_or(false);
+            .is_some_and(|record| record.status == TASK_STATUS_CANCELLED);
         let guidance = self.task(task_id).and_then(|record| {
             linux_firecracker_sudo_guidance_from_args(&record.request.arguments)
         });
@@ -819,8 +823,8 @@ impl McpServer {
             (Some(0), None) if !(outcome.cancelled || already_cancelled) => complete_child_result(
                 tool_name,
                 task_id,
-                outcome.stdout.clone(),
-                outcome.stderr.clone(),
+                &outcome.stdout.clone(),
+                &outcome.stderr.clone(),
             ),
             (code, maybe_error) => tool_execution_error_result(
                 &format!(
@@ -846,7 +850,7 @@ impl McpServer {
         };
         if let Ok(record) = self.update_task(task_id, |record| {
             let preserve_cancelled = record.status == TASK_STATUS_CANCELLED;
-            record.status = status.to_owned();
+            status.clone_into(&mut record.status);
             record.status_message = Some(match status {
                 TASK_STATUS_COMPLETED => "Kalisto task completed successfully.".to_owned(),
                 TASK_STATUS_CANCELLED => "Kalisto task was cancelled.".to_owned(),
@@ -921,10 +925,10 @@ impl McpServer {
         Ok(Some(record))
     }
 
-    fn handle_task_get(&self, id: Value, params: Value) -> Result<()> {
+    fn handle_task_get(&self, id: &Value, params: Value) -> Result<()> {
         let params: TaskLookupParams = match parse_params(params) {
             Ok(params) => params,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
         let execution = self
             .executions
@@ -933,15 +937,15 @@ impl McpServer {
             .and_then(|executions| executions.get(&params.task_id).cloned())
             .unwrap_or_else(|| Arc::new(TaskExecution::detached()));
         let Some(record) = self.refresh_task_state(&params.task_id, execution.as_ref())? else {
-            return self.write_error(id, -32602, format!("unknown task `{}`", params.task_id));
+            return self.write_error(id, -32602, &format!("unknown task `{}`", params.task_id));
         };
-        self.write_result(id, record.public_view())
+        self.write_result(id, &record.public_view())
     }
 
-    fn handle_task_list(&self, id: Value, params: Value) -> Result<()> {
+    fn handle_task_list(&self, id: &Value, params: Value) -> Result<()> {
         let params: TaskListParams = match parse_params(params) {
             Ok(params) => params,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
         let limit = params.limit.unwrap_or(DEFAULT_TASK_LIST_LIMIT).max(1);
         let tasks = self.tasks.lock().map_err(poisoned("task registry"))?;
@@ -970,36 +974,36 @@ impl McpServer {
         };
         self.write_result(
             id,
-            json!({
+            &json!({
                 "tasks": slice.into_iter().map(|task| task.public_view()).collect::<Vec<_>>(),
                 "nextCursor": next_cursor
             }),
         )
     }
 
-    fn handle_task_result(&self, id: Value, params: Value) -> Result<()> {
+    fn handle_task_result(&self, id: &Value, params: Value) -> Result<()> {
         let params: TaskLookupParams = match parse_params(params) {
             Ok(params) => params,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
         let record = match self.wait_for_terminal_task(&params.task_id) {
             Ok(record) => record,
-            Err(Error::InvalidArgs(message)) => return self.write_error(id, -32602, message),
+            Err(Error::InvalidArgs(message)) => return self.write_error(id, -32602, &message),
             Err(error) => return Err(error),
         };
         let result = record.result.unwrap_or_else(|| {
             tool_execution_error_result("task did not persist a result payload", None)
         });
-        self.write_result(id, attach_related_task_meta(result, &params.task_id, None))
+        self.write_result(id, &attach_related_task_meta(result, &params.task_id, None))
     }
 
-    fn handle_task_cancel(&self, id: Value, params: Value) -> Result<()> {
+    fn handle_task_cancel(&self, id: &Value, params: Value) -> Result<()> {
         let params: TaskLookupParams = match parse_params(params) {
             Ok(params) => params,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
         let Some(record) = self.task(&params.task_id) else {
-            return self.write_error(id, -32602, format!("unknown task `{}`", params.task_id));
+            return self.write_error(id, -32602, &format!("unknown task `{}`", params.task_id));
         };
         if matches!(
             record.request.tool_name.as_str(),
@@ -1016,7 +1020,7 @@ impl McpServer {
             return self.write_error(
                 id,
                 -32602,
-                format!("task `{}` is already terminal", params.task_id),
+                &format!("task `{}` is already terminal", params.task_id),
             );
         }
 
@@ -1036,11 +1040,7 @@ impl McpServer {
                         .to_owned(),
                 ),
                 Err(error) => {
-                    return self.write_error(
-                        id,
-                        -32000,
-                        format!("failed detached task cleanup for `{}`: {error}", params.task_id),
-                    )
+                    return self.write_error(id, -32000, &format!("failed detached task cleanup for `{}`: {error}", params.task_id))
                 }
             }
         } else {
@@ -1048,7 +1048,7 @@ impl McpServer {
         };
 
         let updated = match self.update_task(&params.task_id, |record| {
-            record.status = TASK_STATUS_CANCELLED.to_owned();
+            TASK_STATUS_CANCELLED.clone_into(&mut record.status);
             let message = detached_cleanup_note
                 .clone()
                 .unwrap_or_else(|| "Kalisto task was cancelled.".to_owned());
@@ -1066,7 +1066,7 @@ impl McpServer {
             record.child_id = None;
         }) {
             Ok(updated) => updated,
-            Err(error) => return self.write_error(id, error.code, error.message),
+            Err(error) => return self.write_error(id, error.code, &error.message),
         };
 
         if let Some(execution) = execution.as_ref() {
@@ -1079,7 +1079,7 @@ impl McpServer {
         }
 
         self.notify_task(&updated);
-        self.write_result(id, updated.public_view())
+        self.write_result(id, &updated.public_view())
     }
 
     fn wait_for_terminal_task(&self, task_id: &str) -> Result<TaskRecord> {
@@ -1109,14 +1109,14 @@ impl McpServer {
         )
     }
 
-    fn store_task(&self, record: TaskRecord) -> std::result::Result<(), JsonRpcError> {
+    fn store_task(&self, record: &TaskRecord) -> std::result::Result<(), JsonRpcError> {
         {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 jsonrpc_error(-32000, "task registry mutex was poisoned".to_owned())
             })?;
             tasks.insert(record.task_id.clone(), record.clone());
         }
-        self.persist_task(&record)
+        self.persist_task(record)
             .map_err(|error| jsonrpc_error(-32000, error.to_string()))
     }
 
@@ -1170,7 +1170,7 @@ impl McpServer {
         }));
     }
 
-    fn write_result(&self, id: Value, result: Value) -> Result<()> {
+    fn write_result(&self, id: &Value, result: &Value) -> Result<()> {
         self.write_message(&json!({
             "jsonrpc": JSONRPC_VERSION,
             "id": id,
@@ -1178,7 +1178,7 @@ impl McpServer {
         }))
     }
 
-    fn write_error(&self, id: Value, code: i64, message: String) -> Result<()> {
+    fn write_error(&self, id: &Value, code: i64, message: &str) -> Result<()> {
         self.write_message(&json!({
             "jsonrpc": JSONRPC_VERSION,
             "id": id,
@@ -1220,7 +1220,7 @@ impl McpServer {
     }
 
     fn is_initialized(&self) -> bool {
-        self.initialized.lock().map(|state| *state).unwrap_or(false)
+        self.initialized.lock().is_ok_and(|state| *state)
     }
 
     fn set_initialized(&self, initialized: bool) {
@@ -1262,7 +1262,6 @@ fn detect_stdio_framing(reader: &mut dyn BufRead) -> Result<Option<FramingMode>>
             return Ok(None);
         }
         match buffer[0] {
-            b'{' => return Ok(Some(FramingMode::NewlineDelimited)),
             b'C' | b'c' => return Ok(Some(FramingMode::ContentLength)),
             b'\n' | b'\r' | b' ' | b'\t' => reader.consume(1),
             _ => return Ok(Some(FramingMode::NewlineDelimited)),
@@ -1341,7 +1340,8 @@ fn is_persisted_task_record_path(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
-    file_name.ends_with(".json")
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
         && !file_name.ends_with(".manifest.json")
         && !file_name.ends_with(".exit.json")
 }
@@ -1502,7 +1502,6 @@ fn tool_definition(tool: &ToolSpec) -> Value {
 
 fn input_schema(tool_name: &str) -> Value {
     match tool_name {
-        "clusters.list" => empty_object_schema(),
         "clusters.status" | "clusters.stats" | "clusters.state" | "clusters.kubeconfig" => {
             named_cluster_schema()
         }
@@ -1702,6 +1701,7 @@ fn tool_by_name(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|tool| tool.name == name)
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 fn execute_direct_tool(
     tool_name: &str,
     arguments: Value,
@@ -1710,48 +1710,50 @@ fn execute_direct_tool(
     match tool_name {
         "clusters.list" => {
             parse_tool_args::<EmptyArgs>(arguments)?;
-            let clusters = cluster_list().map_err(cluster_error_result)?;
+            let clusters = cluster_list().map_err(|error| cluster_error_result(&error))?;
             Ok(success_tool_result(
-                format!("Listed {} cluster(s).", clusters.len()),
-                json!({
+                &format!("Listed {} cluster(s).", clusters.len()),
+                &json!({
                     "clusters": clusters.iter().map(cluster_status_payload).collect::<Vec<_>>()
                 }),
             ))
         }
         "clusters.status" => {
             let args: NamedClusterArgs = parse_tool_args(arguments)?;
-            let status = cluster_status(&args.name).map_err(cluster_error_result)?;
+            let status =
+                cluster_status(&args.name).map_err(|error| cluster_error_result(&error))?;
             Ok(success_tool_result(
-                format!("Loaded status for cluster `{}`.", status.name),
-                json!({ "cluster": cluster_status_payload(&status) }),
+                &format!("Loaded status for cluster `{}`.", status.name),
+                &json!({ "cluster": cluster_status_payload(&status) }),
             ))
         }
         "clusters.state" => {
             let args: NamedClusterArgs = parse_tool_args(arguments)?;
-            let state = load_cluster_state(&args.name).map_err(cluster_error_result)?;
+            let state =
+                load_cluster_state(&args.name).map_err(|error| cluster_error_result(&error))?;
             Ok(success_tool_result(
-                format!("Loaded persisted state for cluster `{}`.", state.name),
-                json!({ "cluster": cluster_state_payload(&state) }),
+                &format!("Loaded persisted state for cluster `{}`.", state.name),
+                &json!({ "cluster": cluster_state_payload(&state) }),
             ))
         }
         "clusters.stats" => {
             let args: NamedClusterArgs = parse_tool_args(arguments)?;
-            let stats = cluster_stats(&args.name).map_err(cluster_error_result)?;
+            let stats = cluster_stats(&args.name).map_err(|error| cluster_error_result(&error))?;
             Ok(success_tool_result(
-                format!("Loaded stats for cluster `{}`.", stats.name),
-                json!({ "cluster": cluster_stats_payload(&stats) }),
+                &format!("Loaded stats for cluster `{}`.", stats.name),
+                &json!({ "cluster": cluster_stats_payload(&stats) }),
             ))
         }
         "clusters.kubeconfig" => {
             let args: NamedClusterArgs = parse_tool_args(arguments)?;
             let state_root = crate::cluster::spec::ClusterSpec::state_root_for(&args.name)
-                .map_err(cluster_error_result)?;
+                .map_err(|error| cluster_error_result(&error))?;
             let path = ClusterState::load(&state_root)
-                .map_err(cluster_error_result)?
+                .map_err(|error| cluster_error_result(&error))?
                 .kubeconfig_path;
             Ok(success_tool_result(
-                format!("Resolved kubeconfig for cluster `{}`.", args.name),
-                json!({
+                &format!("Resolved kubeconfig for cluster `{}`.", args.name),
+                &json!({
                     "name": args.name,
                     "kubeconfigPath": path.display().to_string()
                 }),
@@ -1760,7 +1762,7 @@ fn execute_direct_tool(
         "clusters.logs" => {
             let args: ClusterLogsArgs = parse_tool_args(arguments)?;
             let logs = crate::cluster::manager::logs(&args.name, &args.node)
-                .map_err(cluster_error_result)?;
+                .map_err(|error| cluster_error_result(&error))?;
             let sections = logs
                 .sections
                 .iter()
@@ -1777,13 +1779,13 @@ fn execute_direct_tool(
                 })
                 .collect::<Vec<_>>();
             Ok(success_tool_result(
-                format!(
+                &format!(
                     "Loaded {} log section(s) for node `{}` in cluster `{}`.",
                     logs.sections.len(),
                     logs.node,
                     logs.cluster
                 ),
-                json!({
+                &json!({
                     "cluster": logs.cluster,
                     "node": logs.node,
                     "sections": sections
@@ -1797,11 +1799,11 @@ fn execute_direct_tool(
                 .as_deref()
                 .map(load_cluster_state)
                 .transpose()
-                .map_err(cluster_error_result)?;
-            let catalog = built_in_catalog().map_err(cluster_error_result)?;
+                .map_err(|error| cluster_error_result(&error))?;
+            let catalog = built_in_catalog().map_err(|error| cluster_error_result(&error))?;
             Ok(success_tool_result(
-                format!("Loaded {} add-on(s).", catalog.len()),
-                json!({
+                &format!("Loaded {} add-on(s).", catalog.len()),
+                &json!({
                     "cluster": args.name,
                     "addons": catalog.iter().map(|plugin| addon_payload(plugin, cluster_state.as_ref())).collect::<Vec<_>>()
                 }),
@@ -1912,9 +1914,9 @@ impl ClusterStateView {
             api_port: state.api_port,
             worker_count: state.worker_count,
             control_plane_resources: NodeResourcesView::from_resources(
-                &state.control_plane_resources,
+                state.control_plane_resources,
             ),
-            worker_resources: NodeResourcesView::from_resources(&state.worker_resources),
+            worker_resources: NodeResourcesView::from_resources(state.worker_resources),
             enable_rosetta: state.enable_rosetta,
             network: state.network.clone(),
             k3s_version: state.k3s_version.clone(),
@@ -1963,7 +1965,7 @@ impl MetalLbConfigView {
 }
 
 impl NodeResourcesView {
-    fn from_resources(resources: &crate::cluster::spec::NodeResources) -> Self {
+    fn from_resources(resources: crate::cluster::spec::NodeResources) -> Self {
         Self {
             cpus: resources.cpus,
             memory_gib: resources.memory_gib,
@@ -1973,6 +1975,7 @@ impl NodeResourcesView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // mirrors persisted k3s component toggles; bool-per-flag is the design
 struct ComponentTogglesView {
     disable_traefik: bool,
     disable_service_lb: bool,
@@ -2049,7 +2052,7 @@ fn load_cluster_state(name: &str) -> Result<ClusterState> {
     ClusterState::load(&state_root)
 }
 
-fn success_tool_result(summary: String, structured_content: Value) -> Value {
+fn success_tool_result(summary: &str, structured_content: &Value) -> Value {
     json!({
         "content": [
             {
@@ -2105,8 +2108,7 @@ fn linux_firecracker_sudo_guidance_from_args(arguments: &Value) -> Option<String
     let bridge_network_requested = arguments
         .get("network")
         .and_then(Value::as_str)
-        .map(|network| network.trim().is_empty() || network.trim() == "bridge")
-        .unwrap_or(false);
+        .is_some_and(|network| network.trim().is_empty() || network.trim() == "bridge");
     if cfg!(target_os = "linux") && backend == BackendKind::Firecracker && bridge_network_requested
     {
         Some("This operation uses firecracker bridge networking on Linux. Run the MCP server itself with sudo, for example `sudo -E kalisto mcp`.".to_owned())
@@ -2146,7 +2148,7 @@ fn parse_params<T: DeserializeOwned>(params: Value) -> std::result::Result<T, Js
         .map_err(|error| jsonrpc_error(-32602, format!("invalid params: {error}")))
 }
 
-fn cluster_error_result(error: Error) -> JsonRpcError {
+fn cluster_error_result(error: &Error) -> JsonRpcError {
     jsonrpc_error(-32000, error.to_string())
 }
 
@@ -2481,6 +2483,7 @@ fn parse_image_arch(value: &str) -> std::result::Result<ImageArch, JsonRpcError>
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)] // test helper mapping every tool to its CLI form
 fn task_command(
     tool_name: &str,
     arguments: &Value,
@@ -2808,19 +2811,19 @@ fn last_nonempty_line(path: &PathBuf) -> Result<Option<String>> {
         .map(ToOwned::to_owned))
 }
 
-fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr: String) -> Value {
+fn complete_child_result(tool_name: &str, task_id: &str, stdout: &str, stderr: &str) -> Value {
     match tool_name {
-        "clusters.create" => parse_create_result(&stdout).unwrap_or_else(|| {
+        "clusters.create" => parse_create_result(stdout).unwrap_or_else(|| {
             success_tool_result(
-                format!("Created cluster for task `{task_id}`."),
-                json!({ "stdout": stdout, "stderr": stderr }),
+                &format!("Created cluster for task `{task_id}`."),
+                &json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
         "clusters.pull" => {
-            let values = parse_key_value_lines(&stdout);
+            let values = parse_key_value_lines(stdout);
             success_tool_result(
-                "Prepared boot assets.".to_owned(),
-                json!({
+                "Prepared boot assets.",
+                &json!({
                     "assetsRoot": values.get("prepared assets"),
                     "probeImage": values.get("probe image"),
                     "stdout": stdout, "stderr": stderr,
@@ -2828,71 +2831,72 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
             )
         }
         "clusters.export" | "clusters.import" => {
-            let values = parse_key_value_lines(&stdout);
+            let values = parse_key_value_lines(stdout);
             success_tool_result(
-                "Cold archive operation completed.".into(),
-                json!({"cluster":values.get("cluster"),"archive":values.get("archive"),"nodes":values.get("nodes"),"state":values.get("state"),"containsSecrets":true,"encrypted":values.get("encrypted").map(|value| value=="true"),"stdout":stdout,"stderr":stderr}),
+                "Cold archive operation completed.",
+                &json!({"cluster":values.get("cluster"),"archive":values.get("archive"),"nodes":values.get("nodes"),"state":values.get("state"),"containsSecrets":true,"encrypted":values.get("encrypted").map(|value| value=="true"),"stdout":stdout,"stderr":stderr}),
             )
         }
-        "clusters.up" => parse_up_result(&stdout).unwrap_or_else(|| {
+        "clusters.up" => parse_up_result(stdout).unwrap_or_else(|| {
             success_tool_result(
-                format!("Brought cluster up for task `{task_id}`."),
-                json!({ "stdout": stdout, "stderr": stderr }),
+                &format!("Brought cluster up for task `{task_id}`."),
+                &json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
-        "clusters.down" => parse_simple_cluster_result(&stdout, "Stopped cluster", "cluster")
+        "clusters.down" => parse_simple_cluster_result(stdout, "Stopped cluster", "cluster")
             .unwrap_or_else(|| {
                 success_tool_result(
-                    format!("Stopped cluster for task `{task_id}`."),
-                    json!({ "stdout": stdout, "stderr": stderr }),
+                    &format!("Stopped cluster for task `{task_id}`."),
+                    &json!({ "stdout": stdout, "stderr": stderr }),
                 )
             }),
-        "clusters.destroy" => parse_simple_cluster_result(&stdout, "Destroyed cluster", "cluster")
+        "clusters.destroy" => parse_simple_cluster_result(stdout, "Destroyed cluster", "cluster")
             .unwrap_or_else(|| {
                 success_tool_result(
-                    format!("Destroyed cluster for task `{task_id}`."),
-                    json!({ "stdout": stdout, "stderr": stderr }),
+                    &format!("Destroyed cluster for task `{task_id}`."),
+                    &json!({ "stdout": stdout, "stderr": stderr }),
                 )
             }),
-        "clusters.scale" => parse_scale_result(&stdout).unwrap_or_else(|| {
+        "clusters.scale" => parse_scale_result(stdout).unwrap_or_else(|| {
             success_tool_result(
-                format!("Scaled cluster for task `{task_id}`."),
-                json!({ "stdout": stdout, "stderr": stderr }),
+                &format!("Scaled cluster for task `{task_id}`."),
+                &json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
-        "addons.install" => parse_addon_install_result(&stdout).unwrap_or_else(|| {
+        "addons.install" => parse_addon_install_result(stdout).unwrap_or_else(|| {
             success_tool_result(
-                format!("Installed add-on for task `{task_id}`."),
-                json!({ "stdout": stdout, "stderr": stderr }),
+                &format!("Installed add-on for task `{task_id}`."),
+                &json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
         "workloads.apply" => {
-            let values = parse_key_value_lines(&stdout);
+            let values = parse_key_value_lines(stdout);
             let cluster = values
                 .get("cluster")
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_owned());
             success_tool_result(
-                format!("Applied workload manifest to cluster `{cluster}`."),
-                json!({ "cluster": cluster, "stdout": stdout, "stderr": stderr }),
+                &format!("Applied workload manifest to cluster `{cluster}`."),
+                &json!({ "cluster": cluster, "stdout": stdout, "stderr": stderr }),
             )
         }
-        "bench.run" => parse_bench_result(&stdout).unwrap_or_else(|| {
+        "bench.run" => parse_bench_result(stdout).unwrap_or_else(|| {
             success_tool_result(
-                format!("Completed benchmark task `{task_id}`."),
-                json!({ "stdout": stdout, "stderr": stderr }),
+                &format!("Completed benchmark task `{task_id}`."),
+                &json!({ "stdout": stdout, "stderr": stderr }),
             )
         }),
-        "probes.macos.lima" | "probes.macos.lima.k3s" => parse_probe_result(&stdout)
-            .unwrap_or_else(|| {
+        "probes.macos.lima" | "probes.macos.lima.k3s" => {
+            parse_probe_result(stdout).unwrap_or_else(|| {
                 success_tool_result(
-                    format!("Completed probe task `{task_id}`."),
-                    json!({ "stdout": stdout, "stderr": stderr }),
+                    &format!("Completed probe task `{task_id}`."),
+                    &json!({ "stdout": stdout, "stderr": stderr }),
                 )
-            }),
+            })
+        }
         _ => success_tool_result(
-            format!("Completed task `{task_id}`."),
-            json!({ "stdout": stdout, "stderr": stderr }),
+            &format!("Completed task `{task_id}`."),
+            &json!({ "stdout": stdout, "stderr": stderr }),
         ),
     }
 }
@@ -2900,8 +2904,8 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: String, stderr:
 fn parse_create_result(stdout: &str) -> Option<Value> {
     let values = parse_key_value_lines(stdout);
     Some(success_tool_result(
-        format!("Created cluster `{}`.", values.get("cluster")?),
-        json!({
+        &format!("Created cluster `{}`.", values.get("cluster")?),
+        &json!({
             "cluster": values.get("cluster")?,
             "stateRoot": values.get("state root")?,
             "runtimeRoot": values.get("runtime root")?
@@ -2912,8 +2916,8 @@ fn parse_create_result(stdout: &str) -> Option<Value> {
 fn parse_up_result(stdout: &str) -> Option<Value> {
     let values = parse_key_value_lines(stdout);
     Some(success_tool_result(
-        format!("Cluster `{}` is ready.", values.get("cluster")?),
-        json!({
+        &format!("Cluster `{}` is ready.", values.get("cluster")?),
+        &json!({
             "cluster": values.get("cluster")?,
             "kubeconfigPath": values.get("kubeconfig")?,
             "controlPlaneReady": values.get("control-plane ready")?,
@@ -2937,13 +2941,13 @@ fn parse_scale_result(stdout: &str) -> Option<Value> {
         })
         .unwrap_or_default();
     Some(success_tool_result(
-        format!(
+        &format!(
             "Scaled cluster `{}` from {} to {} worker(s).",
             values.get("cluster")?,
             previous,
             current
         ),
-        json!({
+        &json!({
             "cluster": values.get("cluster")?,
             "previousWorkers": previous.parse::<usize>().ok()?,
             "currentWorkers": current.parse::<usize>().ok()?,
@@ -2955,12 +2959,12 @@ fn parse_scale_result(stdout: &str) -> Option<Value> {
 fn parse_addon_install_result(stdout: &str) -> Option<Value> {
     let values = parse_key_value_lines(stdout);
     Some(success_tool_result(
-        format!(
+        &format!(
             "Installed add-on `{}` on cluster `{}`.",
             values.get("installed add-on")?,
             values.get("cluster")?
         ),
-        json!({
+        &json!({
             "cluster": values.get("cluster")?,
             "addon": values.get("installed add-on")?
         }),
@@ -2985,8 +2989,8 @@ fn parse_bench_result(stdout: &str) -> Option<Value> {
         }));
     }
     Some(success_tool_result(
-        format!("Completed {} benchmark run(s).", samples.len()),
-        json!({ "samples": samples }),
+        &format!("Completed {} benchmark run(s).", samples.len()),
+        &json!({ "samples": samples }),
     ))
 }
 
@@ -3011,8 +3015,8 @@ fn parse_probe_result(stdout: &str) -> Option<Value> {
         .clone()
         .unwrap_or_else(|| "Probe completed.".to_owned());
     Some(success_tool_result(
-        summary_text,
-        json!({
+        &summary_text,
+        &json!({
             "results": results,
             "summary": summary
         }),
@@ -3023,8 +3027,8 @@ fn parse_simple_cluster_result(stdout: &str, prefix: &str, key: &str) -> Option<
     let line = stdout.lines().find(|line| line.contains(prefix))?;
     let name = line.split('`').nth(1)?;
     Some(success_tool_result(
-        format!("{prefix} `{name}`."),
-        json!({ key: name }),
+        &format!("{prefix} `{name}`."),
+        &json!({ key: name }),
     ))
 }
 
@@ -3220,7 +3224,7 @@ fn iso8601_now() -> String {
 
 fn iso8601_from_system_time(time: SystemTime) -> String {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    let seconds = duration.as_secs() as i64;
+    let seconds = duration.as_secs().cast_signed();
     let days = seconds.div_euclid(86_400);
     let secs_of_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -3240,7 +3244,7 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
+    year += i64::from(month <= 2);
     (year, month, day)
 }
 
@@ -3636,12 +3640,12 @@ mod tests {
                 .get("structuredContent")
                 .and_then(|value| value.get("addons"))
                 .and_then(Value::as_array)
-                .map(|addons| !addons.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|addons| !addons.is_empty())
         );
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // large assertion surface; split tracked for a follow-up
     fn cluster_state_tool_serializes_structured_cluster_view() {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
@@ -3733,7 +3737,7 @@ mod tests {
             cluster
                 .get("nodes")
                 .and_then(Value::as_array)
-                .map(|nodes| nodes.len()),
+                .map(std::vec::Vec::len),
             Some(2)
         );
         assert_eq!(

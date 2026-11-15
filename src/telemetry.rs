@@ -5,6 +5,9 @@ use crate::error::{Error, Result};
 
 const DEFAULT_FILTER_DIRECTIVE: &str = "info";
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn init(log_level: Option<Level>) -> Result<()> {
     let env_filter = env_filter(log_level)?;
     tracing_subscriber::registry()

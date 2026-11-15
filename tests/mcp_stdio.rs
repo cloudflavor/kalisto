@@ -43,7 +43,7 @@ impl McpHarness {
         }
     }
 
-    fn send(&mut self, message: Value) {
+    fn send(&mut self, message: &Value) {
         writeln!(self.stdin, "{message}").expect("request should be written");
         self.stdin.flush().expect("request should be flushed");
     }
@@ -67,7 +67,7 @@ impl McpHarness {
 
     fn wait_for_terminal_task(&mut self, task_id: &str) -> Value {
         for request_id in 100..140 {
-            self.send(json!({
+            self.send(&json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tasks/get",
@@ -106,7 +106,7 @@ fn mcp_stdio_supports_task_backed_calls() {
     fs::create_dir_all(&xdg_data_home).expect("temp xdg dir should exist");
     let mut harness = McpHarness::spawn(&xdg_data_home);
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
@@ -122,12 +122,12 @@ fn mcp_stdio_supports_task_backed_calls() {
         Some("kalisto")
     );
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     }));
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/list",
@@ -145,7 +145,7 @@ fn mcp_stdio_supports_task_backed_calls() {
     assert!(names.contains(&"clusters.destroy"));
     assert!(names.contains(&"addons.list"));
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "tools/call",
@@ -186,7 +186,7 @@ fn mcp_stdio_supports_task_backed_calls() {
         Some("failed")
     );
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 4,
         "method": "tasks/result",
@@ -212,7 +212,7 @@ fn mcp_stdio_clusters_list_keeps_stdout_protocol_clean() {
     fs::create_dir_all(&xdg_data_home).expect("temp xdg dir should exist");
     let mut harness = McpHarness::spawn(&xdg_data_home);
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
@@ -220,12 +220,12 @@ fn mcp_stdio_clusters_list_keeps_stdout_protocol_clean() {
     }));
     let _ = harness.read_until_response(1);
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     }));
 
-    harness.send(json!({
+    harness.send(&json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",

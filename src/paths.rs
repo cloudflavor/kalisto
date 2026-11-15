@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::process::CommandRunner;
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn current_dir() -> Result<PathBuf> {
     env::current_dir().map_err(|source| Error::CommandIo {
         program: "current_dir".to_owned(),
@@ -12,6 +15,9 @@ pub fn current_dir() -> Result<PathBuf> {
     })
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn default_project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
     match project_root {
         Some(path) => Ok(path),
@@ -19,6 +25,9 @@ pub fn default_project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn default_cluster_name(project_root: Option<&Path>) -> Result<String> {
     if let Some(name) = selected_cluster_name()? {
         return Ok(name);
@@ -33,18 +42,26 @@ pub fn default_cluster_name(project_root: Option<&Path>) -> Result<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "kalisto".to_owned()))
+        .map_or_else(|| "kalisto".to_owned(), ToOwned::to_owned))
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn selected_cluster_name() -> Result<Option<String>> {
     read_default_cluster_name()
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn default_cluster_file() -> Result<PathBuf> {
     Ok(config_root()?.join("default-cluster"))
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn read_default_cluster_name() -> Result<Option<String>> {
     let path = default_cluster_file()?;
     if !path.is_file() {
@@ -63,6 +80,9 @@ pub fn read_default_cluster_name() -> Result<Option<String>> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn write_default_cluster_name(name: &str) -> Result<()> {
     let path = default_cluster_file()?;
     if let Some(parent) = path.parent() {
@@ -77,6 +97,9 @@ pub fn write_default_cluster_name(name: &str) -> Result<()> {
     })
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn clear_default_cluster_name_if_matches(name: &str) -> Result<()> {
     let path = default_cluster_file()?;
     // The state may already have been deleted by destroy. Read the selection
@@ -106,6 +129,9 @@ pub fn clear_default_cluster_name_if_matches(name: &str) -> Result<()> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn handoff_default_cluster_file_to_invoking_user(runner: &dyn CommandRunner) -> Result<()> {
     let Some((uid, gid)) = sudo_invoking_user_ids() else {
         return Ok(());
@@ -122,14 +148,23 @@ pub fn handoff_default_cluster_file_to_invoking_user(runner: &dyn CommandRunner)
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn config_root() -> Result<PathBuf> {
     base_dir("XDG_CONFIG_HOME", ".config").map(|root| root.join("kalisto"))
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn data_root() -> Result<PathBuf> {
     base_dir("XDG_DATA_HOME", ".local/share").map(|root| root.join("kalisto"))
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn artifacts_root() -> Result<PathBuf> {
     Ok(data_root()?.join("artifacts"))
 }

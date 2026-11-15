@@ -19,6 +19,9 @@ pub struct ManifestApplyOutcome {
     pub output: String,
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 /// Apply a Kubernetes manifest on a running cluster through the control
 /// plane's own kubectl. The cluster must already be up; workload lifecycle is
 /// delegated to Kubernetes itself.

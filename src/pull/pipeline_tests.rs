@@ -11,6 +11,7 @@ struct RecordingRunner {
 }
 
 impl CommandRunner for RecordingRunner {
+    #[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
     fn run(&self, program: &str, args: &[String]) -> Result<Output> {
         self.commands
             .lock()
@@ -28,8 +29,10 @@ impl CommandRunner for RecordingRunner {
                         "k3s-airgap-images-amd64.tar.zst",
                     ]
                     .iter()
-                    .map(|name| format!("{}  {name}\n", "a".repeat(64)))
-                    .collect::<String>()
+                    .fold(String::new(), |mut content, name| {
+                        let _ = writeln!(content, "{}  {name}", "a".repeat(64));
+                        content
+                    })
                 } else if args.last().unwrap().ends_with("/k3s-images.txt") {
                     "docker.io/rancher/mirrored-coredns-coredns:1.12.3\ndocker.io/rancher/mirrored-pause:3.6\ndocker.io/rancher/klipper-lb:v0.4.13\ndocker.io/rancher/mirrored-library-traefik:3.3.6\n".to_owned()
                 } else {
@@ -61,7 +64,7 @@ impl CommandRunner for RecordingRunner {
                 )
                 .unwrap();
             }
-            "helm" => {}
+            "helm" | "limactl" => {}
             "crane" if args[0] == "version" => stdout = "v0.20.3".to_owned(),
             "crane" if args[0] == "digest" => stdout = format!("sha256:{}\n", "b".repeat(64)),
             "crane" if self.fail_image_pull => {
@@ -85,7 +88,6 @@ impl CommandRunner for RecordingRunner {
                 )
                 .unwrap();
             }
-            "limactl" => {}
             "tar" => {
                 let layout = &args[args.iter().position(|arg| arg == "-C").unwrap() + 1];
                 let index: serde_json::Value = serde_json::from_slice(

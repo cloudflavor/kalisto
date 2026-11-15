@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::process::ExitCode;
@@ -105,21 +106,23 @@ fn real_main() -> Result<()> {
         Command::Up(args) => run_up(args),
         Command::Test(args) => run_test(args),
         Command::Mcp(args) => run_mcp(args),
-        Command::McpTaskRunner(args) => run_hidden_mcp_task_runner(args),
-        Command::Apply(args) => run_apply(args),
-        Command::Down(args) => run_down(args),
-        Command::Destroy(args) => run_destroy(args),
-        Command::Logs(args) => run_logs(args),
-        Command::Addon(args) => run_addon(args),
-        Command::Plugin(args) => run_addon(args),
-        Command::Use(args) => run_use(args),
-        Command::Scale(args) => run_scale(args),
-        Command::Completions(args) => run_completions(args),
-        Command::Kubectl(args) => run_kubectl(args),
+        Command::McpTaskRunner(args) => run_hidden_mcp_task_runner(&args),
+        Command::Apply(args) => run_apply(&args),
+        Command::Down(args) => run_down(&args),
+        Command::Destroy(args) => run_destroy(&args),
+        Command::Logs(args) => run_logs(&args),
+        Command::Addon(args) | Command::Plugin(args) => run_addon(args),
+        Command::Use(args) => run_use(&args),
+        Command::Scale(args) => run_scale(&args),
+        Command::Completions(args) => {
+            run_completions(&args);
+            Ok(())
+        }
+        Command::Kubectl(args) => run_kubectl(&args),
         Command::List => run_list(cli.json),
-        Command::Stats(args) => run_stats(args, cli.json),
-        Command::Status(args) => run_status(args, cli.json),
-        Command::Kubeconfig(args) => run_kubeconfig(args, cli.json),
+        Command::Stats(args) => run_stats(&args, cli.json),
+        Command::Status(args) => run_status(&args, cli.json),
+        Command::Kubeconfig(args) => run_kubeconfig(&args, cli.json),
         Command::Bench(args) => run_bench(args),
         Command::ProbeMacosLima(args) => run_lima_probe(args),
         Command::ProbeMacosLimaK3s(args) => run_lima_k3s_probe(args),
@@ -128,7 +131,7 @@ fn real_main() -> Result<()> {
 
 fn run_test(args: TestArgs) -> Result<()> {
     match args.command {
-        TestCommand::Run(args) => run_test_run(args),
+        TestCommand::Run(args) => run_test_run(&args),
         TestCommand::Ls(args) => run_test_list(args),
     }
 }
@@ -137,8 +140,8 @@ fn run_mcp(args: McpArgs) -> Result<()> {
     run_mcp_server(args.project_root)
 }
 
-fn run_hidden_mcp_task_runner(args: McpTaskRunnerArgs) -> Result<()> {
-    run_mcp_task_runner(args.manifest, args.exit_path)
+fn run_hidden_mcp_task_runner(args: &McpTaskRunnerArgs) -> Result<()> {
+    run_mcp_task_runner(&args.manifest, &args.exit_path)
 }
 
 fn run_create(args: UpArgs) -> Result<()> {
@@ -208,8 +211,8 @@ fn run_test_list(args: TestListArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_test_run(args: TestRunArgs) -> Result<()> {
-    let mut spec = args.into_cluster_spec()?;
+fn run_test_run(args: &TestRunArgs) -> Result<()> {
+    let mut spec = args.clone().into_cluster_spec()?;
     let project_root = spec.workspace_root.clone();
     let config = load_project_config(&project_root)?.ok_or_else(|| {
         Error::InvalidArgs(format!(
@@ -238,10 +241,7 @@ fn run_test_run(args: TestRunArgs) -> Result<()> {
         Ok(report) => report,
         Err(error) => {
             if should_preserve_cluster_after_scenario_failure(lifecycle) {
-                eprintln!(
-                    "scenario failed; preserving cluster `{}` for inspection",
-                    cluster_name
-                );
+                eprintln!("scenario failed; preserving cluster `{cluster_name}` for inspection");
             }
             return Err(error);
         }
@@ -293,14 +293,14 @@ fn apply_harness_cluster_settings(
     Ok(())
 }
 
-fn run_down(args: ClusterLookupArgs) -> Result<()> {
+fn run_down(args: &ClusterLookupArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     cluster_down(&name, args.force)?;
     println!("stopped cluster `{name}`");
     Ok(())
 }
 
-fn run_destroy(args: DestroyArgs) -> Result<()> {
+fn run_destroy(args: &DestroyArgs) -> Result<()> {
     let names = if args.all {
         defined_cluster_names()?
     } else {
@@ -352,12 +352,12 @@ fn describe_scenario(scenario: &ScenarioConfig) -> String {
 
 fn run_addon(args: AddonArgs) -> Result<()> {
     match args.command {
-        AddonCommand::Install(args) => run_addon_install(args),
-        AddonCommand::Ls(args) => run_addon_list(args),
+        AddonCommand::Install(args) => run_addon_install(&args),
+        AddonCommand::Ls(args) => run_addon_list(&args),
     }
 }
 
-fn run_addon_install(args: AddonInstallArgs) -> Result<()> {
+fn run_addon_install(args: &AddonInstallArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let outcome = cluster_install_addon(&name, &args.addon)?;
     println!("cluster: {}", outcome.cluster);
@@ -365,7 +365,7 @@ fn run_addon_install(args: AddonInstallArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_addon_list(args: AddonListArgs) -> Result<()> {
+fn run_addon_list(args: &AddonListArgs) -> Result<()> {
     let selected_cluster = args.cluster_name()?;
     let cluster_state = selected_cluster
         .as_deref()
@@ -401,7 +401,7 @@ fn run_addon_list(args: AddonListArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_logs(args: NodeLogsArgs) -> Result<()> {
+fn run_logs(args: &NodeLogsArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let logs = cluster_logs(&name, &args.node)?;
     println!("cluster: {}", logs.cluster);
@@ -423,7 +423,7 @@ fn run_logs(args: NodeLogsArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_use(args: NamedClusterArgs) -> Result<()> {
+fn run_use(args: &NamedClusterArgs) -> Result<()> {
     let clusters = cluster_list()?;
     if !clusters.iter().any(|cluster| cluster.name == args.name) {
         return Err(Error::InvalidArgs(format!(
@@ -437,7 +437,7 @@ fn run_use(args: NamedClusterArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_scale(args: ScaleArgs) -> Result<()> {
+fn run_scale(args: &ScaleArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let outcome = cluster_scale(&name, args.workers)?;
     println!("cluster: {}", outcome.name);
@@ -453,12 +453,11 @@ fn run_scale(args: ScaleArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_completions(args: CompletionsArgs) -> Result<()> {
+fn run_completions(args: &CompletionsArgs) {
     Cli::clap().gen_completions_to("kalisto", args.shell, &mut std::io::stdout());
-    Ok(())
 }
 
-fn json_error(error: serde_json::Error) -> Error {
+fn json_error(error: &serde_json::Error) -> Error {
     Error::InvalidArgs(format!("failed to serialize JSON output: {error}"))
 }
 
@@ -484,7 +483,7 @@ fn run_list(json: bool) -> Result<()> {
         });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).map_err(json_error)?
+            serde_json::to_string_pretty(&value).map_err(|error| json_error(&error))?
         );
         return Ok(());
     }
@@ -539,7 +538,7 @@ fn run_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_status(args: ClusterLookupArgs, json: bool) -> Result<()> {
+fn run_status(args: &ClusterLookupArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let status = cluster_status(&name)?;
     if json {
@@ -556,7 +555,7 @@ fn run_status(args: ClusterLookupArgs, json: bool) -> Result<()> {
         });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).map_err(json_error)?
+            serde_json::to_string_pretty(&value).map_err(|error| json_error(&error))?
         );
         return Ok(());
     }
@@ -582,7 +581,7 @@ fn run_status(args: ClusterLookupArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_stats(args: StatsArgs, json: bool) -> Result<()> {
+fn run_stats(args: &StatsArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     if json && args.watch {
         return Err(Error::InvalidArgs(
@@ -614,7 +613,7 @@ fn run_stats(args: StatsArgs, json: bool) -> Result<()> {
         });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).map_err(json_error)?
+            serde_json::to_string_pretty(&value).map_err(|error| json_error(&error))?
         );
         return Ok(());
     }
@@ -626,14 +625,13 @@ fn run_stats(args: StatsArgs, json: bool) -> Result<()> {
             println!("{}", render_stats(&stats));
             thread::sleep(interval);
         }
-    } else {
-        let stats = cluster_stats(&name)?;
-        print!("{}", render_stats(&stats));
-        Ok(())
     }
+    let stats = cluster_stats(&name)?;
+    print!("{}", render_stats(&stats));
+    Ok(())
 }
 
-fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
+fn run_kubeconfig(args: &KubeconfigArgs, json: bool) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let path = cluster_kubeconfig_path(&name)?;
     if json {
@@ -644,7 +642,7 @@ fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
         });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).map_err(json_error)?
+            serde_json::to_string_pretty(&value).map_err(|error| json_error(&error))?
         );
         return Ok(());
     }
@@ -656,7 +654,7 @@ fn run_kubeconfig(args: KubeconfigArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_apply(args: ApplyArgs) -> Result<()> {
+fn run_apply(args: &ApplyArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let manifest = std::fs::read_to_string(&args.manifest).map_err(|source| Error::CommandIo {
         program: "read_to_string".to_owned(),
@@ -670,7 +668,7 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_kubectl(args: KubectlArgs) -> Result<()> {
+fn run_kubectl(args: &KubectlArgs) -> Result<()> {
     let name = require_selected_cluster_name(args.cluster_name()?)?;
     let state_root = kalisto::cluster::spec::ClusterSpec::state_root_for(&name)?;
     let state = ClusterState::load(state_root.as_path())?;
@@ -683,8 +681,7 @@ fn run_kubectl(args: KubectlArgs) -> Result<()> {
     let mut kubectl_args = args.args.as_slice();
     if kubectl_args
         .first()
-        .map(|argument| argument == "--")
-        .unwrap_or(false)
+        .is_some_and(|argument| argument == "--")
     {
         kubectl_args = &kubectl_args[1..];
     }
@@ -796,12 +793,10 @@ fn print_table(rows: &[Vec<String>]) {
 
 fn render_stats(stats: &kalisto::cluster::manager::ClusterStats) -> String {
     let mut output = String::new();
-    output.push_str(&format!("cluster: {}\n", stats.name));
-    output.push_str(&format!("state root: {}\n", stats.state_root.display()));
-    output.push_str(&format!(
-        "kubeconfig: {}\n\n",
-        stats.kubeconfig_path.display()
-    ));
+    writeln!(output, "cluster: {}", stats.name).expect("write to String");
+    writeln!(output, "state root: {}", stats.state_root.display()).expect("write to String");
+    writeln!(output, "kubeconfig: {}", stats.kubeconfig_path.display()).expect("write to String");
+    writeln!(output).expect("write to String");
 
     let mut rows = vec![vec![
         "NODE".to_owned(),
@@ -863,7 +858,7 @@ fn render_table(rows: &[Vec<String>]) -> String {
             if column > 0 {
                 output.push_str("  ");
             }
-            let value = row.get(column).map(String::as_str).unwrap_or("");
+            let value = row.get(column).map_or("", String::as_str);
             output.push_str(value);
             let value_width = visible_width(value);
             if *width > value_width {
@@ -877,7 +872,7 @@ fn render_table(rows: &[Vec<String>]) -> String {
                 if column > 0 {
                     output.push_str("  ");
                 }
-                output.push_str(&format!("{:-<width$}", "", width = *width));
+                write!(output, "{:-<width$}", "", width = *width).expect("write to String");
             }
             output.push('\n');
         }
@@ -1138,9 +1133,7 @@ fn visible_width(value: &str) -> usize {
 }
 
 fn optional_u32(value: Option<u32>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned())
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
 fn optional_string(value: Option<String>) -> String {
@@ -1148,12 +1141,14 @@ fn optional_string(value: Option<String>) -> String {
 }
 
 fn optional_bytes(value: Option<u64>) -> String {
-    value.map(format_bytes).unwrap_or_else(|| "-".to_owned())
+    value.map_or_else(|| "-".to_owned(), format_bytes)
 }
 
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut unit_index = 0;
+    // Display formatting only; precision loss in the f64 conversion is intended.
+    #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64;
     while value >= 1024.0 && unit_index < UNITS.len() - 1 {
         value /= 1024.0;

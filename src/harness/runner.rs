@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,10 @@ struct HarnessStepContext<'a> {
     namespace: &'a str,
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn run_scenario(
     state: &ClusterState,
     scenario: &ScenarioConfig,
@@ -100,7 +105,7 @@ pub fn run_scenario(
                 namespace: &scenario.namespace,
             },
             &label,
-            Some(failure_diagnostics_script(&scenario.namespace, None)),
+            Some(failure_diagnostics_script(&scenario.namespace, None).as_str()),
             |context| {
                 apply_manifest(
                     context.backend,
@@ -129,7 +134,7 @@ pub fn run_scenario(
                 namespace: &scenario.namespace,
             },
             &label,
-            Some(failure_diagnostics_script(&scenario.namespace, Some(wait))),
+            Some(failure_diagnostics_script(&scenario.namespace, Some(wait)).as_str()),
             |context| {
                 run_wait(
                     context.backend,
@@ -158,7 +163,7 @@ pub fn run_scenario(
                 namespace: &scenario.namespace,
             },
             &label,
-            Some(failure_diagnostics_script(&scenario.namespace, None)),
+            Some(failure_diagnostics_script(&scenario.namespace, None).as_str()),
             |context| {
                 run_probe(
                     context.backend,
@@ -180,7 +185,7 @@ pub fn run_scenario(
 fn execute_step<F>(
     context: HarnessStepContext<'_>,
     label: &str,
-    diagnostics_script: Option<String>,
+    diagnostics_script: Option<&str>,
     operation: F,
 ) -> Result<()>
 where
@@ -190,7 +195,6 @@ where
         Ok(()) => Ok(()),
         Err(error) => {
             let diagnostics = diagnostics_script
-                .as_deref()
                 .and_then(|script| {
                     run_guest_kubectl_script_capture(
                         context.backend,
@@ -357,8 +361,7 @@ fn wait_for_node_ready(
             "default",
             check_node,
         )
-        .map(|output| has_node_resource(&output))
-        .unwrap_or(false)
+        .is_ok_and(|output| has_node_resource(&output))
         {
             break;
         }
@@ -509,7 +512,8 @@ fn failure_diagnostics_script(namespace: &str, wait: Option<&WaitConfig>) -> Str
 
     if let Some(WaitConfig::Job { name, .. }) = wait {
         let job_name = shell_escape(name);
-        script.push_str(&format!(
+        let _ = write!(
+            script,
             concat!(
                 "\n",
                 "echo\n",
@@ -521,7 +525,7 @@ fn failure_diagnostics_script(namespace: &str, wait: Option<&WaitConfig>) -> Str
             ),
             namespace = namespace,
             job_name = job_name,
-        ));
+        );
     }
 
     script

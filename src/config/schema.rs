@@ -19,9 +19,12 @@ pub struct KalistoConfig {
 }
 
 impl KalistoConfig {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn apply_to_cluster_spec(&self, spec: &mut ClusterSpec) -> Result<()> {
         if let Some(name) = &self.cluster.name {
-            spec.name = name.clone();
+            spec.name.clone_from(name);
         }
         if let Some(backend) = &self.cluster.backend {
             spec.backend = BackendKind::parse(backend).ok_or_else(|| {
@@ -31,7 +34,7 @@ impl KalistoConfig {
             })?;
         }
         if let Some(template) = &self.cluster.template {
-            spec.template = template.clone();
+            spec.template.clone_from(template);
         }
         if let Some(image_arch) = &self.cluster.arch {
             spec.image_arch = Some(
@@ -40,13 +43,13 @@ impl KalistoConfig {
             );
         }
         if let Some(network) = &self.cluster.network {
-            spec.network = network.clone();
+            spec.network.clone_from(network);
         }
         if let Some(api_port) = self.cluster.api_port {
             spec.api_port = api_port;
         }
         if let Some(k3s_version) = &self.cluster.k3s_version {
-            spec.k3s_version = k3s_version.clone();
+            spec.k3s_version.clone_from(k3s_version);
         }
         if let Some(enable_rosetta) = self.cluster.enable_rosetta {
             spec.enable_rosetta = enable_rosetta;
@@ -219,7 +222,7 @@ fn apply_plugin_config(config: &PluginsConfig, spec: &mut ClusterSpec) -> Result
             spec.cni_plugin
                 .apply_component_defaults(&mut spec.component_toggles);
             if let Some(version) = &config.cilium.version {
-                spec.cilium_version = version.clone();
+                spec.cilium_version.clone_from(version);
             }
         }
         _ => {}
@@ -367,13 +370,13 @@ addresses = ["192.168.50.240-192.168.50.250"]
     #[test]
     fn config_rejects_conflicting_cni_plugins() {
         let config: KalistoConfig = toml::from_str(
-            r#"
+            r"
 [plugins.cilium]
 enabled = true
 
 [plugins.flannel]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let mut spec = ClusterSpec::new("default".to_owned(), PathBuf::from("/workspace"));

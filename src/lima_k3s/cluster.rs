@@ -21,11 +21,13 @@ use super::wait::{
 };
 use crate::k3s::NodeRole;
 
+#[must_use]
 pub fn run(config: &Config) -> Report {
     let runner = SystemRunner;
     run_with_runner(config, &runner)
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
     let mut results = Vec::new();
     let mut instances = Vec::new();
@@ -179,7 +181,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
         &control_plane.artifacts.kubeconfig,
         Duration::from_secs(180),
     ) {
-        Ok(_) => results.push(ProbeResult::pass(
+        Ok(()) => results.push(ProbeResult::pass(
             "kubeconfig.present",
             "k3s wrote a kubeconfig into the mounted workspace",
         )),
@@ -191,7 +193,7 @@ pub fn run_with_runner(config: &Config, runner: &dyn CommandRunner) -> Report {
     }
 
     match wait_for_path(&control_plane.artifacts.token, Duration::from_secs(180)) {
-        Ok(_) => results.push(ProbeResult::pass(
+        Ok(()) => results.push(ProbeResult::pass(
             "k3s.token.present",
             "k3s wrote a node token into the mounted workspace",
         )),

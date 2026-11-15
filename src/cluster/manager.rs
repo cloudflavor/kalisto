@@ -118,6 +118,7 @@ pub struct CreateOutcome {
     pub state: ClusterState,
 }
 
+#[derive(Clone, Copy)]
 struct WorkerJoinContext<'a> {
     base_config: &'a BackendConfig,
     k3s_config: &'a K3sBootstrapConfig,
@@ -130,16 +131,25 @@ struct WorkerJoinContext<'a> {
     prestarted_at: Option<Instant>,
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn up(spec: &ClusterSpec) -> Result<UpOutcome> {
     let runner = SystemRunner;
     up_with_runner(spec, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn create(spec: &ClusterSpec) -> Result<CreateOutcome> {
     let runner = SystemRunner;
     create_with_runner(spec, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<CreateOutcome> {
     debug_feedback(format!(
         "create: resolving cluster spec for `{}` ({})",
@@ -225,6 +235,10 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
     Ok(CreateOutcome { state })
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<UpOutcome> {
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
@@ -572,10 +586,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         node = %control_plane.name,
         "control-plane is ready"
     );
-    debug_feedback(format!(
-        "up: control-plane ready in {}",
-        control_plane_ready
-    ));
+    debug_feedback(format!("up: control-plane ready in {control_plane_ready}"));
 
     if let Err(error) = install_addons_and_wait_for_nodes(
         PostReadyAddonRequest {
@@ -696,7 +707,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         cluster_ready = %cluster_ready,
         "cluster is ready"
     );
-    debug_feedback(format!("up: cluster ready in {}", cluster_ready));
+    debug_feedback(format!("up: cluster ready in {cluster_ready}"));
 
     Ok(UpOutcome {
         state,
@@ -868,26 +879,41 @@ fn install_addons_and_wait_for_nodes(
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn down(name: &str, force: bool) -> Result<()> {
     let runner = SystemRunner;
     down_with_runner(name, force, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn destroy(name: &str) -> Result<()> {
     let runner = SystemRunner;
     destroy_with_runner(name, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn scale(name: &str, workers: usize) -> Result<ScaleOutcome> {
     let runner = SystemRunner;
     scale_with_runner(name, workers, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn install_addon(name: &str, addon: &str) -> Result<AddonInstallOutcome> {
     let runner = SystemRunner;
     install_addon_with_runner(name, addon, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn down_with_runner(name: &str, force: bool, runner: &dyn CommandRunner) -> Result<()> {
     info!(cluster = %name, force, "starting cluster teardown");
     let state_root = require_cluster_state_root(name)?;
@@ -908,6 +934,9 @@ fn down_at_root(
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn destroy_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<()> {
     info!(cluster = %name, "starting cluster removal");
     let state_root = require_cluster_state_root(name)?;
@@ -955,26 +984,41 @@ fn destroy_at_root(state_root: &Path, name: &str, runner: &dyn CommandRunner) ->
     Ok(())
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn status(name: &str) -> Result<ClusterStatus> {
     let runner = SystemRunner;
     status_with_runner(name, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn stats(name: &str) -> Result<ClusterStats> {
     let runner = SystemRunner;
     stats_with_runner(name, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn logs(name: &str, node_name: &str) -> Result<NodeLogs> {
     let state_root = require_cluster_state_root(name)?;
     logs_at_root(&state_root, node_name)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn list() -> Result<Vec<ClusterStatus>> {
     let runner = SystemRunner;
     list_with_runner(&runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn defined_cluster_names() -> Result<Vec<String>> {
     defined_cluster_names_at_root(&ClusterSpec::clusters_root_for()?)
 }
@@ -1031,6 +1075,9 @@ fn logs_at_root(state_root: &Path, node_name: &str) -> Result<NodeLogs> {
     })
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn scale_with_runner(
     name: &str,
     workers: usize,
@@ -1041,6 +1088,9 @@ pub fn scale_with_runner(
     scale_at_root(&state_root, name, workers, runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn install_addon_with_runner(
     name: &str,
     addon: &str,
@@ -1051,6 +1101,7 @@ pub fn install_addon_with_runner(
     install_addon_at_root(&state_root, name, addon, runner)
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 fn scale_at_root(
     state_root: &Path,
     _name: &str,
@@ -1441,6 +1492,9 @@ fn record_desired_addon_state(state: &mut ClusterState, addon_id: AddonId) -> bo
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn status_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<ClusterStatus> {
     let state_root = require_cluster_state_root(name)?;
     status_at_root(&state_root, name, runner)
@@ -1472,11 +1526,17 @@ fn status_at_root(
     })
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn list_with_runner(runner: &dyn CommandRunner) -> Result<Vec<ClusterStatus>> {
     let clusters_root = ClusterSpec::clusters_root_for()?;
     list_at_root(&clusters_root, runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn stats_with_runner(name: &str, runner: &dyn CommandRunner) -> Result<ClusterStats> {
     let state_root = require_cluster_state_root(name)?;
     let state = ClusterState::load(&state_root)?;
@@ -1563,6 +1623,9 @@ fn list_at_root(clusters_root: &Path, runner: &dyn CommandRunner) -> Result<Vec<
     Ok(clusters)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn kubeconfig_path(name: &str) -> Result<std::path::PathBuf> {
     let state_root = require_cluster_state_root(name)?;
     let kubeconfig_path = ClusterState::load(state_root.as_path())?.kubeconfig_path;
@@ -1704,10 +1767,7 @@ fn load_firecracker_host_metrics(
     let (rss_bytes, vsz_bytes) = pid
         .and_then(|pid| read_process_memory_bytes(runner, pid).ok())
         .unwrap_or((None, None));
-    let (rx_bytes, tx_bytes) = tap_name
-        .as_deref()
-        .map(read_tap_bytes)
-        .unwrap_or((None, None));
+    let (rx_bytes, tx_bytes) = tap_name.as_deref().map_or((None, None), read_tap_bytes);
 
     HostNodeMetrics {
         pid,
@@ -1802,11 +1862,17 @@ fn read_optional_u64(path: &Path) -> Option<u64> {
     read_optional_trimmed(path)?.parse::<u64>().ok()
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn benchmark(spec: &ClusterSpec, runs: usize) -> Result<Vec<BenchmarkSample>> {
     let runner = SystemRunner;
     benchmark_with_runner(spec, runs, &runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn benchmark_with_runner(
     spec: &ClusterSpec,
     runs: usize,
@@ -1822,7 +1888,7 @@ pub fn benchmark_with_runner(
     for run in 0..runs {
         let run_name = format!("{}-bench-{}", spec.name, run + 1);
         let mut run_spec = spec.clone();
-        run_spec.name = run_name.clone();
+        run_spec.name.clone_from(&run_name);
         info!(
             benchmark_run = run + 1,
             benchmark_total = runs,
@@ -1980,6 +2046,7 @@ fn start_and_join_workers(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 fn start_and_join_workers_parallel(
     backend: &'static dyn ClusterBackend,
     runner: SystemRunner,
@@ -2388,8 +2455,7 @@ fn tls_sans_for_control_plane(control_plane_host: &str, api_endpoint: &str) -> V
 fn endpoint_host(api_endpoint: &str) -> String {
     api_endpoint
         .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .unwrap_or_else(|| api_endpoint.to_owned())
+        .map_or_else(|| api_endpoint.to_owned(), |(host, _)| host.to_owned())
 }
 
 pub(crate) fn require_cluster_state_root(name: &str) -> Result<std::path::PathBuf> {
@@ -3405,10 +3471,11 @@ addresses = ["10.20.0.200-10.20.0.220"]
     }
 
     #[test]
+    #[allow(clippy::similar_names)] // uid and gid are intentionally parallel variables
     fn handoff_cluster_paths_to_invoking_user_runs_recursive_chown_under_sudo() {
         let _guard = env_lock();
-        let original_sudo_uid = std::env::var_os("SUDO_UID");
-        let original_sudo_gid = std::env::var_os("SUDO_GID");
+        let sudo_uid_before = std::env::var_os("SUDO_UID");
+        let sudo_gid_before = std::env::var_os("SUDO_GID");
         let root = std::env::temp_dir().join(format!("kalisto-handoff-{}", std::process::id()));
         let state_root = root.join("state");
         let runtime_root = root.join("runtime");
@@ -3432,16 +3499,17 @@ addresses = ["10.20.0.200-10.20.0.220"]
             ]
         );
 
-        restore_env("SUDO_UID", original_sudo_uid);
-        restore_env("SUDO_GID", original_sudo_gid);
+        restore_env("SUDO_UID", sudo_uid_before);
+        restore_env("SUDO_GID", sudo_gid_before);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
+    #[allow(clippy::similar_names)] // uid and gid are intentionally parallel variables
     fn handoff_cluster_paths_to_invoking_user_is_noop_without_sudo_ids() {
         let _guard = env_lock();
-        let original_sudo_uid = std::env::var_os("SUDO_UID");
-        let original_sudo_gid = std::env::var_os("SUDO_GID");
+        let sudo_uid_before = std::env::var_os("SUDO_UID");
+        let sudo_gid_before = std::env::var_os("SUDO_GID");
         let root =
             std::env::temp_dir().join(format!("kalisto-handoff-noop-{}", std::process::id()));
         let state_root = root.join("state");
@@ -3459,8 +3527,8 @@ addresses = ["10.20.0.200-10.20.0.220"]
 
         assert!(runner.invocations.lock().unwrap().is_empty());
 
-        restore_env("SUDO_UID", original_sudo_uid);
-        restore_env("SUDO_GID", original_sudo_gid);
+        restore_env("SUDO_UID", sudo_uid_before);
+        restore_env("SUDO_GID", sudo_gid_before);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3688,7 +3756,7 @@ clusters:
             super::rewrite_kubeconfig_server("apiVersion: v1\n", "127.0.0.1:16443").unwrap_err();
         match error {
             Error::InvalidArgs(message) => {
-                assert!(message.contains("did not contain a server endpoint"))
+                assert!(message.contains("did not contain a server endpoint"));
             }
             other => panic!("unexpected error: {other}"),
         }

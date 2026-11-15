@@ -43,10 +43,14 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
+    #[must_use]
     pub fn state_file(root: &Path) -> PathBuf {
         root.join("cluster.state")
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn save(&self, root: &Path) -> Result<()> {
         fs::create_dir_all(root).map_err(|source| Error::CommandIo {
             program: "create_dir_all".to_owned(),
@@ -69,6 +73,9 @@ impl ClusterState {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn load(root: &Path) -> Result<Self> {
         let content =
             fs::read_to_string(Self::state_file(root)).map_err(|source| Error::CommandIo {
@@ -111,6 +118,7 @@ impl From<PersistedNodeResources> for NodeResources {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI arguments / persisted config surface; bool-per-flag is the design
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedComponentToggles {

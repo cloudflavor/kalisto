@@ -299,10 +299,10 @@ impl ClusterBackend for FirecrackerBackend {
         {
             return Ok(());
         }
-        let bridge_net = instance_names
-            .first()
-            .map(|name| NetworkConfig::for_bridge_instance(name))
-            .unwrap_or_else(|| NetworkConfig::for_bridge_instance("kalisto"));
+        let bridge_net = instance_names.first().map_or_else(
+            || NetworkConfig::for_bridge_instance("kalisto"),
+            |name| NetworkConfig::for_bridge_instance(name),
+        );
         setup_bridge(runner, &bridge_net)?;
         for instance_name in instance_names {
             setup_tap(runner, &NetworkConfig::for_bridge_instance(instance_name))?;
@@ -325,10 +325,10 @@ impl ClusterBackend for FirecrackerBackend {
             let _ = runner.run("ip", &["link".into(), "del".into(), net.tap_name]);
         }
 
-        let bridge_net = instance_names
-            .first()
-            .map(|name| NetworkConfig::for_bridge_instance(name))
-            .unwrap_or_else(|| NetworkConfig::for_bridge_instance("kalisto"));
+        let bridge_net = instance_names.first().map_or_else(
+            || NetworkConfig::for_bridge_instance("kalisto"),
+            |name| NetworkConfig::for_bridge_instance(name),
+        );
         if runner
             .run(
                 "ip",
@@ -548,6 +548,9 @@ struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    // Tap name and MAC construction intentionally truncates the 32-bit stable hash
+    // into octets; the value is derived, not round-tripped.
+    #[allow(clippy::cast_possible_truncation)]
     fn for_bridge_instance(name: &str) -> Self {
         let hash = stable_hash(name);
         let third = 1 + ((hash >> 8) % 254) as u8;
@@ -562,7 +565,7 @@ impl NetworkConfig {
             (hash >> 8) as u8,
             hash as u8
         );
-        let tap_name = format!("ktap{:08x}", hash);
+        let tap_name = format!("ktap{hash:08x}");
         let tap_name = tap_name.chars().take(15).collect();
 
         Self {
@@ -578,6 +581,8 @@ impl NetworkConfig {
         }
     }
 
+    // Same intentional hash truncation as for_bridge_instance.
+    #[allow(clippy::cast_possible_truncation)]
     fn for_rootless_instance(name: &str, ssh_port: u16, api_port_forward: Option<u16>) -> Self {
         let hash = stable_hash(name);
         let host_octet = 100 + (hash % 100) as u8;
@@ -589,7 +594,7 @@ impl NetworkConfig {
             (hash >> 8) as u8,
             hash as u8
         );
-        let tap_name = format!("ktap{:08x}", hash);
+        let tap_name = format!("ktap{hash:08x}");
         let tap_name = tap_name.chars().take(15).collect();
 
         Self {
@@ -619,8 +624,8 @@ impl RootlessClusterNetwork {
         let _ = read_required_pid(&root.join("slirp4netns.pid"), "slirp4netns")?;
         let api_socket = load_slirp_api_socket_path(&root)?;
         Ok(Self {
-            api_socket,
             anchor_pid,
+            api_socket,
         })
     }
 }
@@ -989,8 +994,7 @@ fn ensure_slirp_host_forward(
     )?;
     if response.get("error").is_some() {
         return Err(Error::InvalidArgs(format!(
-            "failed to add slirp4netns host forward {}:{} -> {}:{}: {}",
-            ROOTLESS_SSH_HOST, host_port, guest_addr, guest_port, response
+            "failed to add slirp4netns host forward {ROOTLESS_SSH_HOST}:{host_port} -> {guest_addr}:{guest_port}: {response}"
         )));
     }
     Ok(())
@@ -1922,10 +1926,10 @@ fn signal(runner: &dyn CommandRunner, signal: &str, pid: u32) -> Result<Output> 
 }
 
 fn stable_hash(input: &str) -> u32 {
-    let mut value = 0x811c9dc5_u32;
+    let mut value = 0x811c_9dc5_u32;
     for byte in input.bytes() {
         value ^= u32::from(byte);
-        value = value.wrapping_mul(0x01000193);
+        value = value.wrapping_mul(0x0100_0193);
     }
     value
 }

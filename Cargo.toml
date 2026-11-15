@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 
+[lints.clippy]
+pedantic = "warn"
+
 [lib]
 name = "kalisto"
 path = "src/lib.rs"

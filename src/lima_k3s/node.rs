@@ -22,6 +22,7 @@ pub struct Artifacts {
 }
 
 impl Artifacts {
+    #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self {
             kubeconfig: root.join("kubeconfig.yaml"),
@@ -41,6 +42,7 @@ pub struct Instance {
 }
 
 impl Instance {
+    #[must_use]
     pub fn new(name: String, role: NodeRole, root: PathBuf) -> Self {
         Self {
             name,
@@ -56,12 +58,14 @@ pub struct StartedWorker {
     pub boot_started: Instant,
 }
 
+#[must_use]
 pub fn build_worker_names(worker_count: usize, cluster_suffix: &str) -> Vec<String> {
     (0..worker_count)
         .map(|index| format!("kalisto-w{index}-{cluster_suffix}"))
         .collect()
 }
 
+#[must_use]
 pub fn build_worker_instances(
     worker_count: usize,
     cluster_suffix: &str,
@@ -79,6 +83,9 @@ pub fn build_worker_instances(
         .collect()
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn start_node_instance(
     runner: &dyn CommandRunner,
     base_config: &BackendConfig,
@@ -101,6 +108,9 @@ pub fn start_node_instance(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn bootstrap_server(
     runner: &dyn CommandRunner,
     config: &Config,
@@ -119,6 +129,9 @@ pub fn bootstrap_server(
     guest_sudo_shell(runner, &control_plane.name, &command)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn bootstrap_worker(
     runner: &dyn CommandRunner,
     config: &Config,
@@ -139,6 +152,9 @@ pub fn bootstrap_worker(
     guest_sudo_shell(runner, &worker.name, &command)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn start_worker_instances(
     runner: &dyn CommandRunner,
     base_config: &BackendConfig,

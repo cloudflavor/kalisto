@@ -10,6 +10,7 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Firecracker => "firecracker",
@@ -17,6 +18,7 @@ impl BackendKind {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "firecracker" => Some(Self::Firecracker),
@@ -25,6 +27,7 @@ impl BackendKind {
         }
     }
 
+    #[must_use]
     pub fn host_default() -> Self {
         if cfg!(target_os = "linux") {
             Self::Firecracker
@@ -58,8 +61,14 @@ pub struct InstanceConfig {
 pub trait ClusterBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn check_available(&self, runner: &dyn CommandRunner) -> Result<()>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn start_instance(
         &self,
         runner: &dyn CommandRunner,
@@ -67,6 +76,9 @@ pub trait ClusterBackend: Send + Sync {
         instance: &InstanceConfig,
     ) -> Result<Output>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn stop_instance(
         &self,
         runner: &dyn CommandRunner,
@@ -75,6 +87,9 @@ pub trait ClusterBackend: Send + Sync {
         force: bool,
     ) -> Result<()>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn delete_instance(
         &self,
         runner: &dyn CommandRunner,
@@ -82,6 +97,9 @@ pub trait ClusterBackend: Send + Sync {
         runtime_root: &std::path::Path,
     ) -> Result<()>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn query_instance_status(
         &self,
         runner: &dyn CommandRunner,
@@ -89,12 +107,18 @@ pub trait ClusterBackend: Send + Sync {
         runtime_root: &std::path::Path,
     ) -> Result<String>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn guest_artifact_root(
         &self,
         instance_name: &str,
         runtime_root: &std::path::Path,
     ) -> Result<PathBuf>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn guest_shell(
         &self,
         runner: &dyn CommandRunner,
@@ -103,6 +127,9 @@ pub trait ClusterBackend: Send + Sync {
         command: &str,
     ) -> Result<Output>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn guest_sudo_shell(
         &self,
         runner: &dyn CommandRunner,
@@ -111,12 +138,18 @@ pub trait ClusterBackend: Send + Sync {
         command: &str,
     ) -> Result<Output>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn control_plane_host(
         &self,
         instance_name: &str,
         runtime_root: &std::path::Path,
     ) -> Result<String>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn host_api_endpoint(
         &self,
         instance_name: &str,
@@ -124,6 +157,9 @@ pub trait ClusterBackend: Send + Sync {
         requested_port: u16,
     ) -> Result<String>;
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn prepare_cluster_network(
         &self,
         _runner: &dyn CommandRunner,
@@ -133,6 +169,9 @@ pub trait ClusterBackend: Send + Sync {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     fn cleanup_cluster_network(
         &self,
         _runner: &dyn CommandRunner,
@@ -143,6 +182,7 @@ pub trait ClusterBackend: Send + Sync {
     }
 }
 
+#[must_use]
 pub fn backend_for(kind: BackendKind) -> &'static dyn ClusterBackend {
     match kind {
         BackendKind::Firecracker => &crate::backend::firecracker::BACKEND,

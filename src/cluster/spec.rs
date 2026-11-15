@@ -24,6 +24,7 @@ pub enum ImageArch {
 }
 
 impl ImageArch {
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "arm64" | "aarch64" => Some(Self::Aarch64),
@@ -32,6 +33,7 @@ impl ImageArch {
         }
     }
 
+    #[must_use]
     pub fn host_default() -> Self {
         match std::env::consts::ARCH {
             "x86_64" | "amd64" => Self::X86_64,
@@ -39,6 +41,7 @@ impl ImageArch {
         }
     }
 
+    #[must_use]
     pub fn lima_template_value(self) -> &'static str {
         match self {
             Self::Aarch64 => "aarch64",
@@ -46,6 +49,7 @@ impl ImageArch {
         }
     }
 
+    #[must_use]
     pub fn lima_artifact_suffix(self) -> &'static str {
         match self {
             Self::Aarch64 => "arm64",
@@ -82,6 +86,7 @@ pub struct ClusterSpec {
 }
 
 impl ClusterSpec {
+    #[must_use]
     pub fn new(name: String, workspace_root: PathBuf) -> Self {
         let backend = BackendKind::host_default();
         let cni_plugin = CniPlugin::None;
@@ -125,38 +130,55 @@ impl ClusterSpec {
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "kalisto".to_owned())
+            .map_or_else(|| "kalisto".to_owned(), ToOwned::to_owned)
     }
 
+    /// # Panics
+    ///
+    /// Panics when the user-scoped Kalisto data root cannot be resolved.
+    #[must_use]
     pub fn state_root(&self) -> PathBuf {
         Self::state_root_for(&self.name).expect("data root should be resolvable")
     }
 
+    /// # Panics
+    ///
+    /// Panics when the user-scoped Kalisto data root cannot be resolved.
+    #[must_use]
     pub fn clusters_root(&self) -> PathBuf {
         Self::clusters_root_for().expect("data root should be resolvable")
     }
 
+    #[must_use]
     pub fn helper_script(&self) -> PathBuf {
         Self::helper_script_for(&self.workspace_root)
     }
 
+    #[must_use]
     pub fn runtime_root(&self) -> PathBuf {
         Self::runtime_root_for(&self.workspace_root, &self.name)
     }
 
+    #[must_use]
     pub fn control_plane_name(&self) -> String {
         format!("kalisto-{}-cp", self.name)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn state_root_for(name: &str) -> crate::error::Result<PathBuf> {
         Ok(Self::clusters_root_for()?.join(name))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn clusters_root_for() -> crate::error::Result<PathBuf> {
         Ok(data_root()?.join("clusters"))
     }
 
+    #[must_use]
     pub fn helper_script_for(workspace_root: &Path) -> PathBuf {
         workspace_root
             .join("scripts")
@@ -164,6 +186,10 @@ impl ClusterSpec {
             .join("k3s_server_probe.sh")
     }
 
+    /// # Panics
+    ///
+    /// Panics when the user-scoped Kalisto data root cannot be resolved.
+    #[must_use]
     pub fn runtime_root_for(_workspace_root: &Path, name: &str) -> PathBuf {
         Self::state_root_for(name)
             .expect("data root should be resolvable")
@@ -182,6 +208,9 @@ fn default_lima_image_arch_suffix() -> &'static str {
     ImageArch::host_default().lima_artifact_suffix()
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn parse_image_arch(value: &str) -> std::result::Result<ImageArch, String> {
     ImageArch::parse(value).ok_or_else(|| {
         format!("unsupported arch `{value}`; expected one of: amd64, x86_64, arm64, aarch64")
@@ -202,6 +231,7 @@ fn default_lima_seed_template_filename() -> String {
     )
 }
 
+#[must_use]
 pub fn default_template(workspace_root: &Path) -> String {
     if let Some(template) = lima_template_under(artifacts_root().ok().as_deref()) {
         return template;

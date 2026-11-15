@@ -7,6 +7,7 @@ pub use crate::lima_k3s::report::{
 use crate::lima_k3s::cluster::{run as run_cluster, run_with_runner as run_cluster_with_runner};
 use crate::process::CommandRunner;
 
+#[must_use]
 pub fn run(config: &ProbeConfig) -> ProbeReport {
     run_cluster(config)
 }

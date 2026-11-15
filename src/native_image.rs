@@ -229,7 +229,7 @@ fn compress_disk(source: &Path, destination: &Path) -> Result<()> {
 
 fn provision_script(binary: &Path, version: &str) -> String {
     format!(
-        r#"#!/bin/sh
+        r"#!/bin/sh
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update
@@ -241,7 +241,7 @@ printf 'overlay\nbr_netfilter\n' >/etc/modules-load.d/kalisto-k3s.conf
 printf 'net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\n' >/etc/sysctl.d/90-kalisto-k3s.conf
 ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 printf '%s\n' {marker} >/etc/kalisto/node-image.env
-"#,
+",
         binary = shell_escape(&binary.display().to_string()),
         marker = shell_escape(&format!(
             "K3S_VERSION={version}\nIMAGE_FLAVOR=ubuntu-24.04-minimal"
@@ -286,7 +286,7 @@ mod tests {
         let source = root.join("source.raw");
         let destination = root.join("node.raw.gz");
         let mut bytes = vec![0; 1024 * 1024];
-        bytes[65536..131072].fill(42);
+        bytes[65_536..131_072].fill(42);
         fs::write(&source, &bytes).unwrap();
         compress_disk(&source, &destination).unwrap();
         let mut decoded = Vec::new();

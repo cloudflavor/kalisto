@@ -9,6 +9,9 @@ use crate::process::CommandRunner;
 
 const RELEASE_URL_BASE: &str = "https://github.com/k3s-io/k3s/releases/download";
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 /// Resolve (downloading and checksum-verifying on first use) the managed host
 /// kubectl binary for a K3s release version.
 pub fn binary(version: &str, runner: &dyn CommandRunner) -> Result<PathBuf> {

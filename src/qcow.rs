@@ -2,7 +2,7 @@
 //!
 //! No QEMU executable is needed on the user's Mac. Supported subset: QCOW2 v2/v3,
 //! standard L2 entries, no backing/encryption/incompatible features, raw DEFLATE.
-//! Format: https://www.qemu.org/docs/master/interop/qcow2.html
+//! Format: <https://www.qemu.org/docs/master/interop/qcow2.html>
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +16,9 @@ const OFFSET: u64 = 0x00ff_ffff_ffff_fe00;
 const COMPRESSED: u64 = 1 << 62;
 const MAX_DISK: u64 = 16 * 1024 * 1024 * 1024;
 
+// Cluster and table sizes come from a validated QCOW2 header (bounded by
+// MAX_DISK); the u64-to-usize truncations used for buffer sizing are safe.
+#[allow(clippy::cast_possible_truncation)]
 pub fn to_raw(source: &Path, destination: &Path) -> Result<()> {
     let mut input = File::open(source).map_err(io_error)?;
     let source_size = input.metadata().map_err(io_error)?.len();
@@ -26,7 +29,7 @@ pub fn to_raw(source: &Path, destination: &Path) -> Result<()> {
     }
     let bits = u32_at(&header, 20);
     let size = u64_at(&header, 24);
-    let entries = u32_at(&header, 36) as u64;
+    let entries = u64::from(u32_at(&header, 36));
     if !(9..=21).contains(&bits)
         || size == 0
         || size > MAX_DISK
@@ -166,10 +169,10 @@ mod tests {
             let data = encoder.finish().unwrap();
             // Compressed clusters may begin in the middle of a sector.
             bytes[1543..1543 + data.len()].copy_from_slice(&data);
-            COMPRESSED | 1543
+            COMPRESSED | 0x0607
         } else {
             bytes[1536..2048].fill(b'A');
-            (1u64 << 63) | 1536
+            (1u64 << 63) | 0x0600
         };
         bytes[1024..1032].copy_from_slice(&descriptor.to_be_bytes());
         bytes

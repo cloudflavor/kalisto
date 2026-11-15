@@ -56,12 +56,14 @@ pub struct Report {
 }
 
 impl Report {
+    #[must_use]
     pub fn has_failures(&self) -> bool {
         self.results
             .iter()
             .any(|result| result.status == Status::Fail)
     }
 
+    #[must_use]
     pub fn summary(&self) -> String {
         let passed = self
             .results

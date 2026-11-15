@@ -61,11 +61,10 @@ impl Drop for OwnedCluster {
                 }
             }
         }
-        let lima_home = std::env::var_os("LIMA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".lima")
-            });
+        let lima_home = std::env::var_os("LIMA_HOME").map_or_else(
+            || PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".lima"),
+            PathBuf::from,
+        );
         for suffix in ["cp", "w0", "w1"] {
             let name = format!("kalisto-{}-{suffix}", self.0);
             for log in [
@@ -105,6 +104,7 @@ fn kubectl(kubeconfig: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+#[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 #[test]
 fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute() {
     if std::env::var("KALISTO_LIVE_THREE_NODE_BOOT_BUDGET").as_deref() != Ok("1") {
@@ -127,11 +127,10 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
         "cold benchmark must not reuse any persisted cluster state"
     );
     let prefix = format!("kalisto-{name}-");
-    let lima_home = std::env::var_os("LIMA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".lima")
-        });
+    let lima_home = std::env::var_os("LIMA_HOME").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".lima"),
+        PathBuf::from,
+    );
     for suffix in ["cp", "w0", "w1"] {
         assert!(
             !lima_home.join(format!("{prefix}{suffix}")).exists(),
@@ -206,12 +205,11 @@ fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute
     // by up, VM creation, guest boot and k3s/CNI startup are all on the clock.
     // No manually bootstrapped guests or pre-created VM definitions qualify.
     let observation_seconds = std::env::var("KALISTO_COLD_OBSERVATION_SECONDS")
-        .map(|value| {
+        .map_or(60, |value| {
             value
                 .parse::<u64>()
                 .expect("observation timeout should be seconds")
         })
-        .unwrap_or(60)
         .max(60);
     let started = Instant::now();
     let deadline = started + Duration::from_secs(observation_seconds);

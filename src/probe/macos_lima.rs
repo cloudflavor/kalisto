@@ -66,6 +66,7 @@ pub struct ProbeConfig {
 }
 
 impl ProbeConfig {
+    #[must_use]
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             template: "template://default".to_owned(),
@@ -83,12 +84,14 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
+    #[must_use]
     pub fn has_failures(&self) -> bool {
         self.results
             .iter()
             .any(|result| result.status == ProbeStatus::Fail)
     }
 
+    #[must_use]
     pub fn summary(&self) -> String {
         let passed = self
             .results
@@ -110,6 +113,7 @@ impl ProbeReport {
     }
 }
 
+#[must_use]
 pub fn run(config: &ProbeConfig) -> ProbeReport {
     let runner = SystemRunner;
     run_with_runner(config, &runner)
@@ -362,8 +366,7 @@ pub(crate) fn shell_escape(input: &str) -> String {
 fn first_line(text: &str, fallback: &'static str) -> String {
     text.lines()
         .find(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.to_owned())
+        .map_or_else(|| fallback.to_owned(), ToOwned::to_owned)
 }
 
 fn unique_suffix() -> String {
@@ -419,11 +422,11 @@ mod tests {
         }
     }
 
-    fn ok(stdout: &str) -> Result<Output> {
-        Ok(Output {
+    fn ok(stdout: &str) -> Output {
+        Output {
             stdout: stdout.to_owned(),
             stderr: String::new(),
-        })
+        }
     }
 
     #[test]
@@ -458,13 +461,13 @@ mod tests {
 
         let runner = FakeRunner::with_on_run(
             vec![
-                ok("limactl version 2.1.0"),
-                ok("started"),
-                ok("kalisto Running vz"),
-                ok(""),
-                ok(""),
-                ok("stopped"),
-                ok("deleted"),
+                Ok(ok("limactl version 2.1.0")),
+                Ok(ok("started")),
+                Ok(ok("kalisto Running vz")),
+                Ok(ok("")),
+                Ok(ok("")),
+                Ok(ok("stopped")),
+                Ok(ok("deleted")),
             ],
             Box::new(move || {
                 if probe_file_for_callback.exists() {

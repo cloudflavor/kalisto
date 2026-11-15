@@ -28,6 +28,9 @@ impl LiveLogTail {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn emit_pending(&mut self) -> Result<()> {
         if !self.path.is_file() {
             return Ok(());
@@ -65,14 +68,13 @@ impl LiveLogTail {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     let started = SystemTime::now();
     loop {
-        if path.is_file()
-            && fs::metadata(path)
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-        {
+        if path.is_file() && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             return Ok(());
         }
         if started.elapsed().unwrap_or_default() >= timeout {
@@ -85,6 +87,9 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_path_with_tail(
     path: &Path,
     timeout: Duration,
@@ -93,11 +98,7 @@ pub fn wait_for_path_with_tail(
     let started = SystemTime::now();
     loop {
         tail.emit_pending()?;
-        if path.is_file()
-            && fs::metadata(path)
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-        {
+        if path.is_file() && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             tail.emit_pending()?;
             return Ok(());
         }
@@ -112,6 +113,9 @@ pub fn wait_for_path_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_stable_guest_success(
     runner: &dyn CommandRunner,
     instance_name: &str,
@@ -141,6 +145,9 @@ pub fn wait_for_stable_guest_success(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_stable_guest_success_with_tail(
     runner: &dyn CommandRunner,
     instance_name: &str,
@@ -174,6 +181,9 @@ pub fn wait_for_stable_guest_success_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_host_http(
     runner: &dyn CommandRunner,
     url: &str,
@@ -213,6 +223,9 @@ pub fn wait_for_host_http(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_host_http_with_tail(
     runner: &dyn CommandRunner,
     url: &str,
@@ -259,6 +272,9 @@ pub fn wait_for_host_http_with_tail(
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_worker_process(runner: &dyn CommandRunner, instance_name: &str) -> Result<Output> {
     wait_for_stable_guest_success(
         runner,
@@ -270,6 +286,9 @@ pub fn wait_for_worker_process(runner: &dyn CommandRunner, instance_name: &str) 
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn wait_for_node_ready(
     runner: &dyn CommandRunner,
     control_plane: &Instance,

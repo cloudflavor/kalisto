@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use kalisto::probe::macos_lima::{ProbeConfig, ProbeStatus, run};
 
 fn live_tests_enabled() -> bool {
-    std::env::var("KALISTO_LIVE_LIMA_TESTS")
-        .map(|value| value == "1")
-        .unwrap_or(false)
+    std::env::var("KALISTO_LIVE_LIMA_TESTS").is_ok_and(|value| value == "1")
 }
 
 #[test]
@@ -22,10 +20,7 @@ fn macos_lima_probe() {
     if let Ok(network) = std::env::var("KALISTO_LIMA_NETWORK") {
         config.network = network;
     }
-    if std::env::var("KALISTO_LIMA_NO_ROSETTA")
-        .map(|value| value == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("KALISTO_LIMA_NO_ROSETTA").is_ok_and(|value| value == "1") {
         config.enable_rosetta = false;
     }
 

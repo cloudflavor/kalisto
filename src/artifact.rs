@@ -58,7 +58,6 @@ struct ManifestData {
 
 fn default_lima_image_arch_suffix() -> &'static str {
     match std::env::consts::ARCH {
-        "aarch64" | "arm64" => "arm64",
         "x86_64" | "amd64" => "amd64",
         _ => "arm64",
     }
@@ -115,6 +114,9 @@ impl ManifestData {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn pull_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
     if let Some(template) = crate::native_image::pack_cached_template(spec)? {
         let mut resolved = spec.clone();
@@ -131,6 +133,9 @@ pub fn pull_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Resu
     resolve_cluster_spec(spec, runner)
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
     if spec.backend == BackendKind::Lima {
         if spec.template != "template://default" {
@@ -357,7 +362,7 @@ fn detect_firecracker_runtime_info(runner: &dyn CommandRunner) -> Result<Firecra
     let installed_version = if let Some(version) = std::env::var("KALISTO_FIRECRACKER_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .map(normalize_version_string)
+        .map(|version| normalize_version_string(&version))
         .transpose()?
     {
         version
@@ -414,7 +419,7 @@ fn parse_firecracker_version(output: &str) -> Result<String> {
     )))
 }
 
-fn normalize_version_string(value: String) -> Result<String> {
+fn normalize_version_string(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let prefixed = if trimmed.starts_with('v') {
         trimmed.to_owned()
@@ -515,8 +520,7 @@ impl ArtifactManagerConfig {
         let default_cache_root = artifacts_root()?.join(FIRECRACKER_ARTIFACT_DIR);
         let cache_root = std::env::var_os("KALISTO_FIRECRACKER_ARTIFACT_CACHE_DIR")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(default_cache_root);
+            .map_or(default_cache_root, PathBuf::from);
 
         let runtime_info = match detect_firecracker_runtime_info(runner) {
             Ok(runtime_info) => Some(runtime_info),
@@ -536,10 +540,10 @@ impl ArtifactManagerConfig {
             .workspace_root
             .join("artifacts")
             .join(FIRECRACKER_ARTIFACT_DIR);
-        let managed_cache_root = runtime_info
-            .as_ref()
-            .map(|runtime| versioned_artifact_root(&cache_root, runtime))
-            .unwrap_or_else(|| cache_root.clone());
+        let managed_cache_root = runtime_info.as_ref().map_or_else(
+            || cache_root.clone(),
+            |runtime| versioned_artifact_root(&cache_root, runtime),
+        );
 
         let mut search_roots = Vec::new();
         if let Some(runtime) = runtime_info.as_ref() {
@@ -654,7 +658,7 @@ impl ArtifactManagerConfig {
     ) -> Result<PathBuf> {
         if let Some(path) = explicit {
             ensure_file(path, request.label)?;
-            return finalize_resolved_artifact(runner, path.to_path_buf(), request);
+            return finalize_resolved_artifact(runner, path, request);
         }
 
         let mut candidate_filenames = vec![request.default_filename.to_owned()];
@@ -669,7 +673,7 @@ impl ArtifactManagerConfig {
             for filename in &candidate_filenames {
                 let candidate = root.join(filename);
                 if candidate.is_file() {
-                    return finalize_resolved_artifact(runner, candidate, request);
+                    return finalize_resolved_artifact(runner, &candidate, request);
                 }
             }
         }
@@ -690,7 +694,7 @@ impl ArtifactManagerConfig {
             request.label,
             request.default_filename,
         )?;
-        finalize_resolved_artifact(runner, fetched, request)
+        finalize_resolved_artifact(runner, &fetched, request)
     }
 
     fn find_local_kernel_candidate(&self, runner: &dyn CommandRunner) -> Result<Option<PathBuf>> {
@@ -763,10 +767,10 @@ pub(crate) fn fetch_into_cache(
 
 fn finalize_resolved_artifact(
     runner: &dyn CommandRunner,
-    candidate: PathBuf,
+    candidate: &Path,
     request: ResolveRequest<'_>,
 ) -> Result<PathBuf> {
-    let materialized = maybe_materialize_rootfs(runner, &candidate, request)?;
+    let materialized = maybe_materialize_rootfs(runner, candidate, request)?;
     if let Some(checksum) = request.expected_sha256 {
         verify_sha256(runner, &materialized, checksum, request.label)?;
     }

@@ -1,3 +1,4 @@
+#[must_use]
 pub fn shell_escape(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }

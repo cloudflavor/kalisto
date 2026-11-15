@@ -83,7 +83,7 @@ pub enum TestCommand {
     Ls(TestListArgs),
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
 pub struct TestRunArgs {
     #[structopt(long, parse(from_os_str))]
     pub project_root: Option<PathBuf>,
@@ -94,6 +94,9 @@ pub struct TestRunArgs {
 }
 
 impl TestRunArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn into_cluster_spec(&self) -> crate::error::Result<ClusterSpec> {
         resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())
     }
@@ -116,6 +119,9 @@ pub struct NodeLogsArgs {
 }
 
 impl NodeLogsArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -134,6 +140,9 @@ pub struct ApplyArgs {
 }
 
 impl ApplyArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -156,6 +165,9 @@ pub struct KubectlArgs {
 }
 
 impl KubectlArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -180,6 +192,9 @@ pub struct AddonInstallArgs {
 }
 
 impl AddonInstallArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -195,6 +210,9 @@ pub struct AddonListArgs {
 }
 
 impl AddonListArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -203,6 +221,7 @@ impl AddonListArgs {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI arguments / persisted config surface; bool-per-flag is the design
 #[derive(Debug, StructOpt)]
 pub struct UpArgs {
     #[structopt(long, parse(from_os_str))]
@@ -250,6 +269,9 @@ pub struct UpArgs {
 }
 
 impl UpArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn into_cluster_spec(self) -> crate::error::Result<ClusterSpec> {
         let mut spec = resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())?;
         if let Some(backend) = self.backend {
@@ -265,7 +287,7 @@ impl UpArgs {
             spec.worker_count = workers;
             spec.requested_worker_count = Some(workers);
             if spec.backend == BackendKind::Lima && workers > 0 && spec.network == "vzNAT" {
-                spec.network = "lima:user-v2".to_owned();
+                "lima:user-v2".clone_into(&mut spec.network);
             }
         }
         if let Some(cpus) = self.control_plane_cpus {
@@ -460,6 +482,9 @@ fn parse_up_addon_id(value: &str) -> std::result::Result<String, String> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn apply_requested_addons(
     spec: &mut ClusterSpec,
     addons: &[String],
@@ -469,7 +494,7 @@ pub fn apply_requested_addons(
         let addon = parse_up_addon_id(addon).map_err(crate::error::Error::InvalidArgs)?;
         match addon.as_str() {
             "cni/flannel" => {
-                requested_cni = merge_requested_cni(requested_cni, CniPlugin::Flannel)?
+                requested_cni = merge_requested_cni(requested_cni, CniPlugin::Flannel)?;
             }
             "cni/cilium" => requested_cni = merge_requested_cni(requested_cni, CniPlugin::Cilium)?,
             _ if !spec.addons.iter().any(|installed| installed == &addon) => {
@@ -531,6 +556,9 @@ pub struct DestroyArgs {
 }
 
 impl DestroyArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_names(&self) -> crate::error::Result<Option<Vec<String>>> {
         let Some(value) = &self.name else {
             return Ok(selected_cluster_name()?.map(|name| vec![name]));
@@ -560,6 +588,9 @@ pub struct ClusterLookupArgs {
 }
 
 impl ClusterLookupArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -577,6 +608,9 @@ pub struct KubeconfigArgs {
 }
 
 impl KubeconfigArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -600,6 +634,9 @@ pub struct ScaleArgs {
 }
 
 impl ScaleArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -625,6 +662,9 @@ pub struct StatsArgs {
 }
 
 impl StatsArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn cluster_name(&self) -> crate::error::Result<Option<String>> {
         match &self.name {
             Some(name) => Ok(Some(name.clone())),
@@ -633,6 +673,7 @@ impl StatsArgs {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI arguments / persisted config surface; bool-per-flag is the design
 #[derive(Debug, StructOpt)]
 pub struct BenchArgs {
     #[structopt(long, parse(from_os_str))]
@@ -682,6 +723,9 @@ pub struct BenchArgs {
 }
 
 impl BenchArgs {
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot be completed.
     pub fn into_cluster_spec(self) -> crate::error::Result<(ClusterSpec, usize)> {
         let runs = self.runs;
         let up = UpArgs {
@@ -962,7 +1006,7 @@ mod tests {
 
         match cli.command {
             Command::Completions(args) => {
-                assert_eq!(format!("{:?}", args.shell).to_ascii_lowercase(), "zsh")
+                assert_eq!(format!("{:?}", args.shell).to_ascii_lowercase(), "zsh");
             }
             other => panic!("expected completions command, got {other:?}"),
         }
@@ -1001,7 +1045,9 @@ mod tests {
                     assert_eq!(args.scenario, "smoke");
                     assert_eq!(args.name.as_deref(), Some("dev"));
                 }
-                other => panic!("expected test run command, got {other:?}"),
+                super::TestCommand::Ls(_) => {
+                    panic!("expected test run command, got ls")
+                }
             },
             other => panic!("expected test command, got {other:?}"),
         }
@@ -1020,7 +1066,9 @@ mod tests {
                         Some(std::path::PathBuf::from("/tmp/work"))
                     );
                 }
-                other => panic!("expected test ls command, got {other:?}"),
+                super::TestCommand::Run(_) => {
+                    panic!("expected test ls command, got run")
+                }
             },
             other => panic!("expected test command, got {other:?}"),
         }
@@ -1162,7 +1210,9 @@ mod tests {
                     assert!(args.name.is_none());
                     assert_eq!(args.addon, "lb/metallb");
                 }
-                other => panic!("expected addon install command, got {other:?}"),
+                super::AddonCommand::Ls(_) => {
+                    panic!("expected addon install command, got ls")
+                }
             },
             other => panic!("expected addon command, got {other:?}"),
         }
@@ -1175,7 +1225,9 @@ mod tests {
         match cli.command {
             Command::Addon(args) => match args.command {
                 super::AddonCommand::Ls(args) => assert_eq!(args.name.as_deref(), Some("dev")),
-                other => panic!("expected addon ls command, got {other:?}"),
+                super::AddonCommand::Install(_) => {
+                    panic!("expected addon ls command, got install")
+                }
             },
             other => panic!("expected addon command, got {other:?}"),
         }
@@ -1188,7 +1240,9 @@ mod tests {
         match cli.command {
             Command::Plugin(args) => match args.command {
                 super::AddonCommand::Ls(args) => assert!(args.name.is_none()),
-                other => panic!("expected plugin ls command, got {other:?}"),
+                super::AddonCommand::Install(_) => {
+                    panic!("expected plugin ls command, got install")
+                }
             },
             other => panic!("expected plugin command, got {other:?}"),
         }
@@ -1283,10 +1337,10 @@ enabled = true
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("kalisto.toml"),
-            r#"
+            r"
 [plugins.traefik]
 enabled = true
-"#,
+",
         )
         .unwrap();
 
@@ -1362,7 +1416,9 @@ command = "kubectl get pods"
                     assert_eq!(spec.name, "from-config");
                     assert_eq!(spec.backend, crate::backend::BackendKind::Lima);
                 }
-                other => panic!("expected test run command, got {other:?}"),
+                super::TestCommand::Ls(_) => {
+                    panic!("expected test run command, got ls")
+                }
             },
             other => panic!("expected test command, got {other:?}"),
         }

@@ -10,6 +10,7 @@ pub enum ServerMode {
 }
 
 impl ServerMode {
+    #[must_use]
     pub fn disable_agent(self) -> bool {
         matches!(self, Self::Agentless)
     }
@@ -22,6 +23,7 @@ pub enum NodeRole {
 }
 
 impl NodeRole {
+    #[must_use]
     pub fn as_env_value(self) -> &'static str {
         match self {
             Self::ControlPlane => "server",
@@ -30,6 +32,7 @@ impl NodeRole {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI arguments / persisted config surface; bool-per-flag is the design
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComponentToggles {
     pub disable_traefik: bool,
@@ -58,6 +61,7 @@ impl Default for ComponentToggles {
 }
 
 impl ComponentToggles {
+    #[must_use]
     pub fn export_commands(self) -> [String; 8] {
         [
             export_toggle("KALISTO_K3S_DISABLE_TRAEFIK", self.disable_traefik),
@@ -152,6 +156,7 @@ impl BootstrapSpec {
     }
 }
 
+#[must_use]
 pub fn kubelet_resolv_conf_contents() -> String {
     let mut contents = String::new();
     for nameserver in KUBELET_RESOLV_CONF_NAMESERVERS {
@@ -162,6 +167,7 @@ pub fn kubelet_resolv_conf_contents() -> String {
     contents
 }
 
+#[must_use]
 pub fn kubelet_resolv_conf_arg() -> String {
     format!("resolv-conf={KUBELET_RESOLV_CONF_PATH}")
 }

@@ -9,6 +9,9 @@ pub struct PluginSpec {
     pub description: String,
 }
 
+/// # Errors
+///
+/// Returns an error when the operation cannot be completed.
 pub fn built_in_catalog() -> Result<Vec<PluginSpec>> {
     // TODO: why does this assume a relative path
     parse_catalog(include_str!("../plugins/config.toml"))

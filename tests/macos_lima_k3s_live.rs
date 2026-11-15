@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use kalisto::probe::macos_lima_k3s::{ProbeConfig, ProbeStatus, ServerMode, run};
 
 fn live_tests_enabled() -> bool {
-    std::env::var("KALISTO_LIVE_LIMA_K3S_TESTS")
-        .map(|value| value == "1")
-        .unwrap_or(false)
+    std::env::var("KALISTO_LIVE_LIMA_K3S_TESTS").is_ok_and(|value| value == "1")
 }
 
 #[test]
@@ -31,16 +29,10 @@ fn macos_lima_k3s_probe() {
     if let Ok(version) = std::env::var("KALISTO_K3S_VERSION") {
         config.k3s_version = version;
     }
-    if std::env::var("KALISTO_LIMA_K3S_AGENTLESS")
-        .map(|value| value == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("KALISTO_LIMA_K3S_AGENTLESS").is_ok_and(|value| value == "1") {
         config.server_mode = ServerMode::Agentless;
     }
-    if std::env::var("KALISTO_LIMA_NO_ROSETTA")
-        .map(|value| value == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("KALISTO_LIMA_NO_ROSETTA").is_ok_and(|value| value == "1") {
         config.enable_rosetta = false;
     }
 
