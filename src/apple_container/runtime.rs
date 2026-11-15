@@ -249,7 +249,7 @@ fn check_platform(runner: &dyn CommandRunner) -> Result<()> {
         .split('.')
         .next()
         .and_then(|value| value.parse::<u32>().ok());
-    if !major.is_some_and(|major| major >= 26) {
+    if major.is_none_or(|major| major < 26) {
         return Err(invalid("Apple containers require macOS 26 or later"));
     }
     Ok(())

@@ -247,7 +247,7 @@ fn write_image<R: Read + Seek, W: Write>(
 ) -> Result<String> {
     let mut hash = Sha256::new();
     let mut size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; 16 * 1024];
     loop {
         let count = layer.read(&mut buffer).map_err(io_error)?;
         if count == 0 {

@@ -866,11 +866,11 @@ mod tests {
         Runner(RefCell::new(responses.into()))
     }
 
-    fn output(value: Value) -> Result<Output> {
-        Ok(Output {
+    fn output(value: &Value) -> Output {
+        Output {
             stdout: value.to_string(),
             stderr: String::new(),
-        })
+        }
     }
 
     fn failed() -> Error {
@@ -903,14 +903,14 @@ mod tests {
 
     #[test]
     fn successful_empty_list_is_missing_without_inspect() {
-        let runner = runner(vec![output(json!([]))]);
+        let runner = runner(vec![Ok(output(&json!([])))]);
         assert!(inspect_node(&runner, "kalisto-demo-cp").unwrap().is_none());
     }
 
     #[test]
     fn failed_inspect_is_not_treated_as_missing() {
         let runner = runner(vec![
-            output(json!([{"id": "kalisto-demo-cp"}])),
+            Ok(output(&json!([{"id": "kalisto-demo-cp"}]))),
             Err(failed()),
         ]);
         assert!(matches!(
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn malformed_list_is_not_treated_as_missing() {
-        let runner = runner(vec![output(json!([{"name": "unrelated"}]))]);
+        let runner = runner(vec![Ok(output(&json!([{"name": "unrelated"}])))]);
         assert!(inspect_node(&runner, "kalisto-demo-cp").is_err());
     }
 
@@ -930,8 +930,8 @@ mod tests {
         let mut node = owned_node();
         node["configuration"]["labels"] = json!({});
         let runner = runner(vec![
-            output(json!([{"id": "kalisto-demo-cp"}])),
-            output(json!([node])),
+            Ok(output(&json!([{"id": "kalisto-demo-cp"}]))),
+            Ok(output(&json!([node]))),
         ]);
         assert!(
             BACKEND
@@ -977,14 +977,14 @@ mod tests {
     #[test]
     fn wrong_manifest_cannot_trigger_image_fetch_during_start() {
         let image = format!("docker.io/kalisto/node@sha256:{}", "a".repeat(64));
-        let runner = runner(vec![output(json!([{
+        let runner = runner(vec![Ok(output(&json!([{
             "id": "indirect-index",
             "variants": [{
                 "platform": {"os": "linux", "architecture": "arm64"},
                 "digest": format!("sha256:{}", "b".repeat(64)),
                 "config": {}
             }]
-        }]))]);
+        }])))]);
         assert!(check_local_image(&runner, &image).is_err());
     }
 
@@ -993,14 +993,14 @@ mod tests {
         let mut node = owned_node();
         node["configuration"]["labels"][ROOT_LABEL] = json!("/");
         let runner = runner(vec![
-            output(json!([{"id": "kalisto-demo-cp"}])),
-            output(json!([node])),
-            output(json!([{
+            Ok(output(&json!([{"id": "kalisto-demo-cp"}]))),
+            Ok(output(&json!([node]))),
+            Ok(output(&json!([{
                 "id": "kalisto-demo-cp",
                 "memoryUsageBytes": 123_456,
                 "networkRxBytes": 222,
                 "networkTxBytes": 333
-            }])),
+            }]))),
         ]);
         let result = metrics(&runner, "kalisto-demo-cp", Path::new("/")).unwrap();
         assert_eq!(

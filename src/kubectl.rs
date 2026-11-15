@@ -48,7 +48,7 @@ pub fn binary(version: &str, runner: &dyn CommandRunner) -> Result<PathBuf> {
         &format!("{release}/{checksum_name}"),
         None,
         "K3s kubectl checksum",
-        &checksum_name,
+        checksum_name,
     )?;
     let digest = expected_checksum(&checksum_path)?;
     let path = artifact::fetch_into_cache(
