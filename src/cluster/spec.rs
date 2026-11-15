@@ -201,6 +201,7 @@ fn default_network(backend: BackendKind) -> String {
     match backend {
         BackendKind::Firecracker => "slirp4netns".to_owned(),
         BackendKind::Lima => "lima:user-v2".to_owned(),
+        BackendKind::AppleContainer => "apple-container".to_owned(),
     }
 }
 

@@ -1,3 +1,4 @@
+mod apple_container;
 pub mod archive;
 pub mod artifact;
 pub mod backend;

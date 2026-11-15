@@ -7,6 +7,7 @@ use crate::process::{CommandRunner, Output};
 pub enum BackendKind {
     Firecracker,
     Lima,
+    AppleContainer,
 }
 
 impl BackendKind {
@@ -15,6 +16,7 @@ impl BackendKind {
         match self {
             Self::Firecracker => "firecracker",
             Self::Lima => "lima",
+            Self::AppleContainer => "apple-container",
         }
     }
 
@@ -23,6 +25,7 @@ impl BackendKind {
         match value {
             "firecracker" => Some(Self::Firecracker),
             "lima" => Some(Self::Lima),
+            "apple-container" => Some(Self::AppleContainer),
             _ => None,
         }
     }
@@ -34,6 +37,11 @@ impl BackendKind {
         } else {
             Self::Lima
         }
+    }
+
+    #[must_use]
+    pub(crate) fn uses_prepared_assets(self) -> bool {
+        matches!(self, Self::Lima | Self::AppleContainer)
     }
 }
 
@@ -187,6 +195,7 @@ pub fn backend_for(kind: BackendKind) -> &'static dyn ClusterBackend {
     match kind {
         BackendKind::Firecracker => &crate::backend::firecracker::BACKEND,
         BackendKind::Lima => &crate::backend::lima::BACKEND,
+        BackendKind::AppleContainer => &crate::backend::apple_container::BACKEND,
     }
 }
 

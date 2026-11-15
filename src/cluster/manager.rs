@@ -243,10 +243,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.exists() {
-        if spec.backend == crate::backend::BackendKind::Lima {
+        if spec.backend.uses_prepared_assets() {
             crate::pull::load(spec)?;
             let resolved = resolve_cluster_spec(spec, runner)?;
-            crate::pull::validate_lima_template(&resolved.template)?;
+            if spec.backend == BackendKind::Lima {
+                crate::pull::validate_lima_template(&resolved.template)?;
+            }
         }
         debug_feedback(format!(
             "up: cluster `{}` has no persisted definition, creating it first",
@@ -261,9 +263,11 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
     let resolved_spec = resolve_up_spec(&state, spec);
     let spec = &resolved_spec;
-    let prepared = if spec.backend == crate::backend::BackendKind::Lima {
+    let prepared = if spec.backend.uses_prepared_assets() {
         let assets = crate::pull::load(spec)?;
-        crate::pull::validate_lima_template(&spec.template)?;
+        if spec.backend == BackendKind::Lima {
+            crate::pull::validate_lima_template(&spec.template)?;
+        }
         Some(assets)
     } else {
         None
@@ -1138,6 +1142,9 @@ fn scale_at_root(
 
     let runtime_root = state_root.join("runtime");
     let backend = backend_for(state.backend);
+    if state.backend == BackendKind::AppleContainer {
+        backend.check_available(runner)?;
+    }
     let control_plane_state = state
         .nodes
         .iter()
@@ -1190,7 +1197,9 @@ fn scale_at_root(
         network: state.network.clone(),
         firecracker_kernel: state.firecracker_kernel.clone(),
         firecracker_rootfs: state.firecracker_rootfs.clone(),
-        boot_assets_root: if state.backend == BackendKind::Lima {
+        boot_assets_root: if state.backend == BackendKind::AppleContainer {
+            Some(crate::pull::load(&cluster_spec_from_state(&state))?)
+        } else if state.backend == BackendKind::Lima {
             let mut asset_spec = cluster_spec_from_state(&state);
             asset_spec.addons.clear();
             match state.cni_plugin {
@@ -1657,6 +1666,31 @@ fn load_host_node_metrics(
     match backend {
         BackendKind::Firecracker => load_firecracker_host_metrics(runner, artifacts_root),
         BackendKind::Lima => load_lima_host_metrics(runner, instance_name),
+        BackendKind::AppleContainer => {
+            load_apple_container_host_metrics(runner, instance_name, artifacts_root)
+        }
+    }
+}
+
+fn load_apple_container_host_metrics(
+    runner: &dyn CommandRunner,
+    instance_name: &str,
+    artifacts_root: &Path,
+) -> HostNodeMetrics {
+    match crate::backend::apple_container::metrics(runner, instance_name, artifacts_root) {
+        Ok(metrics) => HostNodeMetrics {
+            pid: metrics.pid,
+            guest_ip: metrics.guest_ip,
+            rss_bytes: metrics.rss_bytes,
+            vsz_bytes: metrics.vsz_bytes,
+            rootfs_bytes: metrics.rootfs_bytes,
+            rx_bytes: metrics.rx_bytes,
+            tx_bytes: metrics.tx_bytes,
+        },
+        Err(error) => {
+            tracing::debug!(node = instance_name, %error, "Apple container metrics unavailable");
+            HostNodeMetrics::default()
+        }
     }
 }
 

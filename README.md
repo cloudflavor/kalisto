@@ -1,10 +1,11 @@
 # Kalisto
 
-Local-development Kubernetes runtime on macOS using native Lima/VZ.
+Local-development Kubernetes runtime using k3s on macOS and Linux.
 
 Current scope:
 
 - macOS backend: native Lima `vz` (Rosetta opt-in)
+- opt-in macOS backend: Apple `container` running Kalisto-managed k3s nodes
 - Linux backend: Firecracker (in progress)
 - Kubernetes distro: `k3s`
 - image pipeline: native VZ OS preparation; optional legacy container builders
@@ -50,8 +51,8 @@ support enabled rather than a separate proxy DaemonSet. Default CNI remains `non
 explicit Cilium selection is required for pod networking. MCP exposes the same
 preparation through `clusters.pull`, using the lifecycle arguments of `clusters.up`.
 
-The current prepared startup profile supports Lima, no CNI or Cilium, and optional
-`lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
+The prepared startup profiles support Lima and Apple containers, no CNI or Cilium,
+and optional `lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
 silently; install those explicitly after startup. Existing Helm-managed Cilium
 clusters require migration; prepared startup currently targets fresh clusters.
 
@@ -63,10 +64,58 @@ from both workers. Image imports and VM creation remain inside the timer;
 `pull` preparation stays outside it. These measurements are not a universal
 hardware performance guarantee.
 
+## Apple container backend
+
+On Apple silicon with macOS 26 or newer, select Apple's lightweight Linux VM runtime
+without using its experimental Kubernetes cluster implementation:
+
+```bash
+kalisto pull --backend apple-container --addons cni/cilium
+kalisto up --backend apple-container --workers 2 --addons cni/cilium
+kalisto kubectl -- get nodes
+kalisto down
+kalisto up
+```
+
+Kalisto owns the k3s server, agents, Cilium, readiness checks, and cluster state.
+It does not use `container cluster`, `container machine`, kubeadm, kind, Docker,
+or an external registry to bootstrap prepared nodes. Lima remains the macOS default.
+
+`pull` installs a pinned, signed Apple runtime in Kalisto's user data, prepares its
+kernel and init image, and composes a digest-pinned Ubuntu/k3s node image. A temporary
+ordinary container installs Linux prerequisites, then is deleted; no cluster identity
+is baked into the reusable image. The cached node OCI archive can restore a pruned
+runtime image store when `pull` is repeated.
+
+`up` requires the local node image and prepared assets; it never installs tools,
+pulls missing images, or changes the selected CNI. Nodes start concurrently on an
+owned NAT network, with only their own runtime directory and read-only boot assets
+mounted from the host. No home directory, SSH agent, or global shared image store
+is exposed. Workload registry access remains available after startup.
+
+Apple's service is shared within a macOS login session. Kalisto refuses to take
+over a running service with a different version or installation/data root; it does
+not stop another installation automatically. Stop that installation yourself before
+preparing Kalisto's managed runtime.
+
+The Apple backend uses the same three-node, authenticated-API, Cilium rollout,
+worker DNS, and cross-node Service HTTP budget scenario as Lima:
+
+```bash
+KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1 \
+  cargo test --release --test macos_three_node_boot_budget \
+  apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
+```
+
+Run live validation only in the authorized native macOS CI job. The existing Lima
+timings above are not Apple-container measurements. Cold archive export/import
+currently remains Lima-only; existing Lima clusters and archives are not converted
+by selecting a different backend.
+
 ## Install workloads
 
 After `up`, Cilium and CoreDNS provide pod networking and DNS. Supply a Kubernetes
-client such as `kubectl`; host `kubectl` is not installed automatically:
+client such as `kubectl`; the standalone host command is not added to `PATH`:
 
 ```bash
 export KUBECONFIG="$(kalisto kubeconfig --path)"
@@ -77,7 +126,7 @@ kubectl apply -f app.yaml
 
 Or work without a host Kubernetes client: `kalisto apply` ships a manifest to the
 running cluster, and `kalisto kubectl` runs a checksum-verified managed kubectl
-binary matching the cluster's K3s release (fetched on first use, not during `up`):
+binary matching the cluster's Kubernetes version (prepared by `pull`, otherwise fetched on first use):
 
 `app.yaml` is user-provided. New workload images may require registry access after
 startup; the boot cache does not include every application. Ingress is not installed

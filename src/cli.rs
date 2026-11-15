@@ -29,7 +29,7 @@ pub struct Cli {
 #[structopt(rename_all = "kebab")]
 pub enum Command {
     Create(UpArgs),
-    /// Cache Lima node images, K3s and Cilium assets before starting fresh VMs.
+    /// Cache node images, K3s and Cilium assets before starting fresh nodes.
     Pull(UpArgs),
     /// Export stopped native VZ nodes, including credentials and VM-local data.
     Export(ExportArgs),
@@ -276,6 +276,9 @@ impl UpArgs {
         let mut spec = resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())?;
         if let Some(backend) = self.backend {
             spec.backend = backend;
+            if backend == BackendKind::AppleContainer {
+                "apple-container".clone_into(&mut spec.network);
+            }
         }
         if let Some(template) = self.template {
             spec.template = template;
@@ -533,8 +536,11 @@ fn merge_requested_cni(
 }
 
 fn parse_backend_kind(value: &str) -> std::result::Result<BackendKind, String> {
-    BackendKind::parse(value)
-        .ok_or_else(|| format!("unsupported backend `{value}`; expected one of: firecracker, lima"))
+    BackendKind::parse(value).ok_or_else(|| {
+        format!(
+            "unsupported backend `{value}`; expected one of: firecracker, lima, apple-container"
+        )
+    })
 }
 
 fn parse_log_level(value: &str) -> std::result::Result<Level, String> {

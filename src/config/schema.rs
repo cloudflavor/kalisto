@@ -29,9 +29,12 @@ impl KalistoConfig {
         if let Some(backend) = &self.cluster.backend {
             spec.backend = BackendKind::parse(backend).ok_or_else(|| {
                 Error::InvalidArgs(format!(
-                    "unsupported backend `{backend}` in kalisto.toml; expected one of: firecracker, lima"
+                    "unsupported backend `{backend}` in kalisto.toml; expected one of: firecracker, lima, apple-container"
                 ))
             })?;
+            if spec.backend == BackendKind::AppleContainer {
+                "apple-container".clone_into(&mut spec.network);
+            }
         }
         if let Some(template) = &self.cluster.template {
             spec.template.clone_from(template);

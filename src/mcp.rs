@@ -1630,7 +1630,7 @@ fn lifecycle_properties() -> Map<String, Value> {
         ("name".to_owned(), json!({ "type": "string" })),
         (
             "backend".to_owned(),
-            json!({ "type": "string", "enum": ["firecracker", "lima"] }),
+            json!({ "type": "string", "enum": ["firecracker", "lima", "apple-container"] }),
         ),
         ("template".to_owned(), json!({ "type": "string" })),
         (
@@ -2471,7 +2471,9 @@ fn parse_backend(value: &str) -> std::result::Result<BackendKind, JsonRpcError> 
     BackendKind::parse(value).ok_or_else(|| {
         jsonrpc_error(
             -32602,
-            format!("unsupported backend `{value}`; expected one of: firecracker, lima"),
+            format!(
+                "unsupported backend `{value}`; expected one of: firecracker, lima, apple-container"
+            ),
         )
     })
 }

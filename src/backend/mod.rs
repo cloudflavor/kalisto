@@ -1,3 +1,4 @@
+pub mod apple_container;
 pub mod firecracker;
 pub mod lima;
 pub mod runtime;
