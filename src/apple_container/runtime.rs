@@ -24,7 +24,8 @@ const PACKAGE_URL: &str = "https://github.com/apple/container/releases/download/
 const PACKAGE_SHA256: &str = "b6739caf3d47ca53a78f1a7edf32521420a75c7941838c3cefa75f30b80f5a97";
 const TEAM: &str = "UPBK2H6LZM";
 const API_LABEL: &str = "com.apple.container.apiserver";
-const IMAGES_LABEL: &str = "com.apple.container.core.container-core-images";
+const IMAGES_LABEL: &str = "com.apple.container.container-core-images";
+const IMAGES_MACH_SERVICE: &str = "com.apple.container.core.container-core-images";
 // ContainerPersistence/ContainerSystemConfig.swift at tag 1.7.1.
 const KERNEL_URL: &str = "https://github.com/kata-containers/kata-containers/releases/download/4.3.1/kata-static-4.3.1-arm64.tar.zst";
 const KERNEL_SHA256: &str = "2c5bf7cde334ad5307d482f45cceda496f91c9b6b96f5278c47f4f4eac1bbae6";
@@ -58,8 +59,15 @@ struct Prepared {
 }
 
 pub(crate) fn root() -> Result<PathBuf> {
-    std::path::absolute(artifacts_root()?.join("runtime-v1/apple-container-1.7.1-arm64"))
-        .map_err(io_error)
+    let artifacts = artifacts_root()?;
+    let artifacts = match artifacts.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::path::absolute(artifacts).map_err(io_error)?
+        }
+        Err(error) => return Err(io_error(error)),
+    };
+    Ok(artifacts.join("runtime-v1/apple-container-1.7.1-arm64"))
 }
 
 fn install_root() -> Result<PathBuf> {
@@ -214,6 +222,7 @@ pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
         let value = read_plist(runner, &plist)?;
         validate_plist(
             &value,
+            API_LABEL,
             API_LABEL,
             &install_root()?.join("bin/container-apiserver"),
         )?;
@@ -541,8 +550,8 @@ fn check_services(runner: &dyn CommandRunner, domain: &str) -> Result<bool> {
 }
 
 fn owned_service(output: &str, app: &Path, install: &Path) -> bool {
-    launchctl_value(output, "CONTAINER_APP_ROOT", "=>") == app.to_str()
-        && launchctl_value(output, "CONTAINER_INSTALL_ROOT", "=>") == install.to_str()
+    launchctl_value(output, "CONTAINER_APP_ROOT", "=>").map(Path::new) == Some(app)
+        && launchctl_value(output, "CONTAINER_INSTALL_ROOT", "=>").map(Path::new) == Some(install)
         && launchctl_value(output, "program", "=")
             .is_some_and(|program| Path::new(program).starts_with(install))
 }
@@ -571,8 +580,8 @@ fn validate_status(status: &Value, app: &Path, install: &Path) -> Result<()> {
         || status["server"]["version"] != VERSION
         || status["server"]["build"] != "release"
         || status["server"]["appName"] != "container-apiserver"
-        || status["paths"]["appRoot"].as_str() != app.to_str()
-        || status["paths"]["installRoot"].as_str() != install.to_str()
+        || status["paths"]["appRoot"].as_str().map(Path::new) != Some(app)
+        || status["paths"]["installRoot"].as_str().map(Path::new) != Some(install)
     {
         return Err(service_conflict(API_LABEL));
     }
@@ -587,7 +596,7 @@ fn confine_image_temporaries(runner: &dyn CommandRunner, domain: &str) -> Result
     let executable = install_root()?
         .join("libexec/container/plugins/container-core-images/bin/container-core-images");
     let mut value = read_plist(runner, &plist)?;
-    validate_plist(&value, IMAGES_LABEL, &executable)?;
+    validate_plist(&value, IMAGES_LABEL, IMAGES_MACH_SERVICE, &executable)?;
     let target = format!("{domain}/{IMAGES_LABEL}");
     let service = runner.run("/bin/launchctl", &strings(&["print", &target]))?;
     if !owned_service(&service.stdout, &app_root()?, &install_root()?) {
@@ -629,14 +638,23 @@ fn read_plist(runner: &dyn CommandRunner, path: &Path) -> Result<Value> {
     parse_json(&value.stdout, "Apple launchd plist")
 }
 
-fn validate_plist(value: &Value, label: &str, executable: &Path) -> Result<()> {
+fn validate_plist(value: &Value, label: &str, mach_service: &str, executable: &Path) -> Result<()> {
     if value["Label"] != label
-        || value["ProgramArguments"].get(0).and_then(Value::as_str) != executable.to_str()
+        || value["ProgramArguments"]
+            .get(0)
+            .and_then(Value::as_str)
+            .map(Path::new)
+            != Some(executable)
         || value["ProgramArguments"].get(1).and_then(Value::as_str) != Some("start")
-        || value["EnvironmentVariables"]["CONTAINER_APP_ROOT"].as_str() != app_root()?.to_str()
-        || value["EnvironmentVariables"]["CONTAINER_INSTALL_ROOT"].as_str()
-            != install_root()?.to_str()
-        || value["MachServices"][label] != true
+        || value["EnvironmentVariables"]["CONTAINER_APP_ROOT"]
+            .as_str()
+            .map(Path::new)
+            != Some(app_root()?.as_path())
+        || value["EnvironmentVariables"]["CONTAINER_INSTALL_ROOT"]
+            .as_str()
+            .map(Path::new)
+            != Some(install_root()?.as_path())
+        || value["MachServices"][mach_service] != true
     {
         return Err(service_conflict(label));
     }
@@ -900,5 +918,15 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn service_ownership_accepts_owned_directory_urls_with_trailing_separators() {
+        let output = "program = /kalisto/install/bin/container-apiserver\nCONTAINER_APP_ROOT => /kalisto/service/\nCONTAINER_INSTALL_ROOT => /kalisto/install/";
+        assert!(owned_service(
+            output,
+            Path::new("/kalisto/service"),
+            Path::new("/kalisto/install")
+        ));
     }
 }
