@@ -376,6 +376,10 @@ pub struct ExportArgs {
 }
 
 impl ExportArgs {
+    /// # Errors
+    ///
+    /// Returns an error if prompting fails, passphrases do not match, or encryption
+    /// options, recipients, or passphrase files are invalid.
     pub fn encryption(&self) -> crate::error::Result<crate::archive::ExportEncryption> {
         if self.passphrase {
             crate::archive::ExportEncryption::with_passphrase(prompt_archive_passphrase(true)?)
@@ -413,6 +417,9 @@ pub struct ImportArgs {
 }
 
 impl ImportArgs {
+    /// # Errors
+    ///
+    /// Returns an error if prompting fails or credential options or files are invalid.
     pub fn decryption(&self) -> crate::error::Result<crate::archive::ImportDecryption> {
         if self.passphrase {
             Ok(crate::archive::ImportDecryption::Passphrase(

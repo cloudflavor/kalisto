@@ -56,7 +56,7 @@ impl Scratch {
                         .map_err(io_error)?;
                     return Ok(Self(path));
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(io_error(error)),
             }
         }
@@ -78,6 +78,10 @@ pub fn private_file(path: &Path) -> Result<File> {
         .map_err(io_error)
 }
 
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Archive payload names form a case-sensitive format allowlist."
+)]
 pub fn valid_path(path: &str) -> bool {
     if path.len() > 99 || path.contains('\\') || path.contains('\0') {
         return false;
@@ -256,6 +260,10 @@ pub fn verify(input: &Path, max_bytes: u64) -> Result<Manifest> {
     read_impl(ImportDecryption::None.reader(input)?, None, max_bytes)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep streaming verification and publication checks in their execution order."
+)]
 fn read_impl(reader: impl Read, stage: Option<&Path>, max_bytes: u64) -> Result<Manifest> {
     let decoder = GzDecoder::new(BufReader::new(reader));
     let mut tar = tar::Archive::new(decoder);
@@ -323,7 +331,7 @@ fn read_impl(reader: impl Read, stage: Option<&Path>, max_bytes: u64) -> Result<
                 if buffer[..count].iter().any(|byte| *byte != 0) {
                     file.write_all(&buffer[..count]).map_err(io_error)?;
                 } else {
-                    file.seek(SeekFrom::Current(count as i64))
+                    file.seek(SeekFrom::Start(copied + count as u64))
                         .map_err(io_error)?;
                 }
             }

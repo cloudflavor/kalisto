@@ -1499,6 +1499,10 @@ fn tool_definition(tool: &ToolSpec) -> Value {
     definition
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the tool schema inventory together for protocol review."
+)]
 fn input_schema(tool_name: &str) -> Value {
     match tool_name {
         "clusters.status" | "clusters.stats" | "clusters.state" | "clusters.kubeconfig" => {

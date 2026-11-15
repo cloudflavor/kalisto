@@ -23,6 +23,11 @@ pub enum ExportEncryption {
 }
 impl ExportEncryption {
     /// Read public recipients or a private passphrase file. Mutually exclusive.
+    ///
+    /// # Errors
+    ///
+    /// Rejects conflicting options, invalid or excessive recipients, and unreadable,
+    /// insecure, or invalid passphrase files.
     pub fn from_files(recipients: &[String], passphrase_file: Option<&Path>) -> Result<Self> {
         if !recipients.is_empty() && passphrase_file.is_some() {
             return Err(invalid("choose age recipients OR a passphrase, not both"));
@@ -47,6 +52,9 @@ impl ExportEncryption {
         Ok(Self::Recipients(keys))
     }
 
+    /// # Errors
+    ///
+    /// Rejects passphrases shorter than 16 characters.
     pub fn with_passphrase(passphrase: SecretString) -> Result<Self> {
         if passphrase.expose_secret().chars().count() < 16 {
             return Err(invalid(
@@ -56,6 +64,7 @@ impl ExportEncryption {
         Ok(Self::Passphrase(passphrase))
     }
 
+    #[must_use]
     pub fn is_encrypted(&self) -> bool {
         !matches!(self, Self::Plaintext)
     }
@@ -87,6 +96,10 @@ pub enum ImportDecryption {
     Passphrase(SecretString),
 }
 impl ImportDecryption {
+    /// # Errors
+    ///
+    /// Rejects conflicting options, invalid or excessive identities, and unreadable,
+    /// insecure, or invalid credential files.
     pub fn from_files(identity_files: &[PathBuf], passphrase_file: Option<&Path>) -> Result<Self> {
         if !identity_files.is_empty() && passphrase_file.is_some() {
             return Err(invalid(
@@ -210,6 +223,11 @@ fn read_passphrase(path: &Path) -> Result<SecretString> {
 
 /// Create a native age identity without external age-keygen; return public key only.
 /// The secret destination must not exist, and is never included in normal output.
+///
+/// # Errors
+///
+/// Returns an error if private staging or key publication fails, including when
+/// the destination already exists.
 pub fn generate_identity(output: &Path) -> Result<String> {
     let identity = age::x25519::Identity::generate();
     let public = identity.to_public().to_string();

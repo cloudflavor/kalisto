@@ -44,12 +44,22 @@ pub struct ImportOutcome {
 
 /// Export stopped native VZ nodes. `stop` authorizes clean OS shutdown, not force.
 /// Applications must be quiesced by their owner when application consistency matters.
+///
+/// # Errors
+///
+/// Returns an error on unsupported hosts, invalid cluster state, running nodes
+/// without stop consent, or failures reading payloads or publishing the archive.
 pub fn export(name: &str, output: &Path, stop: bool) -> Result<ExportOutcome> {
     require_macos()?;
     export_encrypted(name, output, stop, &ExportEncryption::Plaintext)
 }
 
 /// Stream gzip directly into an age envelope when protection is selected.
+///
+/// # Errors
+///
+/// Returns an error on unsupported hosts, invalid cluster or encryption settings,
+/// or failures stopping nodes, reading payloads, or publishing the archive.
 pub fn export_encrypted(
     name: &str,
     output: &Path,
@@ -60,6 +70,10 @@ pub fn export_encrypted(
     export_protected_with_runner(name, output, stop, &SystemRunner, protection)
 }
 
+/// # Errors
+///
+/// Returns an error for invalid cluster state, missing stop consent, or failures
+/// running host tools, reading payloads, or publishing the archive.
 pub fn export_with_runner(
     name: &str,
     output: &Path,
@@ -69,6 +83,14 @@ pub fn export_with_runner(
     export_protected_with_runner(name, output, stop, runner, &ExportEncryption::Plaintext)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the cold export transaction and stopped-state checks in execution order."
+)]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Runtime filenames must match the archive format's case-sensitive allowlist."
+)]
 pub(crate) fn export_protected_with_runner(
     name: &str,
     output: &Path,
@@ -199,12 +221,22 @@ pub(crate) fn export_protected_with_runner(
 
 /// Verify and restore a trusted archive. Does not overwrite, rename, or start nodes.
 /// Verified managed host tools may be downloaded if the target has not prepared them.
+///
+/// # Errors
+///
+/// Rejects unsupported hosts, invalid archives, incompatible state, and existing
+/// destinations; also reports host-tool preparation and filesystem failures.
 pub fn import(input: &Path, api_port: Option<u16>, max_bytes: u64) -> Result<ImportOutcome> {
     require_macos()?;
     import_encrypted(input, api_port, max_bytes, &ImportDecryption::None)
 }
 
 /// Fully authenticate/decompress/check all payloads before publishing any VM.
+///
+/// # Errors
+///
+/// Rejects unsupported hosts, invalid credentials or archives, incompatible state,
+/// and existing destinations; also reports host-tool and filesystem failures.
 pub fn import_encrypted(
     input: &Path,
     api_port: Option<u16>,
@@ -233,6 +265,10 @@ pub(crate) fn import_with_runner(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep validation, destination reservation, and final publication in transaction order."
+)]
 pub(crate) fn import_protected_with_runner(
     input: &Path,
     api_port: Option<u16>,
@@ -472,10 +508,10 @@ fn spec_for(state: &ClusterState) -> Result<ClusterSpec> {
         std::env::current_dir().map_err(io_error)?,
     );
     spec.backend = state.backend;
-    spec.k3s_version = state.k3s_version.clone();
+    spec.k3s_version.clone_from(&state.k3s_version);
     spec.cni_plugin = state.cni_plugin;
-    spec.cilium_version = state.cilium_version.clone();
-    spec.addons = state.addons.clone();
+    spec.cilium_version.clone_from(&state.cilium_version);
+    spec.addons.clone_from(&state.addons);
     spec.component_toggles = state.component_toggles;
     Ok(spec)
 }
@@ -674,9 +710,12 @@ fn copy_payload(source: &Path, destination: &Path) -> Result<()> {
         if buffer[..count].iter().any(|byte| *byte != 0) {
             output.write_all(&buffer[..count]).map_err(io_error)?;
         } else {
-            output
-                .seek(SeekFrom::Current(count as i64))
-                .map_err(io_error)?;
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "Read count is bounded by the 1 MiB buffer."
+            )]
+            let offset = count as i64;
+            output.seek(SeekFrom::Current(offset)).map_err(io_error)?;
         }
     }
     output.sync_all().map_err(io_error)
