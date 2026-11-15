@@ -170,8 +170,8 @@ pub(crate) fn export_protected_with_runner(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let stage = Scratch::new(parent)?;
-    let staged = stage.0.join("snapshot.kalisto");
+    let scratch = Scratch::new(parent)?;
+    let staged = scratch.0.join("snapshot.kalisto");
     format::write_protected(&staged, manifest, &sources, protection)?;
     if !protection.is_encrypted() {
         format::verify(&staged, DEFAULT_MAX_BYTES)?;
@@ -247,8 +247,8 @@ pub(crate) fn import_protected_with_runner(
     if api_port == Some(0) {
         return Err(invalid("API port must be between 1 and 65535"));
     }
-    let stage = Scratch::new(&data_root()?.join("archive-staging"))?;
-    let manifest = format::read_protected(input, &stage.0, max_bytes, credentials)?;
+    let scratch = Scratch::new(&data_root()?.join("archive-staging"))?;
+    let manifest = format::read_protected(input, &scratch.0, max_bytes, credentials)?;
     if manifest.architecture != std::env::consts::ARCH
         || manifest.lima_version != crate::runtime::LIMA_VERSION
     {
@@ -268,7 +268,7 @@ pub(crate) fn import_protected_with_runner(
         ));
     }
     let home = lima_home()?;
-    let expected = expected_payloads(&state, &stage.0)?;
+    let expected = expected_payloads(&state, &scratch.0)?;
     if manifest
         .files
         .iter()
@@ -295,7 +295,7 @@ pub(crate) fn import_protected_with_runner(
         }
     }
     let spec = spec_for(&state)?;
-    crate::pull::load_from_root(&spec, &stage.0.join("assets"))?;
+    crate::pull::load_from_root(&spec, &scratch.0.join("assets"))?;
     if prepare_tools {
         crate::runtime::prepare(
             runner,
@@ -320,10 +320,10 @@ pub(crate) fn import_protected_with_runner(
     let archive_root = root.join("archive");
     fs::create_dir(&archive_root).map_err(io_error)?;
     copy_payload(
-        &stage.0.join("base-image"),
+        &scratch.0.join("base-image"),
         &archive_root.join("base-image"),
     )?;
-    fs::rename(stage.0.join("assets"), archive_root.join("assets")).map_err(io_error)?;
+    fs::rename(scratch.0.join("assets"), archive_root.join("assets")).map_err(io_error)?;
     let template = json!({"vmType":"vz","mountType":"virtiofs","mounts":[],"containerd":{"system":false,"user":false},
         "images":[{"location":archive_root.join("base-image"),"arch":crate::cluster::spec::ImageArch::host_default().lima_template_value()}]});
     write_json(&root.join("archive/node.yaml"), &template)?;
@@ -332,10 +332,10 @@ pub(crate) fn import_protected_with_runner(
         let dir = home.join(&node.name);
         reserve(&dir, &mut owned)?;
         copy_payload(
-            &stage.0.join(format!("nodes/{index}/disk")),
+            &scratch.0.join(format!("nodes/{index}/disk")),
             &dir.join("disk"),
         )?;
-        let firmware = stage.0.join(format!("nodes/{index}/vz-efi"));
+        let firmware = scratch.0.join(format!("nodes/{index}/vz-efi"));
         if firmware.is_file() {
             copy_payload(&firmware, &dir.join("vz-efi"))?;
         }
@@ -351,7 +351,7 @@ pub(crate) fn import_protected_with_runner(
                 &node.name
             });
         fs::create_dir_all(&node.artifacts_root).map_err(io_error)?;
-        let runtime = stage.0.join(format!("runtime/{index}"));
+        let runtime = scratch.0.join(format!("runtime/{index}"));
         if runtime.is_dir() {
             for entry in fs::read_dir(runtime).map_err(io_error)? {
                 let file = entry.map_err(io_error)?;
@@ -443,17 +443,17 @@ pub(crate) fn wait_for_fresh_nodes(
     Ok(())
 }
 
-fn expected_payloads(state: &ClusterState, stage: &Path) -> Result<BTreeSet<String>> {
+fn expected_payloads(state: &ClusterState, directory: &Path) -> Result<BTreeSet<String>> {
     let mut expected = BTreeSet::from(["base-image".into(), "assets/manifest.json".into()]);
     let spec = spec_for(state)?;
-    let assets = crate::pull::load_from_root(&spec, &stage.join("assets"))?;
+    let assets = crate::pull::load_from_root(&spec, &directory.join("assets"))?;
     expected.extend(assets.filenames().map(|file| format!("assets/{file}")));
     for (index, _) in state.nodes.iter().enumerate() {
         expected.insert(format!("nodes/{index}/disk"));
-        if stage.join(format!("nodes/{index}/vz-efi")).is_file() {
+        if directory.join(format!("nodes/{index}/vz-efi")).is_file() {
             expected.insert(format!("nodes/{index}/vz-efi"));
         }
-        let runtime = stage.join(format!("runtime/{index}"));
+        let runtime = directory.join(format!("runtime/{index}"));
         if runtime.is_dir() {
             for file in fs::read_dir(runtime).map_err(io_error)? {
                 let file = file.map_err(io_error)?;

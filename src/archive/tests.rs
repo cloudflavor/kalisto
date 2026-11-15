@@ -342,13 +342,13 @@ fn encrypted_restore_authenticates_before_publishing_state_or_virtual_machines()
     let state = environment.state();
     // Deterministic fixture noise forces several age chunks; corrupt the final
     // tag only after earlier decrypted payload bytes have reached private staging.
-    let mut value = 0x1234abcd_u32;
+    let mut value = 0x1234_abcd_u32;
     let disk = (0..256 * 1024)
         .map(|_| {
             value ^= value << 13;
             value ^= value >> 17;
             value ^= value << 5;
-            value as u8
+            value.to_le_bytes()[0]
         })
         .collect::<Vec<_>>();
     fs::write(

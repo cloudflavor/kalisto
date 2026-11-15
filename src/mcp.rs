@@ -1012,8 +1012,7 @@ impl McpServer {
             return self.write_error(
                 id,
                 -32602,
-                "archive tasks cannot be cancelled while copying/publishing; wait for completion"
-                    .to_owned(),
+                "archive tasks cannot be cancelled while copying/publishing; wait for completion",
             );
         }
         if record.is_terminal() {
