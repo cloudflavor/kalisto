@@ -475,23 +475,28 @@ fn prepare_kernel(runner: &dyn CommandRunner) -> Result<()> {
         "kata-static-4.3.1-arm64.tar.zst",
     )?;
     let scratch = Scratch::new(&root()?, "kernel")?;
-    runner.run(
-        "/usr/bin/tar",
-        &strings(&[
-            "-xf",
-            path_str(&archive)?,
-            "-C",
-            path_str(&scratch.0)?,
-            KERNEL_MEMBER,
-        ]),
-    )?;
-    let binary = scratch.0.join(KERNEL_MEMBER);
-    let resolved = binary.canonicalize().map_err(io_error)?;
-    if !resolved.starts_with(scratch.0.canonicalize().map_err(io_error)?) || !resolved.is_file() {
-        return Err(invalid(
-            "recommended Apple kernel escapes its extraction directory",
-        ));
+    let compressed = fs::File::open(&archive).map_err(io_error)?;
+    let decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+        .map_err(|error| invalid(format!("invalid compressed Apple kernel archive: {error}")))?;
+    let mut archive = tar::Archive::new(decoder);
+    let binary = scratch.0.join(KERNEL_FILENAME);
+    for entry in archive.entries().map_err(io_error)? {
+        let mut entry = entry.map_err(io_error)?;
+        let path = entry.path().map_err(io_error)?;
+        let path = path.strip_prefix("./").unwrap_or(&path);
+        if path != Path::new(KERNEL_MEMBER) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(invalid(
+                "Apple kernel archive member must be a regular file",
+            ));
+        }
+        let mut output = fs::File::create_new(&binary).map_err(io_error)?;
+        std::io::copy(&mut entry, &mut output).map_err(io_error)?;
+        break;
     }
+    file_size(&binary)?;
     run(
         runner,
         &strings(&[

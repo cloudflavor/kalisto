@@ -85,7 +85,8 @@ or an external registry to bootstrap prepared nodes. Lima remains the macOS defa
 kernel and init image, and composes a digest-pinned Ubuntu/k3s node image. A temporary
 ordinary container installs Linux prerequisites, then is deleted; no cluster identity
 is baked into the reusable image. The cached node OCI archive can restore a pruned
-runtime image store when `pull` is repeated.
+runtime image store when `pull` is repeated. Kernel extraction runs in Rust and
+does not require a host `zstd` executable.
 
 `up` requires the local node image and prepared assets; it never installs tools,
 pulls missing images, or changes the selected CNI. Nodes start concurrently on an
