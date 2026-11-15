@@ -7,7 +7,7 @@ use crate::cluster::spec::ImageArch;
 use crate::error::{Error, Result};
 use crate::process::CommandRunner;
 
-const RELEASE_URL_BASE: &str = "https://github.com/k3s-io/k3s/releases/download";
+const RELEASE_URL_BASE: &str = "https://dl.k8s.io/release";
 
 /// # Errors
 ///
@@ -28,13 +28,19 @@ pub fn binary(version: &str, runner: &dyn CommandRunner) -> Result<PathBuf> {
         ));
     }
     let arch = ImageArch::host_default().lima_artifact_suffix();
-    let binary_name = if arch == "arm64" {
-        "kubectl-arm64"
-    } else {
-        "kubectl"
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => {
+            return Err(Error::InvalidArgs(format!(
+                "managed kubectl is not supported on {other}"
+            )));
+        }
     };
-    let checksum_name = format!("{binary_name}.sha256");
-    let release = format!("{RELEASE_URL_BASE}/{version}");
+    let kubernetes_version = version.split('+').next().unwrap_or(version);
+    let binary_name = "kubectl";
+    let checksum_name = "kubectl.sha256";
+    let release = format!("{RELEASE_URL_BASE}/{kubernetes_version}/bin/{os}/{arch}");
     let root = artifacts_root(version)?;
     let checksum_path = artifact::fetch_into_cache(
         runner,
@@ -61,7 +67,12 @@ fn artifacts_root(version: &str) -> Result<PathBuf> {
     Ok(crate::paths::artifacts_root()?
         .join("downloads")
         .join(version)
-        .join("host-kubectl"))
+        .join("host-kubectl")
+        .join(format!(
+            "{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )))
 }
 
 fn expected_checksum(checksum_path: &Path) -> Result<String> {
