@@ -713,7 +713,10 @@ fn install_remote_yaml_addon(
     progress.set_message(&format!("Applying add-on {} manifest", spec.addon.as_str()));
     apply_guest_manifest(backend, runner, control_plane, &manifest_path, &manifest)?;
     if should_wait_for_addons() {
-        progress.set_message(&format!("Waiting for add-on {} rollout", spec.addon.as_str()));
+        progress.set_message(&format!(
+            "Waiting for add-on {} rollout",
+            spec.addon.as_str()
+        ));
         let wait_command = spec.wait_command_template.replace(
             "{kubeconfig}",
             shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()).as_str(),

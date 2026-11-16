@@ -907,7 +907,10 @@ fn install_addons_and_wait_for_nodes(
     // Agents must register before CNI installation, but cannot become Ready
     // until CNI is installed. This applies to Flannel as well as Cilium.
     if cni != CniPlugin::None && server_mode != ServerMode::Agentless {
-        let progress = Progress::bar("Checking node readiness after CNI", workers.len() as u64 + 1);
+        let progress = Progress::bar(
+            "Checking node readiness after CNI",
+            workers.len() as u64 + 1,
+        );
         for node in std::iter::once(control_plane).chain(workers.iter()) {
             progress.set_message(&format!("Waiting for node {} readiness", node.name));
             info!(node = %node.name, "waiting for node readiness after CNI bootstrap");
@@ -1486,10 +1489,6 @@ fn install_addon_at_root(
             );
         }
     }
-    progress.finish(&format!(
-        "Add-on {} installation operation complete",
-        addon_id.as_str()
-    ));
 
     Ok(AddonInstallOutcome {
         cluster: state.name,

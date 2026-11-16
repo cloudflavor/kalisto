@@ -493,6 +493,23 @@ fn cold_cli_boot(backend: BackendKind) {
                 .expect("observation timeout should be seconds")
         })
         .max(60);
+    if backend == BackendKind::AppleContainer {
+        let trace = fs::File::create(evidence.join("up.log")).unwrap();
+        let mut graphical = Command::new("/usr/bin/script");
+        graphical
+            .args(["-q", "/dev/null"])
+            .arg(command.get_program())
+            .args(command.get_args())
+            .env_remove("RUST_LOG")
+            .env_remove("CI")
+            .env_remove("NO_COLOR")
+            .env("TERM", "xterm-256color")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .current_dir(&workspace)
+            .stdout(Stdio::from(trace.try_clone().unwrap()))
+            .stderr(Stdio::from(trace));
+        command = graphical;
+    }
     let started = Instant::now();
     let deadline = started + Duration::from_secs(observation_seconds);
     drop(port_reservation);

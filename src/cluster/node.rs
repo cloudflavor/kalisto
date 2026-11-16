@@ -205,7 +205,10 @@ pub fn start_node_instance(
         progress.set_message(&format!("Staging cached boot assets on {}", node.name));
         assets.stage_node(backend, runner, node)?;
     }
-    progress.finish(&format!("Node {} started; Kubernetes checks pending", node.name));
+    progress.finish(&format!(
+        "Node {} started; Kubernetes checks pending",
+        node.name
+    ));
     Ok(output)
 }
 
