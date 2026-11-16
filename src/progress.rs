@@ -2,10 +2,12 @@
 
 use std::io::{IsTerminal, stderr, stdout};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use indicatif::ProgressStyle;
 use tracing::Span;
 use tracing_indicatif::IndicatifLayer;
+use tracing_indicatif::TickSettings;
 use tracing_indicatif::filter::IndicatifFilter;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_subscriber::EnvFilter;
@@ -58,7 +60,13 @@ pub(crate) fn init(
     let interactive = allow_progress && terminal && capable && !explicit_logging && !ci;
     let result = if interactive {
         let styles = Styles::new(color).map_err(|error| error.to_string())?;
-        let layer = IndicatifLayer::new().with_progress_style(styles.spinner.clone());
+        let layer = IndicatifLayer::new()
+            .with_progress_style(styles.spinner.clone())
+            .with_tick_settings(TickSettings {
+                term_draw_hz: 10,
+                default_tick_interval: Some(Duration::from_millis(100)),
+                ..TickSettings::default()
+            });
         let writer = layer.get_stderr_writer();
         STYLES
             .set(styles)
