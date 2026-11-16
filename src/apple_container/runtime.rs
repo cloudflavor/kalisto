@@ -56,18 +56,36 @@ struct Selection {
 impl Selection {
     fn validate(&self) -> Result<()> {
         if self.version != VERSION {
-            return Err(invalid("incompatible Apple runtime selection; run `kalisto pull`"));
+            return Err(invalid(
+                "incompatible Apple runtime selection; run `kalisto pull`",
+            ));
         }
-        for path in [&self.executable, &self.api_program, &self.install_root, &self.app_root] {
+        for path in [
+            &self.executable,
+            &self.api_program,
+            &self.install_root,
+            &self.app_root,
+        ] {
             validate_absolute(path)?;
         }
-        let parent = self.executable.parent().ok_or_else(|| invalid("Apple CLI has no parent"))?;
-        if self.executable.file_name().is_none_or(|name| name != "container")
+        let parent = self
+            .executable
+            .parent()
+            .ok_or_else(|| invalid("Apple CLI has no parent"))?;
+        if self
+            .executable
+            .file_name()
+            .is_none_or(|name| name != "container")
             || self.api_program != parent.join("container-apiserver")
-            || !matches!(parent.file_name().and_then(|name| name.to_str()), Some("bin" | "cli"))
+            || !matches!(
+                parent.file_name().and_then(|name| name.to_str()),
+                Some("bin" | "cli")
+            )
             || parent.parent() != Some(self.install_root.as_path())
         {
-            return Err(invalid("Apple runtime executable does not match its installation layout"));
+            return Err(invalid(
+                "Apple runtime executable does not match its installation layout",
+            ));
         }
         if self.managed
             && (self.install_root != root()?.join("install")
@@ -127,8 +145,11 @@ fn load_selection_at(path: &Path) -> Result<Option<Selection>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(error)),
     };
-    let selected: Selection = serde_json::from_slice(&bytes)
-        .map_err(|error| invalid(format!("invalid Apple runtime selection: {error}; run `kalisto pull`")))?;
+    let selected: Selection = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(format!(
+            "invalid Apple runtime selection: {error}; run `kalisto pull`"
+        ))
+    })?;
     selected.validate()?;
     Ok(Some(selected))
 }
@@ -181,17 +202,21 @@ fn configure_selection(command: &mut Command, selected: &Selection) -> Result<()
         .env("TMPDIR", root()?.join("tmp"))
         .env_remove("SSH_AUTH_SOCK");
     if selected.managed {
-        command
-            .env("XDG_CONFIG_HOME", root()?.join("config-home"));
+        command.env("XDG_CONFIG_HOME", root()?.join("config-home"));
     }
     Ok(())
 }
 
 fn validate_absolute(path: &Path) -> Result<()> {
     if !path.is_absolute()
-        || path.components().any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
     {
-        return Err(invalid(format!("Apple runtime requires an absolute normalized path: {}", path.display())));
+        return Err(invalid(format!(
+            "Apple runtime requires an absolute normalized path: {}",
+            path.display()
+        )));
     }
     path_str(path)?;
     Ok(())
@@ -242,8 +267,14 @@ fn service_selection(output: &str) -> Result<Selection> {
 fn validate_installation(selected: &Selection) -> Result<()> {
     let canonical = selected.install_root.canonicalize().map_err(io_error)?;
     for file in selected.runtime_files() {
-        if !file.canonicalize().map_err(io_error)?.starts_with(&canonical) {
-            return Err(invalid("Apple runtime executable escapes its selected installation"));
+        if !file
+            .canonicalize()
+            .map_err(io_error)?
+            .starts_with(&canonical)
+        {
+            return Err(invalid(
+                "Apple runtime executable escapes its selected installation",
+            ));
         }
         file_size(&file)?;
     }
@@ -287,16 +318,26 @@ fn candidate_run(
 
 fn registered_services(runner: &dyn CommandRunner) -> Result<Vec<String>> {
     let services = runner.run("/bin/launchctl", &strings(&["list"]))?;
-    Ok(services.stdout.lines()
+    Ok(services
+        .stdout
+        .lines()
         .filter_map(|line| line.split_whitespace().nth(2))
         .filter(|label| label.starts_with("com.apple.container."))
         .map(str::to_owned)
         .collect())
 }
 
-fn verify_selected_services(runner: &dyn CommandRunner, domain: &str, labels: &[String], selected: &Selection) -> Result<()> {
+fn verify_selected_services(
+    runner: &dyn CommandRunner,
+    domain: &str,
+    labels: &[String],
+    selected: &Selection,
+) -> Result<()> {
     for label in labels {
-        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{label}")]))?;
+        let service = runner.run(
+            "/bin/launchctl",
+            &strings(&["print", &format!("{domain}/{label}")]),
+        )?;
         if !owned_service(&service.stdout, &selected.app_root, &selected.install_root)
             || (label == API_LABEL
                 && launchctl_value(&service.stdout, "program", "=").map(Path::new)
@@ -308,17 +349,32 @@ fn verify_selected_services(runner: &dyn CommandRunner, domain: &str, labels: &[
     Ok(())
 }
 
-fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::ffi::OsStr>) -> Result<Selection> {
+fn select_runtime(
+    runner: &dyn CommandRunner,
+    domain: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<Selection> {
     let labels = registered_services(runner)?;
     if labels.iter().any(|label| label == API_LABEL) {
-        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{API_LABEL}")]))?;
+        let service = runner.run(
+            "/bin/launchctl",
+            &strings(&["print", &format!("{domain}/{API_LABEL}")]),
+        )?;
         let selected = service_selection(&service.stdout)?;
         let version = candidate_run(runner, &selected, &strings(&["--version"]))?;
         if !valid_cli_version(version.stdout.trim()) {
             return Err(service_conflict(API_LABEL));
         }
-        let status = candidate_run(runner, &selected, &strings(&["system", "status", "--format", "json"]))?;
-        validate_status(&parse_json(&status.stdout, "Apple service status")?, &selected.app_root, &selected.install_root)?;
+        let status = candidate_run(
+            runner,
+            &selected,
+            &strings(&["system", "status", "--format", "json"]),
+        )?;
+        validate_status(
+            &parse_json(&status.stdout, "Apple service status")?,
+            &selected.app_root,
+            &selected.install_root,
+        )?;
         validate_installation(&selected)?;
         verify_selected_services(runner, domain, &labels, &selected)?;
         return Ok(selected);
@@ -327,7 +383,10 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
     // them merely because the API service is absent.
     if let Some(label) = labels.first() {
         let managed = managed_selection()?;
-        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{label}")]))?;
+        let service = runner.run(
+            "/bin/launchctl",
+            &strings(&["print", &format!("{domain}/{label}")]),
+        )?;
         if !owned_service(&service.stdout, &managed.app_root, &managed.install_root) {
             return Err(service_conflict(label));
         }
@@ -344,8 +403,13 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(io_error(error)),
             };
-            let parent = executable.parent().ok_or_else(|| invalid("Apple CLI has no parent"))?;
-            let install_root = parent.parent().ok_or_else(|| invalid("Apple CLI has no install root"))?.to_path_buf();
+            let parent = executable
+                .parent()
+                .ok_or_else(|| invalid("Apple CLI has no parent"))?;
+            let install_root = parent
+                .parent()
+                .ok_or_else(|| invalid("Apple CLI has no install root"))?
+                .to_path_buf();
             // Homebrew's bin/container is a shell wrapper exporting an opt/
             // install root. Use the actual cli/ siblings, not that wrapper.
             let executable = if parent.file_name().is_some_and(|name| name == "bin")
@@ -355,7 +419,8 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
             } else {
                 executable
             };
-            let home = std::env::var_os("HOME").filter(|home| !home.is_empty())
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
                 .ok_or_else(|| invalid("HOME is required for an installed Apple runtime"))?;
             let selected = Selection {
                 version: VERSION.into(),
@@ -363,7 +428,8 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
                 api_program: executable.with_file_name("container-apiserver"),
                 executable,
                 install_root,
-                app_root: PathBuf::from(home).join("Library/Application Support/com.apple.container"),
+                app_root: PathBuf::from(home)
+                    .join("Library/Application Support/com.apple.container"),
             };
             let version = candidate_run(runner, &selected, &strings(&["--version"]))?;
             if !valid_cli_version(version.stdout.trim()) {
@@ -373,7 +439,7 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
             match validate_installation(&selected) {
                 Ok(()) => return Ok(selected),
                 Err(Error::CommandIo { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound => continue,
+                    if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
@@ -383,12 +449,18 @@ fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::f
 
 fn start_service(runner: &dyn CommandRunner, domain: &str, selected: &Selection) -> Result<()> {
     if selected.managed {
-        run(runner, &[
-            "system".into(), "start".into(),
-            "--app-root".into(), selected.app_root.display().to_string(),
-            "--install-root".into(), selected.install_root.display().to_string(),
-            "--disable-kernel-install".into(),
-        ])?;
+        run(
+            runner,
+            &[
+                "system".into(),
+                "start".into(),
+                "--app-root".into(),
+                selected.app_root.display().to_string(),
+                "--install-root".into(),
+                selected.install_root.display().to_string(),
+                "--disable-kernel-install".into(),
+            ],
+        )?;
     } else {
         // SystemStart copies user configuration and overwrites the shared API
         // plist. Register a Kalisto-local plist instead; never edit either.
@@ -405,8 +477,14 @@ fn start_service(runner: &dyn CommandRunner, domain: &str, selected: &Selection)
             "MachServices": { (API_LABEL): true },
         });
         publish_json(&plist, &value)?;
-        runner.run("/usr/bin/plutil", &strings(&["-convert", "xml1", path_str(&plist)?]))?;
-        runner.run("/bin/launchctl", &strings(&["bootstrap", domain, path_str(&plist)?]))?;
+        runner.run(
+            "/usr/bin/plutil",
+            &strings(&["-convert", "xml1", path_str(&plist)?]),
+        )?;
+        runner.run(
+            "/bin/launchctl",
+            &strings(&["bootstrap", domain, path_str(&plist)?]),
+        )?;
     }
     Ok(())
 }
@@ -429,8 +507,16 @@ fn prepare_service(runner: &dyn CommandRunner, domain: &str, selected: &Selectio
     if !labels.iter().any(|label| label == API_LABEL) {
         start_service(runner, domain, selected)?;
     }
-    let status = candidate_run(runner, selected, &strings(&["system", "status", "--format", "json"]))?;
-    validate_status(&parse_json(&status.stdout, "Apple service status")?, &selected.app_root, &selected.install_root)
+    let status = candidate_run(
+        runner,
+        selected,
+        &strings(&["system", "status", "--format", "json"]),
+    )?;
+    validate_status(
+        &parse_json(&status.stdout, "Apple service status")?,
+        &selected.app_root,
+        &selected.install_root,
+    )
 }
 
 pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
@@ -507,7 +593,12 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
 pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
     check_platform(runner)?;
     let prepared = load_prepared()?;
-    for (path, expected) in prepared.selection.runtime_files().iter().zip(&prepared.runtime_sizes) {
+    for (path, expected) in prepared
+        .selection
+        .runtime_files()
+        .iter()
+        .zip(&prepared.runtime_sizes)
+    {
         verify_file(path, *expected)?;
     }
     verify_version(runner)?;
@@ -518,7 +609,9 @@ pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
     let domain = launchd_domain(runner)?;
     if !check_services(runner, &domain)? {
         if !prepared.selection.managed {
-            return Err(invalid("selected borrowed Apple service is not running; start it with its `container system start` before offline `kalisto up`"));
+            return Err(invalid(
+                "selected borrowed Apple service is not running; start it with its `container system start` before offline `kalisto up`",
+            ));
         }
         let plist = app_root()?.join("apiserver/apiserver.plist");
         let value = read_plist(runner, &plist)?;
@@ -803,8 +896,12 @@ fn prepare_kernel(runner: &dyn CommandRunner) -> Result<()> {
     }
     file_size(&binary)?;
     let destination = kernel_path()?;
-    fs::create_dir_all(destination.parent().ok_or_else(|| invalid("kernel has no parent"))?)
-        .map_err(io_error)?;
+    fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or_else(|| invalid("kernel has no parent"))?,
+    )
+    .map_err(io_error)?;
     fs::rename(binary, destination).map_err(io_error)?;
     Ok(())
 }
@@ -836,11 +933,10 @@ fn check_services(runner: &dyn CommandRunner, domain: &str) -> Result<bool> {
 fn owned_service(output: &str, app: &Path, install: &Path) -> bool {
     launchctl_value(output, "CONTAINER_APP_ROOT", "=>").map(Path::new) == Some(app)
         && launchctl_value(output, "CONTAINER_INSTALL_ROOT", "=>").map(Path::new) == Some(install)
-        && launchctl_value(output, "program", "=")
-            .is_some_and(|program| {
-                let program = Path::new(program);
-                validate_absolute(program).is_ok() && program.starts_with(install)
-            })
+        && launchctl_value(output, "program", "=").is_some_and(|program| {
+            let program = Path::new(program);
+            validate_absolute(program).is_ok() && program.starts_with(install)
+        })
 }
 
 fn launchctl_value<'a>(output: &'a str, key: &str, separator: &str) -> Option<&'a str> {
@@ -1210,7 +1306,10 @@ mod reuse_tests {
                 fs::write(file, b"existing runtime").unwrap();
             }
             fs::create_dir_all(&selected.app_root).unwrap();
-            Self { _directory: directory, selected }
+            Self {
+                _directory: directory,
+                selected,
+            }
         }
     }
 
@@ -1242,14 +1341,18 @@ mod reuse_tests {
         fn service(&self, program: &Path) -> String {
             format!(
                 "program = {}\nCONTAINER_APP_ROOT => {}\nCONTAINER_INSTALL_ROOT => {}\n",
-                program.display(), self.selected.app_root.display(), self.selected.install_root.display()
+                program.display(),
+                self.selected.app_root.display(),
+                self.selected.install_root.display()
             )
         }
     }
 
     impl CommandRunner for DiscoveryRunner {
         fn run(&self, program: &str, args: &[String]) -> Result<Output> {
-            self.calls.borrow_mut().push((program.into(), args.to_vec()));
+            self.calls
+                .borrow_mut()
+                .push((program.into(), args.to_vec()));
             let stdout = if program == "/bin/launchctl" && args == ["list"] {
                 if self.running {
                     format!("123\t0\t{API_LABEL}\n124\t0\t{IMAGES_LABEL}\n")
@@ -1276,18 +1379,35 @@ mod reuse_tests {
             } else {
                 panic!("unexpected command (installation or service mutation): {program} {args:?}");
             };
-            Ok(Output { stdout, stderr: String::new() })
+            Ok(Output {
+                stdout,
+                stderr: String::new(),
+            })
         }
 
-        fn run_with_env(&self, program: &str, args: &[String], env: &[(&str, &Path)]) -> Result<Output> {
-            assert_eq!(env[1], ("CONTAINER_INSTALL_ROOT", self.selected.install_root.as_path()));
+        fn run_with_env(
+            &self,
+            program: &str,
+            args: &[String],
+            env: &[(&str, &Path)],
+        ) -> Result<Output> {
+            assert_eq!(
+                env[1],
+                (
+                    "CONTAINER_INSTALL_ROOT",
+                    self.selected.install_root.as_path()
+                )
+            );
             assert_eq!(env[0].0, "CONTAINER_APP_ROOT");
             assert!(env[0].1.is_absolute());
             if self.running {
                 assert_eq!(env[0].1, self.selected.app_root);
             }
             if program == "/usr/bin/env" {
-                let executable = args.iter().position(|arg| Path::new(arg) == self.selected.executable).unwrap();
+                let executable = args
+                    .iter()
+                    .position(|arg| Path::new(arg) == self.selected.executable)
+                    .unwrap();
                 self.run(&args[executable], &args[executable + 1..])
             } else {
                 self.run(program, args)
@@ -1301,7 +1421,12 @@ mod reuse_tests {
         let runner = DiscoveryRunner::new(&fixture.selected, true);
         let plist = fixture.selected.app_root.join("service.plist");
         fs::write(&plist, b"untouched shared service").unwrap();
-        let selected = select_runtime(&runner, "gui/501", Some(std::ffi::OsStr::new("/irrelevant"))).unwrap();
+        let selected = select_runtime(
+            &runner,
+            "gui/501",
+            Some(std::ffi::OsStr::new("/irrelevant")),
+        )
+        .unwrap();
         prepare_service(&runner, "gui/501", &selected).unwrap();
         assert_eq!(selected, fixture.selected);
         assert_eq!(fs::read(plist).unwrap(), b"untouched shared service");
@@ -1312,7 +1437,10 @@ mod reuse_tests {
     fn running_official_layout_is_also_borrowed() {
         let fixture = Fixture::new("bin");
         let runner = DiscoveryRunner::new(&fixture.selected, true);
-        assert_eq!(select_runtime(&runner, "gui/501", None).unwrap(), fixture.selected);
+        assert_eq!(
+            select_runtime(&runner, "gui/501", None).unwrap(),
+            fixture.selected
+        );
     }
 
     #[test]
@@ -1321,7 +1449,11 @@ mod reuse_tests {
         let mut runner = DiscoveryRunner::new(&fixture.selected, true);
         runner.status["server"]["version"] = Value::String("1.7.0".into());
         let error = select_runtime(&runner, "gui/501", None).unwrap_err();
-        assert!(error.to_string().contains("will not stop, replace, or download"));
+        assert!(
+            error
+                .to_string()
+                .contains("will not stop, replace, or download")
+        );
         assert_eq!(runner.calls.borrow().len(), 4);
     }
 
@@ -1347,7 +1479,11 @@ mod reuse_tests {
         let fixture = Fixture::new("cli");
         let bin = fixture.selected.install_root.join("bin");
         fs::create_dir(&bin).unwrap();
-        fs::write(bin.join("container"), b"#!/bin/sh\nexec ../cli/container \"$@\"\n").unwrap();
+        fs::write(
+            bin.join("container"),
+            b"#!/bin/sh\nexec ../cli/container \"$@\"\n",
+        )
+        .unwrap();
         let runner = DiscoveryRunner::new(&fixture.selected, false);
         let selected = select_runtime(&runner, "gui/501", Some(bin.as_os_str())).unwrap();
         assert_eq!(selected.executable, fixture.selected.executable);
@@ -1369,7 +1505,7 @@ mod reuse_tests {
     #[test]
     fn persisted_selection_restores_borrowed_executable_and_roots_without_discovery() {
         let fixture = Fixture::new("cli");
-        let path = fixture._directory.0.join(SELECTION);
+        let path = fixture.selected.app_root.join(SELECTION);
         publish_json(&path, &fixture.selected).unwrap();
         assert_eq!(load_selection_at(&path).unwrap(), Some(fixture.selected));
     }
@@ -1385,7 +1521,11 @@ mod reuse_tests {
     #[test]
     fn helper_program_cannot_escape_matching_installation_roots_with_parent_components() {
         let output = "program = /runtime/../foreign/container-core-images\nCONTAINER_APP_ROOT => /state\nCONTAINER_INSTALL_ROOT => /runtime\n";
-        assert!(!owned_service(output, Path::new("/state"), Path::new("/runtime")));
+        assert!(!owned_service(
+            output,
+            Path::new("/state"),
+            Path::new("/runtime")
+        ));
     }
 
     #[test]
@@ -1406,9 +1546,11 @@ mod reuse_tests {
         let changes = command.get_envs().collect::<Vec<_>>();
         assert!(!changes.iter().any(|(key, _)| *key == "XDG_CONFIG_HOME"));
         let temporary = root().unwrap().join("tmp");
-        assert!(changes.iter().any(|(key, value)| {
-            *key == "TMPDIR" && *value == Some(temporary.as_os_str())
-        }));
+        assert!(
+            changes
+                .iter()
+                .any(|(key, value)| { *key == "TMPDIR" && *value == Some(temporary.as_os_str()) })
+        );
     }
 }
 
