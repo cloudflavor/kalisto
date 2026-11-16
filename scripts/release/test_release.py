@@ -11,7 +11,7 @@ import release
 
 SHA = "a" * 40
 TAG = "v1.2.3"
-SERVER = "https://codeberg.org"
+SERVER = "https://forgejo.example.org"
 REPOSITORY = "example/kalisto"
 
 
@@ -186,8 +186,8 @@ class ReleaseTests(unittest.TestCase):
     def test_redirects_and_downloads_never_send_token_to_another_origin(self):
         api = release.Forgejo("dummy", SERVER, REPOSITORY)
         redirect = release.SameOriginRedirect(api.origin)
-        for url in ["https://example.com/asset", "http://codeberg.org/asset",
-                    "https://codeberg.org:8443/asset", "https://token@codeberg.org/asset"]:
+        for url in ["https://example.com/asset", "http://forgejo.example.org/asset",
+                    "https://forgejo.example.org:8443/asset", "https://token@forgejo.example.org/asset"]:
             with self.assertRaises(ValueError, msg=url):
                 redirect.redirect_request(None, None, 302, "", {}, url)
             with patch("urllib.request.build_opener") as opener:
