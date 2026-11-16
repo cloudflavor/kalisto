@@ -18,12 +18,12 @@ functional Cilium/DNS/cross-node HTTP performance acceptance test in
 | `resume.cast` | Create `demo-state` with `value=saved-before-stop`, stop only the owned cluster with `kalisto down`, inspect that all three nodes are actually Stopped, resume with the same profile, and verify the ConfigMap's original UID and data plus the surviving HTTP workload and response. |
 | `scale.cast` | Show the original three Ready nodes, run `kalisto scale --workers 3`, require exactly four Ready nodes, increase the HTTP Deployment to three replicas, require distinct worker placements, and repeat the HTTP proof. |
 
-On Apple-container resume, guest addresses can change. Before starting a stopped
-k3s process, Kalisto verifies any existing kubelet serving certificate for the
-current guest IPv4 address against the cluster CA. A leaf that no longer validates
-is renewed using `k3s certificate rotate --service kubelet`; cluster CA, datastore, and TLS
-verification remain intact. The resume scene's real port-forward verifies this
-consumer path rather than treating Ready nodes alone as proof of recovery.
+On Apple-container resume, guest addresses can change. Kalisto configures the
+built-in cloud controller to reconcile node addresses every five seconds rather
+than leaving persisted worker addresses stale across restart. K3s handles serving
+certificate issuance itself; Kalisto does not rotate the cluster CA or disable
+TLS verification. The resume scene's real port-forward checks recovery beyond
+Ready status alone.
 
 The HTTP fixture is [`scripts/demos/app.yaml`](../scripts/demos/app.yaml): a small
 BusyBox HTTP server, a content ConfigMap, and a Service. Required pod anti-affinity

@@ -342,8 +342,6 @@ def record(work, env):
         (demo / "app.yaml").write_text(fixture)
         shutil.copy2(HERE / "scene.py", demo / "scene.py")
     for scene in SCENES:
-        if scene == "resume":
-            capture_node_diagnostics(work, env, "before-resume")
         print(f"Recording genuine {scene} scene.", flush=True)
         execute([asciinema, "rec", "--output-format", "asciicast-v2", "--window-size", "110x30",
                  "--return", "--headless", "--quiet", "--capture-env", "TERM,SHELL",

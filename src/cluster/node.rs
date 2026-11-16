@@ -74,6 +74,7 @@ struct K3sCommandSpec<'a> {
     node: &'a Instance,
     tls_sans: &'a [String],
     join: Option<JoinConfig<'a>>,
+    dynamic_guest_addresses: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +120,7 @@ pub fn bootstrap_server(
         node: control_plane,
         tls_sans,
         join: None,
+        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
     })?;
     launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)
 }
@@ -147,6 +149,7 @@ pub fn bootstrap_worker(
         node: worker,
         tls_sans: &[],
         join: Some(join),
+        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
     })?;
     launch_k3s_process(backend, runner, worker, &artifact_dir, &command)
 }
@@ -301,44 +304,16 @@ fn launch_k3s_process(
         runner,
         &node.name,
         &node.artifacts.root,
-        &launch_k3s_process_command(
-            artifact_dir,
-            k3s_command,
-            backend.kind() == crate::backend::BackendKind::AppleContainer,
-        ),
+        &launch_k3s_process_command(artifact_dir, k3s_command),
     )
 }
 
-fn launch_k3s_process_command(
-    artifact_dir: &Path,
-    k3s_command: &str,
-    refresh_dynamic_address: bool,
-) -> String {
+fn launch_k3s_process_command(artifact_dir: &Path, k3s_command: &str) -> String {
     let stdout_log_path = artifact_dir.join("k3s.stdout.log");
     let stderr_log_path = artifact_dir.join("k3s.stderr.log");
     let pid_file_path = pid_file_path(artifact_dir);
     format!(
-        concat!(
-            "set -eu\n",
-            // Apple can assign a different guest IP when a persisted node resumes.
-            // Rotate only stale kubelet leaf certificates, before starting k3s.
-            // x509 -checkip reports mismatches without a failing exit status.
-            "if {refresh_dynamic_address} && [ -s /var/lib/rancher/k3s/agent/serving-kubelet.crt ]; then\n",
-            "    command -v openssl >/dev/null\n",
-            "    set -- $(ip -4 -o route get 1.1.1.1)\n",
-            "    while [ \"$#\" -gt 0 ] && [ \"$1\" != src ]; do shift; done\n",
-            "    test \"$#\" -ge 2\n",
-            "    if ! openssl verify -verify_ip \"$2\" -CAfile /var/lib/rancher/k3s/agent/server-ca.crt /var/lib/rancher/k3s/agent/serving-kubelet.crt >/dev/null 2>&1; then\n",
-            "        /usr/local/bin/k3s certificate rotate --service kubelet\n",
-            "    fi\n",
-            "fi\n",
-            "rm -f {pid_file}; nohup /bin/sh -lc {command} >{stdout_log} 2>{stderr_log} </dev/null & printf '%s\\n' $! > {pid_file}"
-        ),
-        refresh_dynamic_address = if refresh_dynamic_address {
-            "true"
-        } else {
-            "false"
-        },
+        "rm -f {pid_file}; nohup /bin/sh -lc {command} >{stdout_log} 2>{stderr_log} </dev/null & printf '%s\\n' $! > {pid_file}",
         pid_file = shell_escape(pid_file_path.as_os_str().to_string_lossy().as_ref()),
         command = shell_escape(k3s_command),
         stdout_log = shell_escape(stdout_log_path.as_os_str().to_string_lossy().as_ref()),
@@ -423,6 +398,12 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
     match spec.node.role {
         NodeRole::ControlPlane => {
             args.push("server".to_owned());
+            if spec.dynamic_guest_addresses {
+                // The default CCM interval leaves resumed Apple nodes advertising old IPs.
+                args.push(
+                    "--kube-cloud-controller-manager-arg=node-status-update-frequency=5s".to_owned(),
+                );
+            }
             if !spec.node.name.is_empty() {
                 args.push("--node-name".to_owned());
                 args.push(spec.node.name.clone());
@@ -561,6 +542,7 @@ mod tests {
             artifact_dir: Path::new("/tmp/kalisto-w0-test"),
             node: &worker,
             tls_sans: &[],
+            dynamic_guest_addresses: false,
             join: Some(super::JoinConfig {
                 server_url: "https://cp.example.test:6443",
                 token: "secret",
@@ -594,6 +576,7 @@ mod tests {
             node: &control_plane,
             tls_sans: &[],
             join: None,
+            dynamic_guest_addresses: false,
         })
         .unwrap();
 
@@ -634,7 +617,6 @@ mod tests {
         let command = launch_k3s_process_command(
             Path::new("/tmp/kalisto-cp-test"),
             "/usr/local/bin/k3s server --write-kubeconfig /tmp/kalisto-cp-test/kubeconfig.yaml",
-            false,
         );
 
         assert!(command.contains("nohup /bin/sh -lc"));
