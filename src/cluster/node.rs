@@ -401,7 +401,8 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
             if spec.dynamic_guest_addresses {
                 // The default CCM interval leaves resumed Apple nodes advertising old IPs.
                 args.push(
-                    "--kube-cloud-controller-manager-arg=node-status-update-frequency=5s".to_owned(),
+                    "--kube-cloud-controller-manager-arg=node-status-update-frequency=5s"
+                        .to_owned(),
                 );
             }
             if !spec.node.name.is_empty() {
