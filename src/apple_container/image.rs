@@ -112,7 +112,7 @@ pub(crate) fn prepare(
         if !archive.is_file() {
             return Err(Error::MissingPath(archive));
         }
-        import_image(runner, &archive, reference)?;
+        super::registry::import_image(runner, &archive, reference)?;
         return Ok(reference.to_owned());
     }
     let nonce = SystemTime::now()
@@ -124,16 +124,7 @@ pub(crate) fn prepare(
     fs::create_dir(&scratch).map_err(io_error)?;
     let mut attempted_create = false;
     let result = (|| {
-        runtime::run(
-            runner,
-            &[
-                "image".into(),
-                "pull".into(),
-                "--platform".into(),
-                "linux/arm64".into(),
-                BASE_IMAGE.into(),
-            ],
-        )?;
+        super::registry::prepare_remote_image(runner, BASE_IMAGE)?;
         let args = vec![
             "run".into(),
             "--name".into(),
@@ -173,7 +164,7 @@ pub(crate) fn prepare(
         let archive = assets_root.join("apple-node-image.tar");
         let output = fs::File::create(&archive).map_err(io_error)?;
         let reference = write_image(&mut layer, output, &spec.k3s_version)?;
-        import_image(runner, &archive, &reference)?;
+        super::registry::import_image(runner, &archive, &reference)?;
         Ok(reference)
     })();
     let cleanup_container = if attempted_create {
@@ -191,36 +182,6 @@ pub(crate) fn prepare(
             "{error}; image preparation cleanup: container={container:?}, files={files:?}"
         ))),
     }
-}
-
-fn import_image(runner: &dyn CommandRunner, archive: &Path, reference: &str) -> Result<()> {
-    let registry = super::registry::ArchiveRegistry::start(archive, reference)?;
-    runtime::run(
-        runner,
-        &[
-            "image".into(),
-            "pull".into(),
-            "--insecure".into(),
-            "--platform".into(),
-            "linux/arm64".into(),
-            registry.reference().into(),
-        ],
-    )?;
-    runtime::run(
-        runner,
-        &[
-            "image".into(),
-            "tag".into(),
-            registry.reference().into(),
-            reference.into(),
-        ],
-    )?;
-    // Fail pull rather than leave up to discover an unresolvable local ref.
-    runtime::run(
-        runner,
-        &["image".into(), "inspect".into(), reference.into()],
-    )?;
-    Ok(())
 }
 
 fn preparation_script(binary: &Path, version: &str) -> String {
@@ -459,6 +420,12 @@ mod tests {
                 let _ = fs::remove_file(&self.0);
             }
         }
+        struct LayoutDirectory(std::path::PathBuf);
+        impl Drop for LayoutDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         fn request(registry: &ArchiveRegistry, method: &str, path: &str) -> Vec<u8> {
             let address = registry.reference().split('/').next().unwrap();
             let mut stream = TcpStream::connect(address).unwrap();
@@ -482,35 +449,40 @@ mod tests {
             &response[end + 4..]
         }
 
-        let path = ArchiveFile(std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "kalisto-loopback-import-{}.tar",
             std::process::id()
-        )));
+        ));
+        let output = fs::File::create_new(&path).unwrap();
+        let path = ArchiveFile(path);
         let layer = b"unique node layer bytes, not an archive header";
-        let reference = write_image(
-            &mut Cursor::new(layer),
-            fs::File::create_new(&path.0).unwrap(),
-            "v1.33.5+k3s1",
-        )
-        .unwrap();
-        let registry = ArchiveRegistry::start(&path.0, &reference).unwrap();
-        let manifest_digest = reference.rsplit_once('@').unwrap().1;
-        let manifest_path = format!("/v2/kalisto-node/manifests/{manifest_digest}");
-        let response = request(&registry, "GET", &manifest_path);
-        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-        assert_eq!(
-            format!("sha256:{}", digest(body(&response))),
-            manifest_digest
-        );
-        let manifest: Value = serde_json::from_slice(body(&response)).unwrap();
-        let layer_digest = manifest["layers"][0]["digest"].as_str().unwrap();
-        let blob_path = format!("/v2/kalisto-node/blobs/{layer_digest}");
-        assert_eq!(body(&request(&registry, "GET", &blob_path)), layer);
-        assert!(body(&request(&registry, "HEAD", &blob_path)).is_empty());
-        assert!(
-            request(&registry, "GET", "/v2/kalisto-node/blobs/../../etc/passwd")
-                .starts_with(b"HTTP/1.1 404")
-        );
-        assert!(request(&registry, "DELETE", &blob_path).starts_with(b"HTTP/1.1 405"));
+        let reference = write_image(&mut Cursor::new(layer), output, "v1.33.5+k3s1").unwrap();
+        let layout = path.0.with_extension("layout");
+        fs::create_dir(&layout).unwrap();
+        let layout = LayoutDirectory(layout);
+        tar::Archive::new(fs::File::open(&path.0).unwrap())
+            .unpack(&layout.0)
+            .unwrap();
+        for source in [&path.0, &layout.0] {
+            let registry = ArchiveRegistry::start(source, &reference).unwrap();
+            let manifest_digest = reference.rsplit_once('@').unwrap().1;
+            let manifest_path = format!("/v2/kalisto-node/manifests/{manifest_digest}");
+            let response = request(&registry, "GET", &manifest_path);
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert_eq!(
+                format!("sha256:{}", digest(body(&response))),
+                manifest_digest
+            );
+            let manifest: Value = serde_json::from_slice(body(&response)).unwrap();
+            let layer_digest = manifest["layers"][0]["digest"].as_str().unwrap();
+            let blob_path = format!("/v2/kalisto-node/blobs/{layer_digest}");
+            assert_eq!(body(&request(&registry, "GET", &blob_path)), layer);
+            assert!(body(&request(&registry, "HEAD", &blob_path)).is_empty());
+            assert!(
+                request(&registry, "GET", "/v2/kalisto-node/blobs/../../etc/passwd")
+                    .starts_with(b"HTTP/1.1 404")
+            );
+            assert!(request(&registry, "DELETE", &blob_path).starts_with(b"HTTP/1.1 405"));
+        }
     }
 }

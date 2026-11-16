@@ -115,8 +115,6 @@ struct Prepared {
     init_image: String,
     init_index: String,
     init_manifest: String,
-    snapshot_sha256: String,
-    snapshot_info_sha256: String,
     kernel_size: u64,
     snapshot_size: u64,
     snapshot_info_size: u64,
@@ -554,14 +552,11 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
         .pointer("/vminit/image")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("Apple runtime properties omit vminit.image"))?;
-    run(
-        runner,
-        &strings(&["image", "pull", "--platform", "linux/arm64", source]),
-    )?;
+    let source = super::registry::prepare_remote_image(runner, source)?;
     // Infra images are deliberately hidden by Apple's image inspect command.
     // A separate local alias exposes the descriptor and platform manifest.
     let probe = "kalisto.invalid/vminit:apple-1.7.1";
-    run(runner, &strings(&["image", "tag", source, probe]))?;
+    run(runner, &strings(&["image", "tag", &source, probe]))?;
     let (index, manifest) = inspect_init(runner, probe)?;
     let reference = format!("kalisto.invalid/vminit:sha256-{}", digest_hex(&index)?);
     run(runner, &strings(&["image", "tag", probe, &reference]))?;
@@ -570,6 +565,8 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
     for (size, path) in runtime_sizes.iter_mut().zip(selected.runtime_files()) {
         *size = file_size(&path)?;
     }
+    // Runtime-owned snapshots can be 512 GiB sparse disks. Bind their metadata
+    // to the selected service and OCI descriptors without scanning sparse extents.
     let prepared = Prepared {
         version: VERSION.into(),
         selection: selected,
@@ -578,8 +575,6 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
         init_image: reference,
         init_index: index,
         init_manifest: manifest,
-        snapshot_sha256: artifact::file_sha256(runner, &snapshot.join("snapshot"))?,
-        snapshot_info_sha256: artifact::file_sha256(runner, &snapshot.join("snapshot-info"))?,
         kernel_size: file_size(&kernel_path()?)?,
         snapshot_size: file_size(&snapshot.join("snapshot"))?,
         snapshot_info_size: file_size(&snapshot.join("snapshot-info"))?,
@@ -1577,8 +1572,6 @@ mod prepared_selection_tests {
             init_image: format!("kalisto.invalid/vminit:sha256-{}", "a".repeat(64)),
             init_index: index,
             init_manifest: format!("sha256:{}", "c".repeat(64)),
-            snapshot_sha256: "d".repeat(64),
-            snapshot_info_sha256: "e".repeat(64),
             kernel_size: 100,
             snapshot_size: 100,
             snapshot_info_size: 100,

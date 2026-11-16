@@ -92,8 +92,9 @@ image. A temporary ordinary container installs Linux prerequisites, then is dele
 no cluster identity is baked into the reusable image. The cached node OCI archive
 can restore a pruned runtime image store when `pull` is repeated. Node archives are
 served directly over temporary loopback HTTP during import, without extracting a
-second archive copy or reconfiguring the shared image helper. Kernel extraction
-runs in Rust and does not require a host `zstd` executable.
+second archive copy or reconfiguring the shared image helper. Managed Crane handles
+external image downloads, including init and base images. Kernel extraction runs
+in Rust and does not require a host `zstd` executable.
 
 `up` requires the local node image and prepared assets; it never installs tools,
 pulls missing images, or changes the selected CNI. Nodes start concurrently on an

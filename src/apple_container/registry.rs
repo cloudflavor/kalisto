@@ -1,4 +1,4 @@
-//! Read-only loopback transport for an already prepared OCI archive.
+//! Read-only loopback transport for prepared OCI archives and layouts.
 //!
 //! Apple's image-load service extracts archives into its own temporary directory.
 //! Serving the existing external-volume archive avoids that extra copy without
@@ -25,26 +25,38 @@ struct Blob {
     size: u64,
 }
 
-pub(super) struct ArchiveRegistry {
-    reference: String,
-    stopping: Arc<AtomicBool>,
-    worker: Option<JoinHandle<io::Result<()>>>,
+enum ImageSource {
+    Archive(File),
+    Layout(std::path::PathBuf),
 }
 
-impl ArchiveRegistry {
-    pub(super) fn start(path: &Path, reference: &str) -> Result<Self> {
-        let digest = reference
-            .rsplit_once('@')
-            .map(|(_, digest)| digest)
-            .ok_or_else(|| invalid("node image reference must contain a digest"))?;
-        let hash = digest
-            .strip_prefix("sha256:")
-            .filter(|hash| valid_hash(hash))
-            .ok_or_else(|| invalid("invalid node image digest"))?;
+impl ImageSource {
+    fn open(path: &Path) -> Result<(Self, BTreeMap<String, Blob>)> {
+        let mut blobs = BTreeMap::new();
+        if path.is_dir() {
+            let root = path.join("blobs/sha256");
+            for entry in std::fs::read_dir(&root).map_err(io_error)? {
+                let entry = entry.map_err(io_error)?;
+                let hash = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| invalid("non-UTF-8 OCI blob name"))?;
+                if !valid_hash(&hash) || !entry.file_type().map_err(io_error)?.is_file() {
+                    return Err(invalid("invalid OCI layout blob"));
+                }
+                blobs.insert(
+                    hash,
+                    Blob {
+                        offset: 0,
+                        size: entry.metadata().map_err(io_error)?.len(),
+                    },
+                );
+            }
+            return Ok((Self::Layout(root), blobs));
+        }
         let file = File::open(path).map_err(io_error)?;
         let length = file.metadata().map_err(io_error)?.len();
         let mut archive = tar::Archive::new(file);
-        let mut blobs = BTreeMap::new();
         for entry in archive.entries_with_seek().map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
             let path = entry.path().map_err(io_error)?;
@@ -70,12 +82,45 @@ impl ArchiveRegistry {
                 return Err(invalid("truncated or duplicate OCI archive blob"));
             }
         }
+        Ok((Self::Archive(archive.into_inner()), blobs))
+    }
+
+    fn copy_blob(&mut self, hash: &str, blob: Blob, stream: &mut TcpStream) -> io::Result<u64> {
+        match self {
+            Self::Archive(file) => {
+                file.seek(SeekFrom::Start(blob.offset))?;
+                io::copy(&mut file.take(blob.size), stream)
+            }
+            Self::Layout(root) => {
+                let file = File::open(root.join(hash))?;
+                io::copy(&mut file.take(blob.size), stream)
+            }
+        }
+    }
+}
+
+pub(super) struct ArchiveRegistry {
+    reference: String,
+    stopping: Arc<AtomicBool>,
+    worker: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl ArchiveRegistry {
+    pub(super) fn start(path: &Path, reference: &str) -> Result<Self> {
+        let digest = reference
+            .rsplit_once('@')
+            .map(|(_, digest)| digest)
+            .ok_or_else(|| invalid("node image reference must contain a digest"))?;
+        let hash = digest
+            .strip_prefix("sha256:")
+            .filter(|hash| valid_hash(hash))
+            .ok_or_else(|| invalid("invalid node image digest"))?;
+        let (mut source, blobs) = ImageSource::open(path)?;
         if !blobs.contains_key(hash) {
             return Err(invalid(
                 "node image manifest is absent from its OCI archive",
             ));
         }
-        let mut file = archive.into_inner();
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(io_error)?;
         let address = listener.local_addr().map_err(io_error)?;
         listener.set_nonblocking(true).map_err(io_error)?;
@@ -89,7 +134,7 @@ impl ArchiveRegistry {
                         Ok((mut stream, _)) => {
                             stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                             stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-                            if let Err(error) = serve(&mut stream, &mut file, &blobs) {
+                            if let Err(error) = serve(&mut stream, &mut source, &blobs) {
                                 tracing::debug!(%error, "OCI import connection closed");
                             }
                         }
@@ -129,7 +174,7 @@ impl Drop for ArchiveRegistry {
 
 fn serve(
     stream: &mut TcpStream,
-    file: &mut File,
+    source: &mut ImageSource,
     blobs: &BTreeMap<String, Blob>,
 ) -> io::Result<()> {
     let mut header = [0u8; 8192];
@@ -193,8 +238,7 @@ fn serve(
         blob.size
     )?;
     if method == "GET" {
-        file.seek(SeekFrom::Start(blob.offset))?;
-        if io::copy(&mut file.take(blob.size), stream)? != blob.size {
+        if source.copy_blob(hash, *blob, stream)? != blob.size {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
     }
@@ -206,6 +250,101 @@ fn empty_response(stream: &mut TcpStream, status: &str) -> io::Result<()> {
         stream,
         "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
+}
+
+pub(super) fn import_image(
+    runner: &dyn crate::process::CommandRunner,
+    path: &Path,
+    reference: &str,
+) -> Result<()> {
+    let registry = ArchiveRegistry::start(path, reference)?;
+    super::runtime::run(
+        runner,
+        &[
+            "image".into(),
+            "pull".into(),
+            "--scheme".into(),
+            "http".into(),
+            "--platform".into(),
+            "linux/arm64".into(),
+            registry.reference().into(),
+        ],
+    )?;
+    super::runtime::run(
+        runner,
+        &[
+            "image".into(),
+            "tag".into(),
+            registry.reference().into(),
+            reference.into(),
+        ],
+    )?;
+    super::runtime::run(
+        runner,
+        &["image".into(), "inspect".into(), reference.into()],
+    )?;
+    Ok(())
+}
+
+/// Keep network acquisition in the same managed downloader as the boot assets.
+/// The borrowed Apple helper receives only local, digest-verified content.
+pub(super) fn prepare_remote_image(
+    runner: &dyn crate::process::CommandRunner,
+    reference: &str,
+) -> Result<String> {
+    let output = runner.run(
+        "crane",
+        &[
+            "digest".into(),
+            "--platform".into(),
+            "linux/arm64".into(),
+            reference.into(),
+        ],
+    )?;
+    let digest = output.stdout.trim();
+    let hash = digest
+        .strip_prefix("sha256:")
+        .filter(|hash| valid_hash(hash))
+        .ok_or_else(|| invalid("registry returned an invalid image digest"))?;
+    let repository = reference.split('@').next().unwrap_or(reference);
+    let repository = match repository.rfind(':') {
+        Some(colon) if repository.rfind('/').is_some_and(|slash| colon > slash) => {
+            &repository[..colon]
+        }
+        _ => repository,
+    };
+    let pinned = format!("{repository}@{digest}");
+    let cache = super::runtime::root()?.join("oci-images");
+    std::fs::create_dir_all(&cache).map_err(io_error)?;
+    let destination = cache.join(hash);
+    if !destination.exists() {
+        let temporary = cache.join(format!(".{hash}.prepare-{}", std::process::id()));
+        std::fs::create_dir(&temporary).map_err(io_error)?;
+        let guard = ImageDownload(temporary);
+        runner.run(
+            "crane",
+            &[
+                "pull".into(),
+                "--format=oci".into(),
+                "--annotate-ref".into(),
+                "--platform".into(),
+                "linux/arm64".into(),
+                pinned.clone(),
+                guard.0.display().to_string(),
+            ],
+        )?;
+        std::fs::rename(&guard.0, &destination).map_err(io_error)?;
+    }
+    import_image(runner, &destination, &pinned)?;
+    Ok(pinned)
+}
+
+struct ImageDownload(std::path::PathBuf);
+
+impl Drop for ImageDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn valid_hash(value: &str) -> bool {
