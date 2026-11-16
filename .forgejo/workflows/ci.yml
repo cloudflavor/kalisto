@@ -148,12 +148,13 @@ jobs:
           # Reuse a running Homebrew service. A stopped installed runtime may be started,
           # but never replace a running daemon or change its roots/configuration.
           export PATH="/opt/homebrew/bin:$PATH"
-          status=$(container system status --format json)
+          status_code=0
+          status=$(container system status --format json) || status_code=$?
           state=$(printf '%s' "$status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
-          case "$state" in
-            running) ;;
-            unregistered) container system start --disable-kernel-install ;;
-            *) printf 'Unsupported existing container service state: %s\n' "$state" >&2; exit 1 ;;
+          case "$state:$status_code" in
+            running:0) ;;
+            unregistered:1) container system start --disable-kernel-install ;;
+            *) printf 'Unsupported container service status (%s): %s\n' "$status_code" "$status" >&2; exit 1 ;;
           esac
           cd "$KALISTO_APPLE_WORKSPACE"
           cargo test --locked --release --test macos_three_node_boot_budget \
