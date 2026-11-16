@@ -108,8 +108,17 @@ def engine_snapshot(env):
     require(native.is_relative_to(install), "Native CLI escapes the borrowed installation")
     properties = json.loads(execute([str(executable), "system", "property", "list", "--format", "json"], env))
     config = app / "config.toml"
+    private_root = Path(env["XDG_DATA_HOME"]) / "kalisto/artifacts/runtime-v1/apple-container-1.7.1-arm64"
+    private_files = {}
+    for relative in ("install", "downloads/container-1.7.1-installer-signed.pkg",
+                     "downloads/container-1.7.1-installer-signed.download"):
+        try:
+            metadata = (private_root / relative).stat()
+            private_files[relative] = [metadata.st_size, metadata.st_mtime_ns]
+        except FileNotFoundError:
+            private_files[relative] = None
     return {"paths": status["paths"], "server": status["server"], "services": services,
-            "properties": properties, "native": str(native),
+            "properties": properties, "native": str(native), "private_files": private_files,
             "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest() if config.exists() else None}
 
 
@@ -122,8 +131,6 @@ def verify_borrowed(work, env, before):
                 and Path(selected["app_root"]) == Path(before["paths"]["appRoot"])
                 and Path(selected["install_root"]) == Path(before["paths"]["installRoot"]),
                 "Kalisto did not borrow the existing daemon unchanged")
-    private_runtime = work / "data/kalisto/artifacts/runtime-v1/apple-container-1.7.1-arm64"
-    require(not private_runtime.exists(), "A private Apple runtime must never be installed")
 
 
 def collision_check(name, env):
@@ -252,10 +259,19 @@ def record(work, env):
     require(asciinema is not None, "The already-installed asciinema recorder is required")
     recorder_version = execute([asciinema, "--version"], env).strip()
     require(re.fullmatch(r"asciinema 3\.2\.1", recorder_version), "Expected installed asciinema 3.2.1; do not replace it")
+    preparation_env = env.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+        if key in os.environ:
+            preparation_env[key] = os.environ[key]
+    artifacts = (work / "data/kalisto/artifacts").resolve(strict=True)
+    storage = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
+    require(artifacts.is_relative_to(storage) and artifacts.stat().st_dev == work.stat().st_dev,
+            "Prepared cache must stay on configured external storage")
     before = engine_snapshot(env)
     (private / "engine-before.json").write_text(json.dumps(before))
     print("Building the exact dispatched source on external storage.", flush=True)
-    execute(["cargo", "build", "--locked", "--release", "--bin", "kalisto"], env,
+    execute(["cargo", "build", "--locked", "--release", "--bin", "kalisto"], preparation_env,
             cwd=work, log=private / "build.log")
     shutil.copy2(Path(env["CARGO_TARGET_DIR"]) / "release/kalisto", work / "bin/kalisto")
     cli_version = execute(["kalisto", "--version"], env).strip()
@@ -274,7 +290,7 @@ def record(work, env):
         profile = ["--name", name, "--backend", "apple-container", "--workers", "2", "--addons", "cni/cilium",
                    "--api-port", env["DEMO_API_PORT"]]
         print("Preparing images and managed tools outside recorded scenes.", flush=True)
-        prepared = execute(["kalisto", "pull", *profile], env, cwd=demo, log=private / "pull.log")
+        prepared = execute(["kalisto", "pull", *profile], preparation_env, cwd=demo, log=private / "pull.log")
         require(not (work / "data/kalisto/clusters" / name).exists(), "Preparation must not create cluster state")
         collision_check(name, env)
         verify_borrowed(work, env, before)
@@ -283,7 +299,7 @@ def record(work, env):
         roots = re.findall(r"^prepared assets: (.+)$", prepared, re.M)
         require(len(roots) == 1, "Preparation must identify exactly one real asset manifest")
         asset_root = Path(roots[0]).resolve(strict=True)
-        require(asset_root.is_relative_to(work / "data/kalisto/artifacts"), "Assets must stay in the isolated external workspace")
+        require(asset_root.is_relative_to(artifacts), "Assets must stay in the configured external cache")
         manifest = json.loads((asset_root / "manifest.json").read_text())
         require(manifest["probe_image"] == image[1] and manifest["rollouts"], "Prepared fixture or Cilium rollouts mismatch")
         (demo / "rollouts.json").write_text(json.dumps(manifest["rollouts"]))

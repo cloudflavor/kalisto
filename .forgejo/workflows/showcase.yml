@@ -44,7 +44,9 @@ jobs:
           printf '%s\n' "$GITHUB_RUN_ID" > "$workspace/.showcase-owner"
           mkdir -p "$workspace/tmp" "$workspace/private" "$workspace/data/kalisto" \
             "$workspace/config" "$workspace/cache" "$storage/cargo-home" \
-            "$storage/release-rustup" "$storage/sccache" "$storage/showcase-target"
+            "$storage/release-rustup" "$storage/sccache" "$storage/showcase-target" \
+            "$storage/apple-container-ci/artifacts"
+          ln -s "$storage/apple-container-ci/artifacts" "$workspace/data/kalisto/artifacts"
           printf 'KALISTO_SHOWCASE_WORKSPACE=%s\n' "$workspace" >> "$GITHUB_ENV"
           printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
           printf 'CARGO_TARGET_DIR=%s/showcase-target\nTMPDIR=%s/tmp\n' "$storage" "$workspace" >> "$GITHUB_ENV"

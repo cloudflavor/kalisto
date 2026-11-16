@@ -55,17 +55,18 @@ An unavailable, stopped, incompatible, or differently owned daemon fails capture
 The recorder checks the Homebrew installation, launchd API PID/start count, service
 programs/roots, properties and configuration digest before and after preparation,
 each scene, and destruction. It also requires Kalisto's selection to be borrowed
-(`managed: false`) and refuses a private Apple runtime installation directory.
+(`managed: false`) and verifies that private installer/install-directory metadata
+is unchanged. Cached kernels and init images are preparation assets, not a private engine.
 
 Builds, the fresh source checkout, node state, images, managed tools, configuration,
 recordings, logs, and temporary files stay on the configured external storage.
 Existing native CI `cargo-home`, `release-rustup`, and `sccache` conventions are
 reused. The persistent compilation directory is `showcase-target`; the freshly
 built binary is copied into the owned job workspace so another job cannot replace
-the recorded executable. Large prepared assets are isolated per job rather than
-sharing mutable prepared state with another native CI workflow. Captures serialize
-with each other, but do not cancel other native jobs or take ownership of their
-clusters.
+the recorded executable. Cluster state and private configuration are isolated per
+job; prepared assets reuse the existing `apple-container-ci/artifacts` cache using
+Kalisto's normal profile locking. Cleanup never removes that shared cache.
+Captures serialize without cancelling other jobs or taking ownership of their clusters.
 
 The workflow checks out `GITHUB_SHA`, builds `cargo build --locked --release --bin
 kalisto`, and invokes `python3 scripts/demos/capture.py` from the external checkout.
@@ -176,6 +177,8 @@ names and relative `app.yaml`, never absolute checkout/script paths. Kubeconfig
 private repository/service URLs, and signed URLs must never be recorded or published.
 No CI secrets, proxy credentials, shell startup hooks, personal kubeconfig, or
 container overrides are passed to scene subprocesses.
+Existing proxy and TLS trust-store environment is inherited only by the unrecorded
+build/preparation phase; it is not forwarded to recorded scenes.
 
 The conservative publication gate rejects known runner identity, unredacted private
 path roots, credential markers, private hostnames, unknown/credential-bearing URLs,
