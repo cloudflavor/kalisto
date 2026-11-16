@@ -138,7 +138,7 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
     Ok(format!(
         "{}{}-{}-{}-{}-{components:02x}",
         if spec.backend == BackendKind::AppleContainer {
-            "apple-container-v1-"
+            "apple-container-v2-"
         } else {
             ""
         },
