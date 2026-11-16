@@ -21,12 +21,15 @@ non-JSON CLI text remains a convenience format, not an API.
 
 ## Prepare once, then boot
 
-The standard macOS native Lima/VZ flow requires the standalone binary, not a checkout,
-manual template, Homebrew, Docker, QEMU installation, or host sudo.
+The standard macOS flow runs Kalisto-managed k3s on Apple containers (Apple silicon,
+macOS 26 or newer). It requires the standalone binary, not a checkout, manual template,
+Homebrew, Docker, QEMU installation, host sudo, or Lima. Lima remains available via
+`--backend lima` on both preparation and startup, or `cluster.backend = "lima"` in
+`kalisto.toml`.
 
 `pull` manages tools and cached assets. First preparation can take minutes and may
-create a temporary OS-only builder VM, which is deleted afterward. It never starts
-Kubernetes or creates cluster VMs/state. Preparation is reused for matching
+create a temporary ordinary container to prepare the reusable node image, then deletes
+it. It never starts Kubernetes or creates cluster nodes/state. Preparation is reused for matching
 architecture, versions and enabled components; rerun it when those inputs change or
 cache is removed. Repeating the same `pull` verifies and reuses a complete cache.
 
@@ -42,8 +45,8 @@ Choose an owned cluster name; the example uses `agent-demo`:
 ```bash
 CLUSTER=agent-demo
 kalisto ls
-kalisto pull --name "$CLUSTER" --backend lima --addons cni/cilium
-kalisto up --name "$CLUSTER" --backend lima --workers 2 --addons cni/cilium
+kalisto pull --name "$CLUSTER" --addons cni/cilium
+kalisto up --name "$CLUSTER" --workers 2 --addons cni/cilium
 kalisto status --name "$CLUSTER"
 export KUBECONFIG="$(kalisto kubeconfig --name "$CLUSTER" --path)"
 kubectl get nodes
@@ -119,7 +122,6 @@ After normal MCP initialization, a preparation request looks like:
     "name": "clusters.pull",
     "arguments": {
       "name": "agent-demo",
-      "backend": "lima",
       "addons": ["cni/cilium"]
     },
     "task": {}
@@ -181,7 +183,8 @@ never infer permission to stop a running cluster or delete the original to make 
 
 ## What the boot timing means
 
-Four fresh development-Mac runs measured **56.07s, 53.84s, 54.26s, and 54.83s**.
+Native Apple-container CI measured **52.04s**. Four optional Lima development-Mac
+runs measured **56.07s, 53.84s, 54.26s, and 54.83s**.
 Each includes VM creation, image imports, three Ready nodes, authenticated host API,
 all rendered Cilium rollouts, both-worker DNS and cross-node Service HTTP. Preparation
 is outside that clock. This is not a universal hardware guarantee, nor a sub-minute

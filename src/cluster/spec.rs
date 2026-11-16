@@ -197,7 +197,7 @@ impl ClusterSpec {
     }
 }
 
-fn default_network(backend: BackendKind) -> String {
+pub(crate) fn default_network(backend: BackendKind) -> String {
     match backend {
         BackendKind::Firecracker => "slirp4netns".to_owned(),
         BackendKind::Lima => "lima:user-v2".to_owned(),
@@ -418,6 +418,8 @@ mod tests {
         assert!(!spec.stream_vm_logs);
         if cfg!(target_os = "linux") {
             assert_eq!(spec.network, "slirp4netns");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(spec.network, "apple-container");
         } else {
             assert_eq!(spec.network, "lima:user-v2");
         }

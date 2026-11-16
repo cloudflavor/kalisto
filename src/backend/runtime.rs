@@ -34,6 +34,8 @@ impl BackendKind {
     pub fn host_default() -> Self {
         if cfg!(target_os = "linux") {
             Self::Firecracker
+        } else if cfg!(target_os = "macos") {
+            Self::AppleContainer
         } else {
             Self::Lima
         }
@@ -219,6 +221,8 @@ mod tests {
     fn host_default_matches_compilation_target() {
         if cfg!(target_os = "linux") {
             assert_eq!(BackendKind::host_default(), BackendKind::Firecracker);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(BackendKind::host_default(), BackendKind::AppleContainer);
         } else {
             assert_eq!(BackendKind::host_default(), BackendKind::Lima);
         }

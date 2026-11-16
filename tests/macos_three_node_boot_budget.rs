@@ -174,8 +174,6 @@ fn cold_cli_boot(backend: BackendKind) {
         .current_dir(&workspace)
         .args([
             "up",
-            "--backend",
-            backend.as_str(),
             "--workers",
             "2",
             "--addons",
@@ -187,6 +185,9 @@ fn cold_cli_boot(backend: BackendKind) {
         .arg(&workspace)
         .stdout(Stdio::from(up_log.try_clone().unwrap()))
         .stderr(Stdio::from(up_log));
+    if backend != BackendKind::AppleContainer {
+        command.args(["--backend", backend.as_str()]);
+    }
     if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
         command.args(["--api-port", &port]);
     }

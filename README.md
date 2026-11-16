@@ -4,11 +4,11 @@ Local-development Kubernetes runtime using k3s on macOS and Linux.
 
 Current scope:
 
-- macOS backend: native Lima `vz` (Rosetta opt-in)
-- opt-in macOS backend: Apple `container` running Kalisto-managed k3s nodes
+- default macOS backend: Apple `container` running Kalisto-managed k3s nodes
+- optional macOS backend: native Lima `vz` (Rosetta opt-in)
 - Linux backend: Firecracker (in progress)
 - Kubernetes distro: `k3s`
-- image pipeline: native VZ OS preparation; optional legacy container builders
+- image pipeline: prepared Ubuntu/k3s node images; optional Lima VM disks
 
 ## Binary releases
 
@@ -20,7 +20,7 @@ support remains in progress; available binaries do not imply feature parity.
 
 ## Quick Start
 
-Install the standalone macOS binary, then run from any directory:
+On Apple silicon with macOS 26 or newer, install the standalone binary and run from any directory:
 
 ```bash
 kalisto pull --addons cni/cilium
@@ -33,12 +33,13 @@ boots; rerun `pull` when the profile changes or cache is removed. Repeating `pul
 verifies/reuses a complete cache rather than rebuilding the OS image. Bare
 `pull`/`up` do **not** select a CNI.
 
-`pull` fetches checksum-verified managed Lima, Helm, Crane, K3s, and
-platform-digest-pinned OCI images including a BusyBox diagnostic image. It prepares
-a sanitized compressed Ubuntu disk via a temporary native VZ VM, never starting
-Kubernetes or creating cluster state; the builder is deleted after use. Standard
-flow requires no checkout, manual templates, Homebrew, Docker, QEMU install, or
-host sudo. Cache lives under `artifacts/boot-v4` in user-scoped Kalisto data.
+`pull` fetches the pinned, signed Apple runtime, its kernel/init image, managed
+Helm, Crane, kubectl, K3s, and platform-digest-pinned OCI images including a BusyBox
+diagnostic image. It prepares a reusable Ubuntu/k3s node image in a temporary
+ordinary container, never starting Kubernetes or creating cluster state; the builder
+is deleted after use. Standard flow requires no checkout, manual templates, Homebrew,
+Docker, QEMU install, host sudo, or Lima. Cache lives under `artifacts/boot-v4` in
+user-scoped Kalisto data.
 Preparation can take several minutes and stays outside cold cluster startup timing.
 
 `up` requires a complete cache, mounts it read-only, imports local images on fresh
@@ -56,7 +57,7 @@ and optional `lb/servicelb` only. Other startup add-ons are rejected rather than
 silently; install those explicitly after startup. Existing Helm-managed Cilium
 clusters require migration; prepared startup currently targets fresh clusters.
 
-The opt-in release benchmark in `tests/macos_three_node_boot_budget.rs` passed
+The optional Lima release benchmark in `tests/macos_three_node_boot_budget.rs` passed
 in **56.07s, 53.84s, 54.26s, and 54.83s** on the development Mac. Each run used the actual
 binary from an empty directory with system-only `PATH`, fresh three VMs, three
 Ready nodes, authenticated host API, Cilium rollouts, and DNS/Service HTTP probes
@@ -66,12 +67,12 @@ hardware performance guarantee.
 
 ## Apple container backend
 
-On Apple silicon with macOS 26 or newer, select Apple's lightweight Linux VM runtime
-without using its experimental Kubernetes cluster implementation:
+Apple's lightweight Linux VM runtime is the macOS default. Kalisto runs its own
+k3s without using Apple's experimental Kubernetes cluster implementation:
 
 ```bash
-kalisto pull --backend apple-container --addons cni/cilium
-kalisto up --backend apple-container --workers 2 --addons cni/cilium
+kalisto pull --addons cni/cilium
+kalisto up --workers 2 --addons cni/cilium
 kalisto kubectl -- get nodes
 kalisto down
 kalisto up
@@ -79,7 +80,7 @@ kalisto up
 
 Kalisto owns the k3s server, agents, Cilium, readiness checks, and cluster state.
 It does not use `container cluster`, `container machine`, kubeadm, kind, Docker,
-or an external registry to bootstrap prepared nodes. Lima remains the macOS default.
+or an external registry to bootstrap prepared nodes. Lima is an explicit alternative.
 
 `pull` installs a pinned, signed Apple runtime in Kalisto's user data, prepares its
 kernel and init image, and composes a digest-pinned Ubuntu/k3s node image. A temporary
@@ -118,6 +119,26 @@ Run live validation only in the authorized native macOS CI job. The existing Lim
 timings above are not Apple-container measurements. Cold archive export/import
 currently remains Lima-only; existing Lima clusters and archives are not converted
 by selecting a different backend.
+
+## Optional Lima backend
+
+Select Lima explicitly on both preparation and startup, including on Intel Macs or
+macOS versions older than 26:
+
+```bash
+kalisto pull --backend lima --addons cni/cilium
+kalisto up --backend lima --workers 2 --addons cni/cilium
+```
+
+Or persist the choice in `kalisto.toml`:
+
+```toml
+[cluster]
+backend = "lima"
+```
+
+The default never silently falls back to Lima. Existing clusters retain their
+recorded backend; selecting another backend does not convert their disks.
 
 ## Install workloads
 
