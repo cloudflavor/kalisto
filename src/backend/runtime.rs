@@ -7,6 +7,7 @@ use crate::process::{CommandRunner, Output};
 pub enum BackendKind {
     Firecracker,
     Lima,
+    AppleContainer,
 }
 
 impl BackendKind {
@@ -15,6 +16,7 @@ impl BackendKind {
         match self {
             Self::Firecracker => "firecracker",
             Self::Lima => "lima",
+            Self::AppleContainer => "apple-container",
         }
     }
 
@@ -23,6 +25,7 @@ impl BackendKind {
         match value {
             "firecracker" => Some(Self::Firecracker),
             "lima" => Some(Self::Lima),
+            "apple-container" => Some(Self::AppleContainer),
             _ => None,
         }
     }
@@ -31,9 +34,16 @@ impl BackendKind {
     pub fn host_default() -> Self {
         if cfg!(target_os = "linux") {
             Self::Firecracker
+        } else if cfg!(target_os = "macos") {
+            Self::AppleContainer
         } else {
             Self::Lima
         }
+    }
+
+    #[must_use]
+    pub(crate) fn uses_prepared_assets(self) -> bool {
+        matches!(self, Self::Lima | Self::AppleContainer)
     }
 }
 
@@ -187,6 +197,7 @@ pub fn backend_for(kind: BackendKind) -> &'static dyn ClusterBackend {
     match kind {
         BackendKind::Firecracker => &crate::backend::firecracker::BACKEND,
         BackendKind::Lima => &crate::backend::lima::BACKEND,
+        BackendKind::AppleContainer => &crate::backend::apple_container::BACKEND,
     }
 }
 
@@ -210,6 +221,8 @@ mod tests {
     fn host_default_matches_compilation_target() {
         if cfg!(target_os = "linux") {
             assert_eq!(BackendKind::host_default(), BackendKind::Firecracker);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(BackendKind::host_default(), BackendKind::AppleContainer);
         } else {
             assert_eq!(BackendKind::host_default(), BackendKind::Lima);
         }

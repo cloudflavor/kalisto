@@ -11,7 +11,7 @@ use crate::paths::{artifacts_root, config_root};
 use crate::process::CommandRunner;
 use crate::shell::shell_escape;
 
-const LIMA_ARTIFACT_DIR: &str = "lima-node";
+const LIMA_ARTIFACT_DIR: &str = "node-image";
 const FIRECRACKER_ARTIFACT_DIR: &str = "firecracker-node";
 const FIRECRACKER_ARTIFACT_MANIFEST_FILENAME: &str = "firecracker-artifacts.manifest";
 const DEFAULT_FIRECRACKER_KERNEL_FILENAME: &str = "kalisto-vmlinux";
@@ -118,48 +118,56 @@ impl ManifestData {
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn pull_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
-    if let Some(template) = crate::native_image::pack_cached_template(spec)? {
-        let mut resolved = spec.clone();
-        resolved.template = template.display().to_string();
-        return Ok(resolved);
+    match spec.backend {
+        BackendKind::AppleContainer => Ok(spec.clone()),
+        BackendKind::Lima => {
+            let mut resolved = spec.clone();
+            if spec.template == "template://default" {
+                resolved.template = resolve_lima_template(spec, runner, true)?
+                    .display()
+                    .to_string();
+            }
+            if let Some(template) = crate::native_image::pack_cached_template(&resolved)? {
+                resolved.template = template.display().to_string();
+            }
+            Ok(resolved)
+        }
+        BackendKind::Firecracker => resolve_cluster_spec(spec, runner),
     }
-    if spec.backend == BackendKind::Lima && spec.template == "template://default" {
-        let mut resolved = spec.clone();
-        resolved.template = resolve_lima_template(spec, runner, true)?
-            .display()
-            .to_string();
-        return Ok(resolved);
-    }
-    resolve_cluster_spec(spec, runner)
 }
 
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<ClusterSpec> {
-    if spec.backend == BackendKind::Lima {
-        if spec.template != "template://default" {
-            return Ok(spec.clone());
+    match spec.backend {
+        BackendKind::AppleContainer => Ok(spec.clone()),
+        BackendKind::Lima => {
+            let mut resolved = spec.clone();
+            if spec.template == "template://default" {
+                resolved.template = resolve_lima_template(spec, runner, false)?
+                    .display()
+                    .to_string();
+            }
+            Ok(resolved)
         }
-
-        let mut resolved_spec = spec.clone();
-        resolved_spec.template = resolve_lima_template(spec, runner, false)?
-            .display()
-            .to_string();
-        return Ok(resolved_spec);
+        BackendKind::Firecracker => {
+            let artifacts = prepare_firecracker(spec, runner)?;
+            let mut resolved = spec.clone();
+            resolved.firecracker_kernel = Some(artifacts.kernel);
+            resolved.firecracker_rootfs = Some(artifacts.rootfs);
+            Ok(resolved)
+        }
     }
+}
 
-    if spec.backend != BackendKind::Firecracker {
-        return Ok(spec.clone());
-    }
-
-    let manager = ArtifactManagerConfig::from_env(spec, runner)?;
-    let resolved = manager.resolve_firecracker(spec, runner)?;
-
-    let mut resolved_spec = spec.clone();
-    resolved_spec.firecracker_kernel = Some(resolved.kernel);
-    resolved_spec.firecracker_rootfs = Some(resolved.rootfs);
-    Ok(resolved_spec)
+/// Resolve configured local or managed Firecracker kernel/rootfs artifacts,
+/// downloading missing artifacts only when their URLs are explicitly configured.
+pub(crate) fn prepare_firecracker(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+) -> Result<ResolvedFirecrackerArtifacts> {
+    ArtifactManagerConfig::from_env(spec, runner)?.resolve_firecracker(spec, runner)
 }
 
 fn resolve_lima_template(
@@ -217,14 +225,16 @@ fn resolve_lima_template(
     }
 
     Err(Error::InvalidArgs(
-        "no managed Lima template found for Kalisto; install Kalisto Lima artifacts under ~/.local/share/kalisto/artifacts/lima-node, place them under <project>/artifacts/lima-node, set KALISTO_LIMA_IMAGE_URL and run kalisto pull, or pass --template explicitly"
+        "no managed Lima template found for Kalisto; install Kalisto Lima artifacts under ~/.local/share/kalisto/artifacts/node-image, place them under <project>/artifacts/node-image, set KALISTO_LIMA_IMAGE_URL and run kalisto pull, or pass --template explicitly"
             .to_owned(),
     ))
 }
 
 fn lima_search_roots(workspace_root: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = vec![artifacts_root()?.join(LIMA_ARTIFACT_DIR)];
-    roots.push(workspace_root.join("artifacts").join(LIMA_ARTIFACT_DIR));
+    for root in workspace_root.ancestors() {
+        roots.push(root.join("artifacts").join(LIMA_ARTIFACT_DIR));
+    }
     if let Ok(config_root) = config_root() {
         roots.push(config_root.join(LIMA_ARTIFACT_DIR));
     }
@@ -975,8 +985,8 @@ mod tests {
         ArtifactManagerConfig, DEFAULT_FIRECRACKER_KERNEL_FILENAME,
         DEFAULT_FIRECRACKER_ROOTFS_FILENAME, FIRECRACKER_ARTIFACT_MANIFEST_FILENAME,
         LIMA_ARTIFACT_DIR, compressed_artifact_extension, decompressed_file_name,
-        default_lima_finalized_image_filename, default_lima_finalized_template_filename, io_error,
-        render_lima_template, resolve_cluster_spec,
+        default_lima_finalized_image_filename, default_lima_finalized_template_filename,
+        default_lima_seed_template_filename, io_error, render_lima_template, resolve_cluster_spec,
     };
 
     #[derive(Default)]
@@ -984,11 +994,13 @@ mod tests {
         checksums: HashMap<PathBuf, String>,
         curl_stdout: HashMap<String, String>,
         downloads: Mutex<Vec<(String, PathBuf)>>,
+        commands: Mutex<Vec<String>>,
         firecracker_version: Option<String>,
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+            self.commands.lock().unwrap().push(program.to_owned());
             match program {
                 "curl" => {
                     let source = args
@@ -1111,42 +1123,65 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cluster_spec_fetches_missing_artifacts_into_cache() {
+    fn prepare_firecracker_fetches_only_manifest_kernel_and_rootfs() {
+        let _guard = env_lock();
+        let names = [
+            "XDG_DATA_HOME",
+            "KALISTO_FIRECRACKER_ARTIFACT_CACHE_DIR",
+            "KALISTO_FIRECRACKER_MANIFEST_URL",
+            "KALISTO_FIRECRACKER_VERSION",
+        ];
+        let original_env = names.map(|name| (name, std::env::var_os(name)));
         let root = temp_dir("fetch");
         let remote_root = root.join("remote");
         let cache_root = root.join("cache");
+        let data_home = root.join("xdg-data");
+        let lima_root = data_home
+            .join("kalisto")
+            .join("artifacts")
+            .join(LIMA_ARTIFACT_DIR);
+        fs::create_dir_all(lima_root.parent().unwrap()).unwrap();
+        fs::write(&lima_root, "not a Lima image directory").unwrap();
         fs::create_dir_all(&remote_root).unwrap();
         let remote_kernel = remote_root.join("kernel.bin");
         let remote_rootfs = remote_root.join("rootfs.raw");
         fs::write(&remote_kernel, "kernel").unwrap();
         fs::write(&remote_rootfs, "rootfs").unwrap();
-
-        let config = ArtifactManagerConfig {
-            managed_cache_root: cache_root.clone(),
-            search_roots: vec![
-                root.join("workspace")
-                    .join("artifacts")
-                    .join("firecracker-node"),
-            ],
-            managed_k3s_version: DEFAULT_K3S_VERSION.to_owned(),
-            kernel_filename: DEFAULT_FIRECRACKER_KERNEL_FILENAME.to_owned(),
-            rootfs_filename: DEFAULT_FIRECRACKER_ROOTFS_FILENAME.to_owned(),
-            kernel_url: Some(format!("file://{}", remote_kernel.display())),
-            rootfs_url: Some(format!("file://{}", remote_rootfs.display())),
-            kernel_sha256: None,
-            rootfs_sha256: None,
-        };
+        let manifest = root.join(FIRECRACKER_ARTIFACT_MANIFEST_FILENAME);
+        fs::write(
+            &manifest,
+            format!(
+                "KERNEL_URL=file://{}\nROOTFS_URL=file://{}\n",
+                remote_kernel.display(),
+                remote_rootfs.display()
+            ),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+            std::env::set_var("KALISTO_FIRECRACKER_ARTIFACT_CACHE_DIR", &cache_root);
+            std::env::set_var("KALISTO_FIRECRACKER_MANIFEST_URL", &manifest);
+            std::env::set_var("KALISTO_FIRECRACKER_VERSION", "v1.13.1");
+        }
         let spec = firecracker_spec(&root.join("workspace"));
         let runner = FakeRunner::default();
 
-        let resolved = config.resolve_firecracker(&spec, &runner).unwrap();
+        let resolved = super::prepare_firecracker(&spec, &runner).unwrap();
+        let versioned_cache = cache_root
+            .join("v1.13")
+            .join(super::detect_firecracker_artifact_arch().unwrap());
 
-        assert_eq!(resolved.kernel, cache_root.join("kernel.bin"));
-        assert_eq!(resolved.rootfs, cache_root.join("rootfs.raw"));
-        assert!(resolved.kernel.is_file());
-        assert!(resolved.rootfs.is_file());
+        assert_eq!(resolved.kernel, versioned_cache.join("kernel.bin"));
+        assert_eq!(resolved.rootfs, versioned_cache.join("rootfs.raw"));
+        assert_eq!(fs::read(&resolved.kernel).unwrap(), b"kernel");
+        assert_eq!(fs::read(&resolved.rootfs).unwrap(), b"rootfs");
         assert_eq!(runner.downloads.lock().unwrap().len(), 2);
+        assert_eq!(*runner.commands.lock().unwrap(), ["curl", "curl"]);
+        assert!(lima_root.is_file());
 
+        for (name, value) in original_env {
+            restore_env(name, value);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1193,9 +1228,7 @@ mod tests {
         checksums.insert(rootfs.clone(), "def456".to_owned());
         let runner = FakeRunner {
             checksums,
-            curl_stdout: HashMap::new(),
-            downloads: Mutex::default(),
-            firecracker_version: None,
+            ..FakeRunner::default()
         };
         let config = ArtifactManagerConfig {
             managed_cache_root: root.join("cache"),
@@ -1248,6 +1281,143 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cluster_spec_prefers_finalized_lima_template() {
+        let _guard = env_lock();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = temp_dir("lima-finalized-template");
+        let image_root = root.join("artifacts").join(LIMA_ARTIFACT_DIR);
+        let finalized = image_root.join(default_lima_finalized_template_filename());
+        let seeded = image_root.join(default_lima_seed_template_filename());
+        fs::create_dir_all(&image_root).unwrap();
+        fs::write(&finalized, "finalized\n").unwrap();
+        fs::write(&seeded, "seeded\n").unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", root.join("xdg-data"));
+        }
+        let mut spec = ClusterSpec::new("default".to_owned(), root.clone());
+        spec.backend = BackendKind::Lima;
+
+        let resolved = resolve_cluster_spec(&spec, &FakeRunner::default()).unwrap();
+
+        assert_eq!(resolved.template, finalized.display().to_string());
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_cluster_spec_prefers_xdg_lima_template_over_workspace() {
+        let _guard = env_lock();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = temp_dir("lima-xdg-template");
+        let data_home = root.join("xdg-data");
+        let workspace_root = root.join("workspace");
+        let workspace_template = workspace_root
+            .join("artifacts")
+            .join(LIMA_ARTIFACT_DIR)
+            .join(default_lima_finalized_template_filename());
+        let xdg_template = data_home
+            .join("kalisto")
+            .join("artifacts")
+            .join(LIMA_ARTIFACT_DIR)
+            .join(default_lima_finalized_template_filename());
+        fs::create_dir_all(workspace_template.parent().unwrap()).unwrap();
+        fs::create_dir_all(xdg_template.parent().unwrap()).unwrap();
+        fs::write(&workspace_template, "workspace\n").unwrap();
+        fs::write(&xdg_template, "xdg\n").unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let mut spec = ClusterSpec::new("default".to_owned(), workspace_root);
+        spec.backend = BackendKind::Lima;
+
+        let resolved = resolve_cluster_spec(&spec, &FakeRunner::default()).unwrap();
+
+        assert_eq!(resolved.template, xdg_template.display().to_string());
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_cluster_spec_finds_lima_template_in_workspace_ancestors() {
+        let _guard = env_lock();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = temp_dir("lima-ancestor-template");
+        let workspace_root = root.join("examples").join("harness").join("job-smoke");
+        let ancestor_template = root
+            .join("artifacts")
+            .join(LIMA_ARTIFACT_DIR)
+            .join(default_lima_finalized_template_filename());
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(ancestor_template.parent().unwrap()).unwrap();
+        fs::write(&ancestor_template, "ancestor\n").unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", root.join("xdg-data"));
+        }
+        let mut spec = ClusterSpec::new("default".to_owned(), workspace_root);
+        spec.backend = BackendKind::Lima;
+
+        let resolved = resolve_cluster_spec(&spec, &FakeRunner::default()).unwrap();
+
+        assert_eq!(resolved.template, ancestor_template.display().to_string());
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apple_container_resolvers_ignore_lima_disks_and_firecracker() {
+        let _guard = env_lock();
+        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let root = temp_dir("apple-ignores-lima-template");
+        let data_home = root.join("xdg-data");
+        let image_root = data_home
+            .join("kalisto")
+            .join("artifacts")
+            .join(LIMA_ARTIFACT_DIR);
+        let stem = format!(
+            "ubuntu-24.04-minimal-k3s-{}-finalized",
+            ImageArch::host_default().lima_artifact_suffix()
+        );
+        let cached_template = image_root.join(format!("{stem}.yaml"));
+        let raw = image_root.join(format!("{stem}.raw"));
+        let packed = image_root.join(format!("{stem}.raw.gz"));
+        fs::create_dir_all(&image_root).unwrap();
+        fs::write(&cached_template, "invalid: [yaml").unwrap();
+        fs::write(&raw, "Lima disk").unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let mut spec = ClusterSpec::new("default".to_owned(), root.join("workspace"));
+        spec.backend = BackendKind::AppleContainer;
+        let runner = FakeRunner::default();
+
+        for template in [
+            "template://default".to_owned(),
+            cached_template.display().to_string(),
+        ] {
+            spec.template = template.clone();
+            let resolved = resolve_cluster_spec(&spec, &runner).unwrap();
+            let pulled = super::pull_cluster_spec(&spec, &runner).unwrap();
+            assert_eq!(resolved.template, template);
+            assert_eq!(pulled.template, template);
+            assert!(resolved.firecracker_kernel.is_none());
+            assert!(pulled.firecracker_rootfs.is_none());
+        }
+        assert!(runner.commands.lock().unwrap().is_empty());
+        assert!(!packed.exists());
+        assert_eq!(
+            fs::read_to_string(&cached_template).unwrap(),
+            "invalid: [yaml"
+        );
+        assert_eq!(fs::read_to_string(&raw).unwrap(), "Lima disk");
+
+        restore_env("XDG_DATA_HOME", original_xdg_data_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resolve_cluster_spec_rejects_generic_lima_default_template() {
         let _guard = env_lock();
         let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
@@ -1268,7 +1438,7 @@ mod tests {
         match error {
             Error::InvalidArgs(message) => {
                 assert!(message.contains("no managed Lima template found"));
-                assert!(message.contains("~/.local/share/kalisto/artifacts/lima-node"));
+                assert!(message.contains("~/.local/share/kalisto/artifacts/node-image"));
                 assert!(message.contains("KALISTO_LIMA_IMAGE_URL"));
                 assert!(message.contains("--template"));
             }
@@ -1313,7 +1483,7 @@ mod tests {
         let cached_image = data_home
             .join("kalisto")
             .join("artifacts")
-            .join("lima-node")
+            .join("node-image")
             .join(default_lima_finalized_image_filename());
 
         assert_eq!(
@@ -1321,7 +1491,7 @@ mod tests {
             data_home
                 .join("kalisto")
                 .join("artifacts")
-                .join("lima-node")
+                .join("node-image")
                 .join(default_lima_finalized_template_filename())
         );
         assert!(cached_image.is_file());

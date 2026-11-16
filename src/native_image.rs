@@ -30,7 +30,7 @@ pub fn prepare(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf
         ));
     }
     let suffix = arch.lima_artifact_suffix();
-    let root = artifacts_root()?.join("lima-node");
+    let root = artifacts_root()?.join("node-image");
     fs::create_dir_all(&root).map_err(io_error)?;
     let image = root.join(format!(
         "ubuntu-24.04-minimal-k3s-{suffix}-finalized.raw.gz"
@@ -151,7 +151,7 @@ pub fn pack_cached_template(spec: &ClusterSpec) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let arch = spec.image_arch.unwrap_or_else(ImageArch::host_default);
-    let root = artifacts_root()?.join("lima-node");
+    let root = artifacts_root()?.join("node-image");
     let stem = format!(
         "ubuntu-24.04-minimal-k3s-{}-finalized",
         arch.lima_artifact_suffix()

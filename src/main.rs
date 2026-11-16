@@ -161,9 +161,8 @@ fn run_create(args: UpArgs) -> Result<()> {
 
 fn run_pull(args: UpArgs) -> Result<()> {
     let spec = args.into_cluster_spec()?;
-    let assets = kalisto::pull::prepare(&spec)?;
-    println!("prepared assets: {}", assets.root.display());
-    println!("probe image: {}", assets.probe_image());
+    let outcome = kalisto::pull::prepare(&spec)?;
+    println!("{outcome}");
     Ok(())
 }
 

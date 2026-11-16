@@ -33,6 +33,8 @@ impl CommandRunner for RecordingRunner {
                         let _ = writeln!(content, "{}  {name}", "a".repeat(64));
                         content
                     })
+                } else if args.last().unwrap().ends_with("/kubectl.sha256") {
+                    "a".repeat(64)
                 } else if args.last().unwrap().ends_with("/k3s-images.txt") {
                     "docker.io/rancher/mirrored-coredns-coredns:1.12.3\ndocker.io/rancher/mirrored-pause:3.6\ndocker.io/rancher/klipper-lb:v0.4.13\ndocker.io/rancher/mirrored-library-traefik:3.3.6\n".to_owned()
                 } else {
@@ -64,6 +66,7 @@ impl CommandRunner for RecordingRunner {
                 )
                 .unwrap();
             }
+            "firecracker" => stdout = "Firecracker v1.13.1".to_owned(),
             "helm" | "limactl" => {}
             "crane" if args[0] == "version" => stdout = "v0.20.3".to_owned(),
             "crane" if args[0] == "digest" => stdout = format!("sha256:{}\n", "b".repeat(64)),
@@ -167,6 +170,42 @@ impl Drop for TestEnvironment {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn firecracker_pull_prepares_only_kernel_rootfs_and_host_kubectl() {
+    let _guard = env_lock();
+    let environment = TestEnvironment::new("firecracker");
+    let mut spec = ClusterSpec::new("firecracker".into(), environment.root.clone());
+    spec.backend = BackendKind::Firecracker;
+    let kernel = environment.root.join("vmlinux");
+    let rootfs = environment.root.join("rootfs.raw");
+    fs::write(&kernel, "kernel").unwrap();
+    fs::write(&rootfs, "rootfs").unwrap();
+    spec.firecracker_kernel = Some(kernel.clone());
+    spec.firecracker_rootfs = Some(rootfs.clone());
+    let runner = RecordingRunner::default();
+
+    let artifacts = prepare_firecracker(&spec, &runner).unwrap();
+
+    assert_eq!(artifacts.kernel, kernel);
+    assert_eq!(artifacts.rootfs, rootfs);
+    assert!(!cache_root().unwrap().exists());
+    assert!(!spec.state_root().exists());
+    assert!(
+        crate::kubectl::binary(&spec.k3s_version, &runner)
+            .unwrap()
+            .is_file()
+    );
+    assert!(
+        runner.commands.lock().unwrap().iter().all(|command| {
+            command == "firecracker --version"
+                || command.starts_with("sha256sum ")
+                || command.starts_with("shasum ")
+                || (command.starts_with("curl ") && command.contains("https://dl.k8s.io/"))
+        }),
+        "Firecracker preparation must not fetch Lima, Apple, Helm or OCI assets"
+    );
 }
 
 #[test]

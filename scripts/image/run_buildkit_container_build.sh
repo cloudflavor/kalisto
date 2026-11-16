@@ -95,7 +95,7 @@ fi
 rm -rf "${CONTEXT_DIR}" "${OUTPUT_DIR}"
 mkdir -p "${CONTEXT_DIR}" "${OUTPUT_DIR}"
 
-cp "${WORKSPACE_ROOT}/scripts/image/Containerfile.lima-node" "${CONTEXT_DIR}/Containerfile"
+cp "${WORKSPACE_ROOT}/scripts/image/Containerfile.node-image" "${CONTEXT_DIR}/Containerfile"
 cp "${WORKSPACE_ROOT}/scripts/image/build_lima_rootfs_in_container.sh" "${CONTEXT_DIR}/build_lima_rootfs_in_container.sh"
 cp "${WORKSPACE_ROOT}/scripts/image/provision_kalisto_node.sh" "${CONTEXT_DIR}/provision_lima_node.sh"
 cp "${K3S_CACHE_PATH}" "${CONTEXT_DIR}/k3s"

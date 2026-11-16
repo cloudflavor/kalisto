@@ -1,4 +1,4 @@
-//! Prepare immutable Lima boot assets without creating cluster state or VMs.
+//! Prepare immutable offline k3s boot assets without creating cluster state or nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -55,6 +55,36 @@ pub struct PreparedAssets {
     manifest: Manifest,
 }
 
+#[derive(Debug)]
+pub enum PullOutcome {
+    AppleContainer(PreparedAssets),
+    Lima(PreparedAssets),
+    Firecracker(artifact::ResolvedFirecrackerArtifacts),
+}
+
+impl std::fmt::Display for PullOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (backend, assets) = match self {
+            Self::AppleContainer(assets) => ("apple-container", assets),
+            Self::Lima(assets) => ("lima", assets),
+            Self::Firecracker(artifacts) => {
+                return write!(
+                    formatter,
+                    "backend: firecracker\nkernel: {}\nrootfs: {}",
+                    artifacts.kernel.display(),
+                    artifacts.rootfs.display()
+                );
+            }
+        };
+        write!(
+            formatter,
+            "backend: {backend}\nprepared assets: {}\nprobe image: {}",
+            assets.root.display(),
+            assets.probe_image()
+        )
+    }
+}
+
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
@@ -63,8 +93,15 @@ pub fn cache_root() -> Result<PathBuf> {
 }
 
 fn profile(spec: &ClusterSpec) -> Result<String> {
-    if spec.backend != BackendKind::Lima {
-        return Err(invalid("pull currently supports the Lima backend only"));
+    if !spec.backend.uses_prepared_assets() {
+        return Err(invalid(
+            "pull supports the Lima and apple-container backends",
+        ));
+    }
+    if spec.backend == BackendKind::AppleContainer
+        && spec.image_arch.unwrap_or_else(ImageArch::host_default) != ImageArch::Aarch64
+    {
+        return Err(invalid("apple-container requires native arm64 node images"));
     }
     if spec.cni_plugin == CniPlugin::Flannel
         || spec.addons.iter().any(|addon| addon != "lb/servicelb")
@@ -99,7 +136,12 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
             mask | (u8::from(*enabled) << bit)
         });
     Ok(format!(
-        "{}-{}-{}-{}-{components:02x}",
+        "{}{}-{}-{}-{}-{components:02x}",
+        if spec.backend == BackendKind::AppleContainer {
+            "apple-container-v1-"
+        } else {
+            ""
+        },
         spec.k3s_version,
         spec.image_arch
             .unwrap_or_else(ImageArch::host_default)
@@ -116,10 +158,51 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
-pub fn prepare(spec: &ClusterSpec) -> Result<PreparedAssets> {
+pub fn prepare(spec: &ClusterSpec) -> Result<PullOutcome> {
+    match spec.backend {
+        BackendKind::AppleContainer => {
+            prepare_apple_container(spec, &SystemRunner).map(PullOutcome::AppleContainer)
+        }
+        BackendKind::Lima => prepare_lima(spec, &SystemRunner).map(PullOutcome::Lima),
+        BackendKind::Firecracker => {
+            prepare_firecracker(spec, &SystemRunner).map(PullOutcome::Firecracker)
+        }
+    }
+}
+
+fn prepare_apple_container(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+) -> Result<PreparedAssets> {
     profile(spec)?;
-    crate::runtime::prepare(&SystemRunner, spec.cni_plugin == CniPlugin::Cilium)?;
-    prepare_with_runner(spec, &SystemRunner)
+    crate::runtime::prepare(
+        runner,
+        BackendKind::AppleContainer,
+        spec.cni_plugin == CniPlugin::Cilium,
+    )?;
+    crate::apple_container::runtime::prepare(runner)?;
+    crate::kubectl::binary(&spec.k3s_version, runner)?;
+    prepare_with_runner(spec, runner)
+}
+
+fn prepare_lima(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PreparedAssets> {
+    profile(spec)?;
+    crate::runtime::prepare(
+        runner,
+        BackendKind::Lima,
+        spec.cni_plugin == CniPlugin::Cilium,
+    )?;
+    crate::kubectl::binary(&spec.k3s_version, runner)?;
+    prepare_with_runner(spec, runner)
+}
+
+fn prepare_firecracker(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+) -> Result<artifact::ResolvedFirecrackerArtifacts> {
+    let artifacts = artifact::prepare_firecracker(spec, runner)?;
+    crate::kubectl::binary(&spec.k3s_version, runner)?;
+    Ok(artifacts)
 }
 
 #[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
@@ -148,8 +231,10 @@ pub fn prepare_with_runner(
         _lock: lock,
         staging: None,
     };
-    let resolved = artifact::pull_cluster_spec(spec, runner)?;
-    validate_lima_template(&resolved.template)?;
+    if spec.backend == BackendKind::Lima {
+        let resolved = artifact::pull_cluster_spec(spec, runner)?;
+        validate_lima_template(&resolved.template)?;
+    }
     if spec
         .state_root()
         .join("archive/assets/manifest.json")
@@ -175,6 +260,12 @@ pub fn prepare_with_runner(
                 &file.sha256,
                 &file.name,
             )?;
+        }
+        if spec.backend == BackendKind::AppleContainer {
+            let image = crate::apple_container::image::prepare(spec, &assets.root, runner)?;
+            if image != assets.apple_node_image()? {
+                return Err(invalid("cached Apple node image identity changed"));
+            }
         }
         return Ok(assets);
     }
@@ -342,6 +433,12 @@ pub fn prepare_with_runner(
     )?;
     files.push(hash_file(runner, &staging, "images.tar")?);
     fs::remove_dir_all(layout).map_err(io_error)?;
+    if spec.backend == BackendKind::AppleContainer {
+        let image = crate::apple_container::image::prepare(spec, &staging, runner)?;
+        fs::write(staging.join("apple-node-image"), format!("{image}\n")).map_err(io_error)?;
+        files.push(hash_file(runner, &staging, "apple-node-image")?);
+        files.push(hash_file(runner, &staging, "apple-node-image.tar")?);
+    }
     let manifest = Manifest {
         schema: SCHEMA,
         profile: key,
@@ -385,7 +482,7 @@ pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<Prepared
         return Err(invalid("boot asset profile mismatch; run kalisto pull"));
     }
     let chart_name = format!("cilium-{}.tgz", spec.cilium_version);
-    let required = if spec.cni_plugin == CniPlugin::Cilium {
+    let mut required = if spec.cni_plugin == CniPlugin::Cilium {
         vec![
             "k3s",
             "k3s-images.tar.zst",
@@ -396,6 +493,9 @@ pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<Prepared
     } else {
         vec!["k3s", "k3s-images.tar.zst", "images.tar"]
     };
+    if spec.backend == BackendKind::AppleContainer {
+        required.extend(["apple-node-image", "apple-node-image.tar"]);
+    }
     let names = manifest
         .files
         .iter()
@@ -442,15 +542,28 @@ pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<Prepared
             return Err(invalid("cached Cilium rollout inventory mismatch"));
         }
     }
-    Ok(PreparedAssets {
+    let assets = PreparedAssets {
         root: root.canonicalize().map_err(io_error)?,
         manifest,
-    })
+    };
+    if spec.backend == BackendKind::AppleContainer {
+        assets.apple_node_image()?;
+    }
+    Ok(assets)
 }
 
 impl PreparedAssets {
     pub(crate) fn filenames(&self) -> impl Iterator<Item = &str> {
         self.manifest.files.iter().map(|file| file.name.as_str())
+    }
+
+    pub(crate) fn apple_node_image(&self) -> Result<String> {
+        let reference = fs::read_to_string(self.root.join("apple-node-image")).map_err(io_error)?;
+        let reference = reference.trim();
+        if !valid_image_reference(reference) {
+            return Err(invalid("cached Apple node image must be digest-pinned"));
+        }
+        Ok(reference.to_owned())
     }
 
     #[must_use]

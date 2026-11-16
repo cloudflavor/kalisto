@@ -335,6 +335,7 @@ pub(crate) fn import_protected_with_runner(
     if prepare_tools {
         crate::runtime::prepare(
             runner,
+            BackendKind::Lima,
             state.cni_plugin == crate::cluster::addon::CniPlugin::Cilium,
         )?;
     }

@@ -138,6 +138,7 @@ fn native_cold_archive_restores_kubernetes_objects_and_worker_local_data() {
         "mkdir -p /var/lib/kalisto-archive-proof; printf 'persistent-before-export' >/var/lib/kalisto-archive-proof/value"]).output().unwrap();
     assert!(output.status.success());
     let mut spec = ClusterSpec::new(name.clone(), workspace.clone());
+    spec.backend = kalisto::backend::BackendKind::Lima;
     spec.cni_plugin = CniPlugin::Cilium;
     spec.cni_plugin
         .apply_component_defaults(&mut spec.component_toggles);

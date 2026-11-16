@@ -158,9 +158,8 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             let up = lifecycle
                 .into_up_args(manifest.default_project_root.clone())
                 .map_err(jsonrpc_to_error)?;
-            let assets = crate::pull::prepare(&up.into_cluster_spec()?)?;
-            println!("prepared assets: {}", assets.root.display());
-            println!("probe image: {}", assets.probe_image());
+            let outcome = crate::pull::prepare(&up.into_cluster_spec()?)?;
+            println!("{outcome}");
             Ok(())
         }
         "clusters.up" => {
@@ -1630,7 +1629,7 @@ fn lifecycle_properties() -> Map<String, Value> {
         ("name".to_owned(), json!({ "type": "string" })),
         (
             "backend".to_owned(),
-            json!({ "type": "string", "enum": ["firecracker", "lima"] }),
+            json!({ "type": "string", "enum": ["firecracker", "lima", "apple-container"] }),
         ),
         ("template".to_owned(), json!({ "type": "string" })),
         (
@@ -2471,7 +2470,9 @@ fn parse_backend(value: &str) -> std::result::Result<BackendKind, JsonRpcError> 
     BackendKind::parse(value).ok_or_else(|| {
         jsonrpc_error(
             -32602,
-            format!("unsupported backend `{value}`; expected one of: firecracker, lima"),
+            format!(
+                "unsupported backend `{value}`; expected one of: firecracker, lima, apple-container"
+            ),
         )
     })
 }
@@ -2827,8 +2828,11 @@ fn complete_child_result(tool_name: &str, task_id: &str, stdout: &str, stderr: &
             success_tool_result(
                 "Prepared boot assets.",
                 &json!({
+                    "backend": values.get("backend"),
                     "assetsRoot": values.get("prepared assets"),
                     "probeImage": values.get("probe image"),
+                    "kernel": values.get("kernel"),
+                    "rootfs": values.get("rootfs"),
                     "stdout": stdout, "stderr": stderr,
                 }),
             )

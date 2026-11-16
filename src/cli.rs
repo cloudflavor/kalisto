@@ -29,7 +29,7 @@ pub struct Cli {
 #[structopt(rename_all = "kebab")]
 pub enum Command {
     Create(UpArgs),
-    /// Cache Lima node images, K3s and Cilium assets before starting fresh VMs.
+    /// Cache assets for the selected backend before starting fresh nodes.
     Pull(UpArgs),
     /// Export stopped native VZ nodes, including credentials and VM-local data.
     Export(ExportArgs),
@@ -228,6 +228,7 @@ pub struct UpArgs {
     pub project_root: Option<PathBuf>,
     #[structopt(long)]
     pub name: Option<String>,
+    /// Backend: apple-container by default on macOS, firecracker on Linux.
     #[structopt(long, parse(try_from_str = parse_backend_kind))]
     pub backend: Option<BackendKind>,
     #[structopt(long)]
@@ -275,6 +276,9 @@ impl UpArgs {
     pub fn into_cluster_spec(self) -> crate::error::Result<ClusterSpec> {
         let mut spec = resolve_base_cluster_spec(self.project_root.clone(), self.name.clone())?;
         if let Some(backend) = self.backend {
+            if spec.backend != backend {
+                spec.network = crate::cluster::spec::default_network(backend);
+            }
             spec.backend = backend;
         }
         if let Some(template) = self.template {
@@ -533,8 +537,11 @@ fn merge_requested_cni(
 }
 
 fn parse_backend_kind(value: &str) -> std::result::Result<BackendKind, String> {
-    BackendKind::parse(value)
-        .ok_or_else(|| format!("unsupported backend `{value}`; expected one of: firecracker, lima"))
+    BackendKind::parse(value).ok_or_else(|| {
+        format!(
+            "unsupported backend `{value}`; expected one of: firecracker, lima, apple-container"
+        )
+    })
 }
 
 fn parse_log_level(value: &str) -> std::result::Result<Level, String> {
@@ -1281,6 +1288,8 @@ version = "1.19.2"
             Command::Up(args) => {
                 let spec = args.into_cluster_spec().unwrap();
                 assert_eq!(spec.name, "from-config");
+                assert_eq!(spec.backend, crate::backend::BackendKind::Lima);
+                assert_eq!(spec.network, "lima:user-v2");
                 assert_eq!(spec.api_port, 17443);
                 assert_eq!(spec.cni_plugin, CniPlugin::Cilium);
                 assert_eq!(spec.cilium_version, "1.19.2");
@@ -1301,6 +1310,8 @@ version = "1.19.2"
             r#"
 [cluster]
 name = "from-config"
+backend = "apple-container"
+network = "apple-container"
 api_port = 17443
 
 [plugins.cilium]
@@ -1314,6 +1325,8 @@ enabled = true
             "up",
             "--project-root",
             root.to_str().unwrap(),
+            "--backend",
+            "lima",
             "--name",
             "from-cli",
             "--api-port",
@@ -1327,6 +1340,8 @@ enabled = true
             Command::Up(args) => {
                 let spec = args.into_cluster_spec().unwrap();
                 assert_eq!(spec.name, "from-cli");
+                assert_eq!(spec.backend, crate::backend::BackendKind::Lima);
+                assert_eq!(spec.network, "lima:user-v2");
                 assert_eq!(spec.api_port, 18443);
                 assert_eq!(spec.cni_plugin, CniPlugin::Flannel);
                 assert!(spec.component_toggles.flannel_backend_none);

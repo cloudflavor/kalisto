@@ -1,13 +1,14 @@
 # Kalisto
 
-Local-development Kubernetes runtime on macOS using native Lima/VZ.
+Local-development Kubernetes runtime using k3s on macOS and Linux.
 
 Current scope:
 
-- macOS backend: native Lima `vz` (Rosetta opt-in)
+- default macOS backend: Apple `container` running Kalisto-managed k3s nodes
+- optional macOS backend: native Lima `vz` (Rosetta opt-in)
 - Linux backend: Firecracker (in progress)
 - Kubernetes distro: `k3s`
-- image pipeline: native VZ OS preparation; optional legacy container builders
+- image pipeline: prepared Ubuntu/k3s node images; optional Lima VM disks
 
 ## Binary releases
 
@@ -19,7 +20,32 @@ support remains in progress; available binaries do not imply feature parity.
 
 ## Quick Start
 
-Install the standalone macOS binary, then run from any directory:
+### macOS prerequisites
+
+The default Apple-container backend requires:
+
+- **Apple silicon and macOS 26 or newer.**
+- **Apple's `container` CLI installed and its system service running before
+  `kalisto pull` or `kalisto up`.** The validated version is `container` 1.7.1.
+
+For a new Homebrew installation:
+
+```bash
+brew install container
+container system start
+container --version
+container list
+```
+
+Skip installation/start if a compatible installation and service are already
+available. Do not replace or stop a shared running daemon. First-time runtime
+and kernel setup happens before the cluster startup measurement.
+See [macOS Apple-container prerequisites](docs/prerequisites-macos-apple-container.md)
+for installation, upgrades and firewall requirements.
+
+### Prepare and start
+
+After installing Apple `container` and the standalone Kalisto binary, run from any directory:
 
 ```bash
 kalisto pull --addons cni/cilium
@@ -32,12 +58,15 @@ boots; rerun `pull` when the profile changes or cache is removed. Repeating `pul
 verifies/reuses a complete cache rather than rebuilding the OS image. Bare
 `pull`/`up` do **not** select a CNI.
 
-`pull` fetches checksum-verified managed Lima, Helm, Crane, K3s, and
-platform-digest-pinned OCI images including a BusyBox diagnostic image. It prepares
-a sanitized compressed Ubuntu disk via a temporary native VZ VM, never starting
-Kubernetes or creating cluster state; the builder is deleted after use. Standard
-flow requires no checkout, manual templates, Homebrew, Docker, QEMU install, or
-host sudo. Cache lives under `artifacts/boot-v4` in user-scoped Kalisto data.
+With the prerequisites in place, `pull` reuses the installed Apple CLI/runtime
+from `PATH`, including Homebrew, without replacing its compatible running service.
+It prepares the kernel/init image, managed Crane, kubectl, Helm when Cilium is
+selected, K3s, and platform-digest-pinned OCI images including a BusyBox diagnostic
+image. A temporary ordinary container prepares the reusable Ubuntu/k3s node image,
+never starting Kubernetes or creating cluster state; the builder is deleted after
+use. After Apple `container` is installed, no checkout, manual templates, Docker,
+QEMU install, host sudo or Lima is needed. Cache lives under `artifacts/boot-v4`
+in user-scoped Kalisto data.
 Preparation can take several minutes and stays outside cold cluster startup timing.
 
 `up` requires a complete cache, mounts it read-only, imports local images on fresh
@@ -50,12 +79,12 @@ support enabled rather than a separate proxy DaemonSet. Default CNI remains `non
 explicit Cilium selection is required for pod networking. MCP exposes the same
 preparation through `clusters.pull`, using the lifecycle arguments of `clusters.up`.
 
-The current prepared startup profile supports Lima, no CNI or Cilium, and optional
-`lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
+The prepared startup profiles support Lima and Apple containers, no CNI or Cilium,
+and optional `lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
 silently; install those explicitly after startup. Existing Helm-managed Cilium
 clusters require migration; prepared startup currently targets fresh clusters.
 
-The opt-in release benchmark in `tests/macos_three_node_boot_budget.rs` passed
+The optional Lima release benchmark in `tests/macos_three_node_boot_budget.rs` passed
 in **56.07s, 53.84s, 54.26s, and 54.83s** on the development Mac. Each run used the actual
 binary from an empty directory with system-only `PATH`, fresh three VMs, three
 Ready nodes, authenticated host API, Cilium rollouts, and DNS/Service HTTP probes
@@ -63,10 +92,132 @@ from both workers. Image imports and VM creation remain inside the timer;
 `pull` preparation stays outside it. These measurements are not a universal
 hardware performance guarantee.
 
+## Apple container backend
+
+Apple's lightweight Linux VM runtime is the macOS default. Kalisto runs its own
+k3s without using Apple's experimental Kubernetes cluster implementation:
+
+```bash
+kalisto pull --addons cni/cilium
+kalisto up --workers 2 --addons cni/cilium
+kalisto kubectl -- get nodes
+kalisto down
+kalisto up
+```
+
+Kalisto owns the k3s server, agents, Cilium, readiness checks, and cluster state.
+It does not use `container cluster`, `container machine`, kubeadm, kind, Docker,
+or an external registry to bootstrap prepared nodes. Lima is an explicit alternative.
+
+Apple `container` is a host prerequisite; install and start it before preparation.
+Kalisto reuses the compatible Apple 1.7.1 CLI on `PATH`, including Homebrew's CLI
+and already-running service. `pull` prepares a kernel/init image and composes a
+digest-pinned Ubuntu/k3s node image. A temporary ordinary container installs Linux
+prerequisites, then is deleted;
+no cluster identity is baked into the reusable image. The cached node OCI archive
+can restore a pruned runtime image store when `pull` is repeated. Node archives are
+served directly over temporary loopback HTTP during import, without extracting a
+second archive copy or reconfiguring the shared image helper. Managed Crane handles
+external image downloads, including init and base images. Kernel extraction runs
+in Rust and does not require a host `zstd` executable.
+
+`up` requires the local node image and prepared assets; it never installs tools,
+pulls missing images, or changes the selected CNI. Nodes start concurrently on an
+owned NAT network, with only their own runtime directory and read-only boot assets
+mounted from the host. No home directory, SSH agent, or global shared image store
+is exposed to guests. Workload registry access remains available after startup.
+
+Apple's service is shared within a macOS login session. A compatible running
+service is borrowed without stopping, replacing, or changing its executable,
+installation/application roots, configuration, or default system properties.
+Kalisto owns only its cluster nodes, networks, and VM directories, not that daemon
+or its existing data. Runtime selection is recorded in per-user Kalisto data,
+separately from the shared artifact cache. An incompatible running service causes
+a clear error before any replacement is downloaded; Kalisto never takes it over.
+Use the explicit Lima backend if the running service is incompatible.
+
+Application firewalls such as [LuLu](https://objective-see.org/products/lulu.html)
+may require separate allow rules for Homebrew's `container-core-images` and
+`container-runtime-linux` executables after an upgrade. Rules for Apple-signed
+copies do not necessarily match Homebrew builds. Approve only the required
+helpers; do not disable the firewall.
+
+The Apple backend uses the same three-node, authenticated-API, Cilium rollout,
+worker DNS, and cross-node Service HTTP budget scenario as Lima:
+
+```bash
+KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1 \
+  cargo test --release --test macos_three_node_boot_budget \
+  apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
+```
+
+Native [macOS CI](https://forgejo.example.test/cloudflavor/kalisto/actions/runs/41)
+measured **46.71s** for that fresh three-node scenario using the existing Homebrew
+Apple `container` 1.7.1 service without replacing or reconfiguring it.
+Stop/resume preserved Kubernetes state, and scaling to four Ready nodes passed
+afterward, outside the startup timer. This is one completed run, not a universal
+hardware performance guarantee.
+
+The native CI scenario borrows a running Homebrew 1.7.1 service; CI setup may start
+a stopped installation, but never replaces a running daemon.
+It records CLI/daemon identity, service roots, process identity, and default system
+properties before flag-free `pull`/`up` with system-only `PATH`, then compares them after preparation,
+stop/resume, scaling, and cluster destruction. It also checks that no private
+installer is fetched or selected. CI cleanup never stops the borrowed daemon or
+removes its persistent application root.
+
+Run live validation only in the authorized native macOS CI job. The existing Lima
+timings above are not Apple-container measurements. Cold archive export/import
+currently remains Lima-only; existing Lima clusters and archives are not converted
+by selecting a different backend.
+
+## Backend-specific preparation
+
+`pull` prepares only the selected backend; it does not prepare the other engines.
+Apple containers are the macOS default, Firecracker is the Linux default, and
+`--backend` or `cluster.backend` selects an explicit alternative.
+
+| Backend | Preparation command | Backend-specific assets |
+| --- | --- | --- |
+| Apple containers (macOS default) | `kalisto pull` | Linux kernel/init and Ubuntu/k3s OCI node image, using the installed Apple `container` runtime; no Lima VM disk or template |
+| Lima (optional) | `kalisto pull --backend lima` | Managed Lima runtime and VM disk/template under `artifacts/node-image`; no Apple runtime or node image |
+| Firecracker (Linux default) | `kalisto pull --backend firecracker` | Configured/discovered Firecracker kernel and rootfs; no Apple, Lima, Helm or OCI boot-profile preparation |
+
+Apple and Lima also cache Kubernetes boot images and managed kubectl. Add
+`--addons cni/cilium` to prepare Cilium images and its Helm chart, then select the
+same add-on during `up`. Firecracker prepares matching host kubectl, but its
+kernel/rootfs publication is still in progress: provide existing artifacts or
+configured manifest/artifact URLs as described in
+[Linux prerequisites](docs/prerequisites-linux-firecracker.md). This does not
+extend the macOS offline-startup or sub-minute guarantee to Firecracker.
+CLI and MCP pull results identify the selected backend and report only its
+prepared boot profile or kernel/rootfs paths. Disk templates are never discovered
+for default Apple-container startup, and only Lima logs a template path.
+
+## Optional Lima backend
+
+Select Lima explicitly on both preparation and startup, including on Intel Macs or
+macOS versions older than 26:
+
+```bash
+kalisto pull --backend lima --addons cni/cilium
+kalisto up --backend lima --workers 2 --addons cni/cilium
+```
+
+Or persist the choice in `kalisto.toml`:
+
+```toml
+[cluster]
+backend = "lima"
+```
+
+The default never silently falls back to Lima. Existing clusters retain their
+recorded backend; selecting another backend does not convert their disks.
+
 ## Install workloads
 
 After `up`, Cilium and CoreDNS provide pod networking and DNS. Supply a Kubernetes
-client such as `kubectl`; host `kubectl` is not installed automatically:
+client such as `kubectl`; the standalone host command is not added to `PATH`:
 
 ```bash
 export KUBECONFIG="$(kalisto kubeconfig --path)"
@@ -77,7 +228,7 @@ kubectl apply -f app.yaml
 
 Or work without a host Kubernetes client: `kalisto apply` ships a manifest to the
 running cluster, and `kalisto kubectl` runs a checksum-verified managed kubectl
-binary matching the cluster's K3s release (fetched on first use, not during `up`):
+binary matching the cluster's Kubernetes version (prepared by `pull`, otherwise fetched on first use):
 
 `app.yaml` is user-provided. New workload images may require registry access after
 startup; the boot cache does not include every application. Ingress is not installed
@@ -374,9 +525,10 @@ KALISTO_BUILD_VERSION=1.4.3-rc.1+build42 cargo build
 
 ## Advanced: legacy Lima image build helpers
 
-The standard binary-only path is `kalisto pull`: it prepares a sanitized compressed
+For the optional Lima backend, `kalisto pull` prepares a sanitized compressed
 Ubuntu raw disk through native VZ without starting Kubernetes. No scripts in this
-section are required for that flow.
+section are required for that flow. Lima YAML templates are Lima-only; the default
+Apple-container backend neither needs nor consumes a disk image template.
 
 The optional maintainer scripts below provide a separate two-stage image flow:
 
@@ -385,7 +537,7 @@ The optional maintainer scripts below provide a separate two-stage image flow:
 
 Relevant files:
 
-- [images/macos/lima-node/ubuntu-24.04.yaml](images/macos/lima-node/ubuntu-24.04.yaml)
+- [images/macos/node-image/ubuntu-24.04.yaml](images/macos/node-image/ubuntu-24.04.yaml)
 - [scripts/macos/provision_lima_node.sh](scripts/macos/provision_lima_node.sh)
 - [scripts/macos/build_lima_node_image.sh](scripts/macos/build_lima_node_image.sh)
 - [scripts/macos/finalize_lima_node_image.sh](scripts/macos/finalize_lima_node_image.sh)
@@ -419,31 +571,31 @@ brew install qemu
 
 Default artifacts:
 
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.yaml`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.manifest`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
 
 ## Advanced: releasing prebuilt Lima images
 
 This optional publishing workflow uses the legacy helpers above, not the managed
-native preparation performed by `kalisto pull`.
+native preparation performed by `kalisto pull` for the optional Lima backend.
 
 For a published prebuilt image, the important runtime artifact is the finalized
 disk image. Kalisto can render the matching Lima template locally from that image,
 so the minimum published artifact set is:
 
 - required:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
 - recommended:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
 - optional intermediate seed artifacts:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.yaml`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.manifest`
 
 Build and finalize the release image with these scripts:
 
@@ -453,8 +605,8 @@ sh scripts/macos/finalize_lima_node_image.sh
 ```
 
 The legacy finalize script requires `qemu-img` to export a compact finalized
-`qcow2`. The standard native `kalisto pull` path instead exports compressed raw
-and does not require a host QEMU installation.
+`qcow2`. The optional Lima backend's native `kalisto pull` path instead exports
+compressed raw and does not require a host QEMU installation.
 
 The first script produces the seed image and manifest. The second script boots
 that seed once under Lima, waits for the guest to contain the Kalisto node-image
@@ -464,18 +616,18 @@ manifest.
 To install a release artifact into Kalisto's managed XDG cache locally:
 
 ```bash
-mkdir -p ~/.local/share/kalisto/artifacts/lima-node
-cp artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
-  ~/.local/share/kalisto/artifacts/lima-node/
+mkdir -p ~/.local/share/kalisto/artifacts/node-image
+cp artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/node-image/
 sh scripts/macos/render_lima_artifact_template.sh \
-  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
-  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
+  ~/.local/share/kalisto/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
 ```
 
 Kalisto now looks in this XDG cache first:
 
 ```text
-~/.local/share/kalisto/artifacts/lima-node/
+~/.local/share/kalisto/artifacts/node-image/
 ```
 
 If you publish the finalized image at a stable URL, Kalisto can fetch it on miss
