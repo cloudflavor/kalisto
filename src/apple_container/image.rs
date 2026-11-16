@@ -1,8 +1,8 @@
 //! Prepare a reusable Linux node rootfs during pull, never Kubernetes identities.
 //!
-//! Apple 1.7.1 exports ordinary containers as an uncompressed rootfs tar; compose
-//! the OCI config ourselves so neither the preparation command nor host-derived
-//! environment becomes the node's init process. `image load` also unpacks it.
+//! Export ordinary containers to an external OCI archive. Pull that archive over
+//! a temporary loopback registry so an existing Apple image helper never extracts
+//! a second copy into its own temporary directory.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -77,7 +77,7 @@ cat /proc/sys/kernel/random/boot_id > /run/kalisto-node-ready
 exec sleep infinity
 "#;
 
-/// Build, import and unpack the exact k3s node image, using only managed tools.
+/// Build, import and unpack the exact k3s node image using the selected runtime.
 #[allow(clippy::too_many_lines)] // Keep the owned preparation container and cleanup in one scope.
 pub(crate) fn prepare(
     spec: &ClusterSpec,
@@ -194,13 +194,25 @@ pub(crate) fn prepare(
 }
 
 fn import_image(runner: &dyn CommandRunner, archive: &Path, reference: &str) -> Result<()> {
+    let registry = super::registry::ArchiveRegistry::start(archive, reference)?;
     runtime::run(
         runner,
         &[
             "image".into(),
-            "load".into(),
-            "--input".into(),
-            archive.display().to_string(),
+            "pull".into(),
+            "--insecure".into(),
+            "--platform".into(),
+            "linux/arm64".into(),
+            registry.reference().into(),
+        ],
+    )?;
+    runtime::run(
+        runner,
+        &[
+            "image".into(),
+            "tag".into(),
+            registry.reference().into(),
+            reference.into(),
         ],
     )?;
     // Fail pull rather than leave up to discover an unresolvable local ref.
@@ -431,5 +443,74 @@ mod tests {
     #[test]
     fn empty_export_is_rejected_before_loading() {
         assert!(write_image(&mut Cursor::new(b""), Vec::new(), "v1.33.5+k3s1").is_err());
+    }
+    #[test]
+    fn loopback_import_serves_exact_manifest_and_layer_without_extracting() {
+        use std::fs;
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        use super::super::registry::ArchiveRegistry;
+
+        struct ArchiveFile(std::path::PathBuf);
+        impl Drop for ArchiveFile {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        fn request(registry: &ArchiveRegistry, method: &str, path: &str) -> Vec<u8> {
+            let address = registry.reference().split('/').next().unwrap();
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "{method} {path} HTTP/1.1\r\nHost: {address}\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        }
+        fn body(response: &[u8]) -> &[u8] {
+            let end = response
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            &response[end + 4..]
+        }
+
+        let path = ArchiveFile(std::env::temp_dir().join(format!(
+            "kalisto-loopback-import-{}.tar",
+            std::process::id()
+        )));
+        let layer = b"unique node layer bytes, not an archive header";
+        let reference = write_image(
+            &mut Cursor::new(layer),
+            fs::File::create_new(&path.0).unwrap(),
+            "v1.33.5+k3s1",
+        )
+        .unwrap();
+        let registry = ArchiveRegistry::start(&path.0, &reference).unwrap();
+        let manifest_digest = reference.rsplit_once('@').unwrap().1;
+        let manifest_path = format!("/v2/kalisto-node/manifests/{manifest_digest}");
+        let response = request(&registry, "GET", &manifest_path);
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            format!("sha256:{}", digest(body(&response))),
+            manifest_digest
+        );
+        let manifest: Value = serde_json::from_slice(body(&response)).unwrap();
+        let layer_digest = manifest["layers"][0]["digest"].as_str().unwrap();
+        let blob_path = format!("/v2/kalisto-node/blobs/{layer_digest}");
+        assert_eq!(body(&request(&registry, "GET", &blob_path)), layer);
+        assert!(body(&request(&registry, "HEAD", &blob_path)).is_empty());
+        assert!(
+            request(&registry, "GET", "/v2/kalisto-node/blobs/../../etc/passwd")
+                .starts_with(b"HTTP/1.1 404")
+        );
+        assert!(request(&registry, "DELETE", &blob_path).starts_with(b"HTTP/1.1 405"));
     }
 }

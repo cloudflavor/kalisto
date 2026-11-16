@@ -113,6 +113,225 @@ fn managed_kubectl() -> PathBuf {
     .expect("matching managed kubectl should be prepared")
 }
 
+struct BorrowedAppleRuntime {
+    executable: PathBuf,
+    identity: serde_json::Value,
+    config: Option<Vec<u8>>,
+    private_files: [Option<(u64, SystemTime)>; 3],
+}
+
+impl BorrowedAppleRuntime {
+    fn capture(evidence: &Path, stage: &str) -> Self {
+        let executable = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+            .map(|directory| directory.join("container"))
+            .find(|candidate| candidate.is_file())
+            .expect("native CI requires an installed Homebrew container on PATH")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            executable.to_string_lossy().contains("/Cellar/container/"),
+            "native CI must prove reuse of Homebrew, not a private runtime"
+        );
+        let version = runtime_output(&executable, &["--version"]);
+        assert!(
+            String::from_utf8_lossy(&version)
+                .starts_with("container CLI version 1.7.1 (build: release,"),
+            "native CI requires the supported Homebrew release"
+        );
+        let status: serde_json::Value = serde_json::from_slice(&runtime_output(
+            &executable,
+            &["system", "status", "--format", "json"],
+        ))
+        .unwrap();
+        assert_eq!(status["status"], "running", "do not start a user's service");
+        assert_eq!(status["server"]["version"], "1.7.1");
+        assert_eq!(status["server"]["build"], "release");
+        let app = PathBuf::from(status["paths"]["appRoot"].as_str().unwrap());
+        let install = PathBuf::from(status["paths"]["installRoot"].as_str().unwrap());
+        assert!(executable.starts_with(install.canonicalize().unwrap()));
+        let services = launchd_services(&app, &install);
+        let properties: serde_json::Value = serde_json::from_slice(&runtime_output(
+            &executable,
+            &["system", "property", "list", "--format", "json"],
+        ))
+        .unwrap();
+        // Homebrew's PATH entry is a shell wrapper; Kalisto selects the native
+        // CLI beside the already-running API daemon, retaining this installation.
+        let path_executable = executable;
+        let executable = Path::new(
+            services["com.apple.container.apiserver"]["program"]
+                .as_str()
+                .unwrap(),
+        )
+        .parent()
+        .unwrap()
+        .join("container")
+        .canonicalize()
+        .unwrap();
+        assert!(executable.starts_with(install.canonicalize().unwrap()));
+        let identity = serde_json::json!({
+            "executable": executable,
+            "path_executable": path_executable,
+            "paths": status["paths"],
+            "server": status["server"],
+            "services": services,
+            "properties": properties
+        });
+        fs::write(
+            evidence.join(format!("runtime-{stage}.json")),
+            serde_json::to_vec_pretty(&identity).unwrap(),
+        )
+        .unwrap();
+        let private_root = kalisto::paths::artifacts_root()
+            .unwrap()
+            .join("runtime-v1/apple-container-1.7.1-arm64");
+        let private_files = [
+            private_root.join("install"),
+            private_root.join("downloads/container-1.7.1-installer-signed.pkg"),
+            private_root.join("downloads/container-1.7.1-installer-signed.download"),
+        ]
+        .map(|path| match fs::metadata(&path) {
+            Ok(metadata) => Some((metadata.len(), metadata.modified().unwrap())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("cannot inspect private runtime {}: {error}", path.display()),
+        });
+        let config = match fs::read(app.join("config.toml")) {
+            Ok(config) => Some(config),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("cannot inspect borrowed service config: {error}"),
+        };
+        Self {
+            executable,
+            identity,
+            config,
+            private_files,
+        }
+    }
+
+    fn assert_unchanged(&self, evidence: &Path, stage: &str) {
+        let after = Self::capture(evidence, stage);
+        assert_eq!(
+            after.identity, self.identity,
+            "borrowed service was mutated"
+        );
+        assert!(
+            after.config == self.config,
+            "borrowed service configuration must not change"
+        );
+        assert_eq!(
+            after.private_files, self.private_files,
+            "reuse must not download or install a private Apple runtime"
+        );
+        assert_eq!(
+            kalisto::runtime::program("container").unwrap(),
+            self.executable,
+            "Kalisto must select the compatible executable from PATH"
+        );
+        let selection: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                kalisto::paths::data_root()
+                    .unwrap()
+                    .join("apple-container/selection.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selection["managed"], false, "the service is user-owned");
+        assert_eq!(selection["executable"], self.identity["executable"]);
+        for key in ["app_root", "install_root"] {
+            let status_key = if key == "app_root" {
+                "appRoot"
+            } else {
+                "installRoot"
+            };
+            assert_eq!(
+                Path::new(selection[key].as_str().unwrap()),
+                Path::new(self.identity["paths"][status_key].as_str().unwrap())
+            );
+        }
+        assert_eq!(
+            selection["api_program"],
+            self.identity["services"]["com.apple.container.apiserver"]["program"]
+        );
+        let log = fs::read_to_string(evidence.join("pull.log")).unwrap();
+        assert!(
+            !log.contains("container-1.7.1-installer-signed")
+                && !log.contains("signed Apple container runtime"),
+            "pull must not fetch a second Apple runtime"
+        );
+    }
+}
+
+fn launchd_services(app: &Path, install: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let uid = runtime_output(Path::new("/usr/bin/id"), &["-u"]);
+    let session = runtime_output(Path::new("/bin/launchctl"), &["managername"]);
+    let domain = match String::from_utf8_lossy(&session).trim() {
+        "Aqua" => "gui",
+        "Background" => "user",
+        other => panic!("unsupported native CI launchd session: {other}"),
+    };
+    let mut services = serde_json::Map::new();
+    for label in [
+        "com.apple.container.apiserver",
+        "com.apple.container.container-core-images",
+    ] {
+        let target = format!("{domain}/{}/{label}", String::from_utf8_lossy(&uid).trim());
+        let output = runtime_output(Path::new("/bin/launchctl"), &["print", &target]);
+        let output = String::from_utf8(output).unwrap();
+        let mut identity = serde_json::Map::new();
+        for (key, separator) in [
+            ("program", "="),
+            ("CONTAINER_APP_ROOT", "=>"),
+            ("CONTAINER_INSTALL_ROOT", "=>"),
+            ("TMPDIR", "=>"),
+        ] {
+            if let Some(value) = launchd_value(&output, key, separator) {
+                identity.insert(key.into(), value.into());
+            }
+        }
+        assert_eq!(
+            identity["CONTAINER_APP_ROOT"].as_str().map(Path::new),
+            Some(app),
+            "the running service must keep its original app root"
+        );
+        assert_eq!(
+            identity["CONTAINER_INSTALL_ROOT"].as_str().map(Path::new),
+            Some(install),
+            "the running service must keep its original install root"
+        );
+        if label == "com.apple.container.apiserver" {
+            for key in ["pid", "runs"] {
+                let value = launchd_value(&output, key, "=")
+                    .expect("the already-running API daemon must retain its process");
+                identity.insert(key.into(), value.into());
+            }
+        }
+        services.insert(label.into(), identity.into());
+    }
+    services
+}
+
+fn runtime_output(program: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .expect("runtime identity inspection should run");
+    assert!(
+        output.status.success(),
+        "{} {args:?} failed: {}",
+        program.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn launchd_value<'a>(output: &'a str, key: &str, separator: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once(separator)?;
+        (name.trim() == key).then_some(value.trim())
+    })
+}
+
 #[test]
 fn cold_cli_boot_has_three_ready_nodes_working_cni_and_host_api_under_one_minute() {
     if std::env::var("KALISTO_LIVE_THREE_NODE_BOOT_BUDGET").as_deref() != Ok("1") {
@@ -165,12 +384,13 @@ fn cold_cli_boot(backend: BackendKind) {
             );
         }
     }
-    let _cleanup = OwnedCluster(name.clone(), evidence.clone());
+    let cleanup = OwnedCluster(name.clone(), evidence.clone());
+    let borrowed_runtime = (backend == BackendKind::AppleContainer)
+        .then(|| BorrowedAppleRuntime::capture(&evidence, "before-pull"));
     let up_log = fs::File::create(evidence.join("up.log")).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kalisto"));
     command
         .env("RUST_LOG", "info")
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir(&workspace)
         .args([
             "up",
@@ -187,17 +407,21 @@ fn cold_cli_boot(backend: BackendKind) {
         .stderr(Stdio::from(up_log));
     if backend != BackendKind::AppleContainer {
         command.args(["--backend", backend.as_str()]);
+        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }
     if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
         command.args(["--api-port", &port]);
     }
 
     // Preparation may build a sanitized OS image, never a Kubernetes cluster or
-    // any benchmark VM. Product commands run outside the checkout without brew tools.
+    // any benchmark VM. Apple commands retain PATH to reuse the user's Homebrew CLI.
     let mut pull = Command::new(command.get_program());
     let pull_log = fs::File::create(evidence.join("pull.log")).unwrap();
+    pull.env("RUST_LOG", "info");
+    if backend != BackendKind::AppleContainer {
+        pull.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    }
     let pull_status = pull
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir(&workspace)
         .arg("pull")
         .args(command.get_args().skip(1))
@@ -213,6 +437,9 @@ fn cold_cli_boot(backend: BackendKind) {
         !spec.state_root().exists(),
         "pull must not create cluster state"
     );
+    if let Some(runtime) = &borrowed_runtime {
+        runtime.assert_unchanged(&evidence, "after-pull");
+    }
     if backend == BackendKind::Lima {
         let after_pull =
             Command::new(kalisto::runtime::program("limactl").expect("pull installs Lima"))
@@ -404,7 +631,8 @@ fn cold_cli_boot(backend: BackendKind) {
             "worker_cross_node_http_probes": 2,
             "probe_images_prepared": true,
             "empty_working_directory": true,
-            "system_only_path": true,
+            "system_only_path": backend != BackendKind::AppleContainer,
+            "borrowed_homebrew_runtime": borrowed_runtime.is_some(),
             "under_60_seconds": elapsed < Duration::from_secs(60)
         }))
         .unwrap(),
@@ -416,6 +644,15 @@ fn cold_cli_boot(backend: BackendKind) {
     );
     if backend == BackendKind::AppleContainer {
         prove_persistent_restart_and_worker_scale(&name, &prepared_spec, &kubeconfig);
+        borrowed_runtime
+            .as_ref()
+            .unwrap()
+            .assert_unchanged(&evidence, "after-restart-scale");
+        drop(cleanup);
+        borrowed_runtime
+            .as_ref()
+            .unwrap()
+            .assert_unchanged(&evidence, "after-destroy");
     }
 }
 

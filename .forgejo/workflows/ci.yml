@@ -142,9 +142,19 @@ jobs:
           git fetch -q --depth=1 "$url" "$GITHUB_SHA"
           git checkout -q --detach "$GITHUB_SHA"
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Prove cold k3s and functional three-node Cilium within sixty seconds
+      - name: Prove running Homebrew reuse and fresh functional three-node Cilium within sixty seconds
         run: |
           set -eu
+          # Reuse a running Homebrew service. A stopped installed runtime may be started,
+          # but never replace a running daemon or change its roots/configuration.
+          export PATH="/opt/homebrew/bin:$PATH"
+          status=$(container system status --format json)
+          state=$(printf '%s' "$status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+          case "$state" in
+            running) ;;
+            unregistered) container system start --disable-kernel-install ;;
+            *) printf 'Unsupported existing container service state: %s\n' "$state" >&2; exit 1 ;;
+          esac
           cd "$KALISTO_APPLE_WORKSPACE"
           cargo test --locked --release --test macos_three_node_boot_budget \
             apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
@@ -156,9 +166,10 @@ jobs:
           path: |
             ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/result.json
             ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/*-image-timings.log
+            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/runtime-*.json
           if-no-files-found: warn
           retention-days: 7
-      - name: Clean only this job's clusters and service
+      - name: Clean only this job's clusters and ephemeral data
         if: always()
         run: |
           set -eu
@@ -168,12 +179,22 @@ jobs:
           if [ -x "$CARGO_TARGET_DIR/release/kalisto" ]; then
             "$CARGO_TARGET_DIR/release/kalisto" destroy --all
           fi
-          export CONTAINER_INSTALL_ROOT="$XDG_DATA_HOME/kalisto/artifacts/runtime-v1/apple-container-1.7.1-arm64/install"
-          export CONTAINER_APP_ROOT="$XDG_DATA_HOME/kalisto/apple-container"
-          binary="$CONTAINER_INSTALL_ROOT/bin/container"
-          if [ -x "$binary" ]; then
-            status=$("$binary" system status --format json)
-            printf '%s' "$status" | python3 -c 'import json,os,sys; s=json.load(sys.stdin); p=s.get("paths",{}); assert s.get("status") == "running" and all(os.path.realpath(p.get(k,"")) == os.path.realpath(os.environ[e]) for k,e in [("appRoot","CONTAINER_APP_ROOT"),("installRoot","CONTAINER_INSTALL_ROOT")]), "service ownership not verified; retaining isolated data"'
-            "$binary" system stop
-          fi
+          # Lifecycle ownership checks remove only task-owned nodes/networks.
+          # Never stop the shared daemon or remove its persistent application root.
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = Path(os.environ["XDG_DATA_HOME"]).resolve()
+          runtime = data / "kalisto/apple-container"
+          selection = runtime / "selection.json"
+          if selection.exists():
+              selected = json.loads(selection.read_text())
+              assert selected["managed"] is False, "unexpected managed service; retaining isolated data"
+              app = Path(selected["app_root"]).resolve()
+              assert app != data and data not in app.parents, "service data is not ephemeral; retaining isolated data"
+          else:
+              assert not runtime.exists(), "runtime ownership is unknown; retaining isolated data"
+          PY
           rm -rf -- "$XDG_DATA_HOME" "$KALISTO_APPLE_WORKSPACE"

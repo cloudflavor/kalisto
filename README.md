@@ -33,11 +33,13 @@ boots; rerun `pull` when the profile changes or cache is removed. Repeating `pul
 verifies/reuses a complete cache rather than rebuilding the OS image. Bare
 `pull`/`up` do **not** select a CNI.
 
-`pull` fetches the pinned, signed Apple runtime, its kernel/init image, managed
-Helm, Crane, kubectl, K3s, and platform-digest-pinned OCI images including a BusyBox
-diagnostic image. It prepares a reusable Ubuntu/k3s node image in a temporary
-ordinary container, never starting Kubernetes or creating cluster state; the builder
-is deleted after use. Standard flow requires no checkout, manual templates, Homebrew,
+`pull` reuses a compatible installed Apple CLI/runtime (including Homebrew) from
+`PATH`. Only when no compatible installation exists does it fetch the pinned,
+signed private runtime. It also prepares the kernel/init image, managed Helm,
+Crane, kubectl, K3s, and platform-digest-pinned OCI images including a BusyBox
+diagnostic image. A temporary ordinary container prepares the reusable Ubuntu/k3s
+node image, never starting Kubernetes or creating cluster state; the builder is
+deleted after use. Standard flow requires no checkout, manual templates, Homebrew,
 Docker, QEMU install, host sudo, or Lima. Cache lives under `artifacts/boot-v4` in
 user-scoped Kalisto data.
 Preparation can take several minutes and stays outside cold cluster startup timing.
@@ -82,23 +84,31 @@ Kalisto owns the k3s server, agents, Cilium, readiness checks, and cluster state
 It does not use `container cluster`, `container machine`, kubeadm, kind, Docker,
 or an external registry to bootstrap prepared nodes. Lima is an explicit alternative.
 
-`pull` installs a pinned, signed Apple runtime in Kalisto's user data, prepares its
-kernel and init image, and composes a digest-pinned Ubuntu/k3s node image. A temporary
-ordinary container installs Linux prerequisites, then is deleted; no cluster identity
-is baked into the reusable image. The cached node OCI archive can restore a pruned
-runtime image store when `pull` is repeated. Kernel extraction runs in Rust and
-does not require a host `zstd` executable.
+`pull` prefers the compatible Apple 1.7.1 release already installed on `PATH`,
+including Homebrew's CLI and already-running service. Without a compatible
+installation, it installs the pinned, signed runtime privately in Kalisto's user
+data. It prepares a kernel/init image and composes a digest-pinned Ubuntu/k3s node
+image. A temporary ordinary container installs Linux prerequisites, then is deleted;
+no cluster identity is baked into the reusable image. The cached node OCI archive
+can restore a pruned runtime image store when `pull` is repeated. Node archives are
+served directly over temporary loopback HTTP during import, without extracting a
+second archive copy or reconfiguring the shared image helper. Kernel extraction
+runs in Rust and does not require a host `zstd` executable.
 
 `up` requires the local node image and prepared assets; it never installs tools,
 pulls missing images, or changes the selected CNI. Nodes start concurrently on an
 owned NAT network, with only their own runtime directory and read-only boot assets
 mounted from the host. No home directory, SSH agent, or global shared image store
-is exposed. Workload registry access remains available after startup.
+is exposed to guests. Workload registry access remains available after startup.
 
-Apple's service is shared within a macOS login session. Kalisto refuses to take
-over a running service with a different version or installation/data root; it does
-not stop another installation automatically. Stop that installation yourself before
-preparing Kalisto's managed runtime.
+Apple's service is shared within a macOS login session. A compatible running
+service is borrowed without stopping, replacing, or changing its executable,
+installation/application roots, configuration, or default system properties.
+Kalisto owns only its cluster nodes, networks, and VM directories, not that daemon
+or its existing data. Runtime selection is recorded in per-user Kalisto data,
+separately from the shared artifact cache. An incompatible running service causes
+a clear error before any replacement is downloaded; Kalisto never takes it over.
+Use the explicit Lima backend if the running service is incompatible.
 
 The Apple backend uses the same three-node, authenticated-API, Cilium rollout,
 worker DNS, and cross-node Service HTTP budget scenario as Lima:
@@ -114,6 +124,15 @@ measured **52.04s** for that fresh three-node scenario with Apple `container` 1.
 Stop/resume preserved Kubernetes state, and scaling to four Ready nodes passed
 afterward, outside the startup timer. This is one completed run, not a universal
 hardware performance guarantee.
+
+The native CI scenario borrows a running Homebrew 1.7.1 service; CI setup may start
+a stopped installation, but never replaces a running daemon.
+It records CLI/daemon identity, service roots, process identity, and default system
+properties before flag-free `pull`/`up`, then compares them after preparation,
+stop/resume, scaling, and cluster destruction. It also checks that no private
+installer is fetched or selected. CI cleanup never stops the borrowed daemon or
+removes its persistent application root. The measurement above predates this
+reuse-specific proof; its startup/network assertions and sixty-second limit remain.
 
 Run live validation only in the authorized native macOS CI job. The existing Lima
 timings above are not Apple-container measurements. Cold archive export/import

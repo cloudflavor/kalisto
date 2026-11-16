@@ -1,4 +1,4 @@
-//! Pinned, user-owned Apple runtime; only `prepare` is allowed to fetch assets.
+//! Compatible installed Apple runtimes, with a signed private fallback.
 //!
 //! Command/layout contracts come from apple/container tag 1.7.1: Makefile,
 //! ContainerPlugin/{InstallRoot,ApplicationRoot,ServiceManager,PluginLoader}.swift,
@@ -24,14 +24,15 @@ const PACKAGE_URL: &str = "https://github.com/apple/container/releases/download/
 const PACKAGE_SHA256: &str = "b6739caf3d47ca53a78f1a7edf32521420a75c7941838c3cefa75f30b80f5a97";
 const TEAM: &str = "UPBK2H6LZM";
 const API_LABEL: &str = "com.apple.container.apiserver";
+#[cfg(test)]
 const IMAGES_LABEL: &str = "com.apple.container.container-core-images";
-const IMAGES_MACH_SERVICE: &str = "com.apple.container.core.container-core-images";
 // ContainerPersistence/ContainerSystemConfig.swift at tag 1.7.1.
 const KERNEL_URL: &str = "https://github.com/kata-containers/kata-containers/releases/download/4.3.1/kata-static-4.3.1-arm64.tar.zst";
 const KERNEL_SHA256: &str = "2c5bf7cde334ad5307d482f45cceda496f91c9b6b96f5278c47f4f4eac1bbae6";
 const KERNEL_MEMBER: &str = "opt/kata/share/kata-containers/vmlinux-6.18.56-208-debug";
 const KERNEL_FILENAME: &str = "vmlinux-6.18.56-208-debug";
 const MANIFEST: &str = "prepared.json";
+const SELECTION: &str = "selection.json";
 const REQUIRED_BINARIES: &[&str] = &[
     "bin/container",
     "bin/container-apiserver",
@@ -42,9 +43,55 @@ const REQUIRED_BINARIES: &[&str] = &[
     "libexec/container/plugins/machine-apiserver/bin/machine-apiserver",
 ];
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct Selection {
+    version: String,
+    managed: bool,
+    executable: PathBuf,
+    api_program: PathBuf,
+    install_root: PathBuf,
+    app_root: PathBuf,
+}
+
+impl Selection {
+    fn validate(&self) -> Result<()> {
+        if self.version != VERSION {
+            return Err(invalid("incompatible Apple runtime selection; run `kalisto pull`"));
+        }
+        for path in [&self.executable, &self.api_program, &self.install_root, &self.app_root] {
+            validate_absolute(path)?;
+        }
+        let parent = self.executable.parent().ok_or_else(|| invalid("Apple CLI has no parent"))?;
+        if self.executable.file_name().is_none_or(|name| name != "container")
+            || self.api_program != parent.join("container-apiserver")
+            || !matches!(parent.file_name().and_then(|name| name.to_str()), Some("bin" | "cli"))
+            || parent.parent() != Some(self.install_root.as_path())
+        {
+            return Err(invalid("Apple runtime executable does not match its installation layout"));
+        }
+        if self.managed
+            && (self.install_root != root()?.join("install")
+                || self.app_root != state_root()?
+                || parent.file_name().is_none_or(|name| name != "bin"))
+        {
+            return Err(invalid("managed Apple runtime selection has foreign roots"));
+        }
+        Ok(())
+    }
+
+    fn runtime_files(&self) -> [PathBuf; REQUIRED_BINARIES.len()] {
+        std::array::from_fn(|index| match index {
+            0 => self.executable.clone(),
+            1 => self.api_program.clone(),
+            _ => self.install_root.join(REQUIRED_BINARIES[index]),
+        })
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct Prepared {
     version: String,
+    selection: Selection,
     package_sha256: String,
     kernel_sha256: String,
     init_image: String,
@@ -70,21 +117,42 @@ pub(crate) fn root() -> Result<PathBuf> {
     Ok(artifacts.join("runtime-v1/apple-container-1.7.1-arm64"))
 }
 
-fn install_root() -> Result<PathBuf> {
-    Ok(root()?.join("install"))
-}
-
-fn app_root() -> Result<PathBuf> {
+fn state_root() -> Result<PathBuf> {
     std::path::absolute(data_root()?.join("apple-container")).map_err(io_error)
 }
 
-/// This never probes PATH, downloads, or falls back to an older host binary.
+fn load_selection_at(path: &Path) -> Result<Option<Selection>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let selected: Selection = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("invalid Apple runtime selection: {error}; run `kalisto pull`")))?;
+    selected.validate()?;
+    Ok(Some(selected))
+}
+
+fn selection() -> Result<Selection> {
+    load_selection_at(&state_root()?.join(SELECTION))?
+        .ok_or_else(|| invalid("Apple runtime is not selected; run `kalisto pull` first"))
+}
+
+fn install_root() -> Result<PathBuf> {
+    Ok(selection()?.install_root)
+}
+
+fn app_root() -> Result<PathBuf> {
+    Ok(selection()?.app_root)
+}
+
+/// Resolve the user-data selection without probing PATH or downloading.
 pub(crate) fn program() -> Result<PathBuf> {
-    Ok(install_root()?.join("bin/container"))
+    Ok(selection()?.executable)
 }
 
 pub(crate) fn kernel_path() -> Result<PathBuf> {
-    Ok(app_root()?.join("kernels").join(KERNEL_FILENAME))
+    Ok(root()?.join("kernels").join(KERNEL_FILENAME))
 }
 
 pub(crate) fn init_image() -> Result<String> {
@@ -102,12 +170,244 @@ pub(crate) fn configure(command: &mut Command) -> Result<()> {
             command.env_remove(key);
         }
     }
+    configure_selection(command, &selection()?)?;
+    Ok(())
+}
+
+fn configure_selection(command: &mut Command, selected: &Selection) -> Result<()> {
     command
-        .env("CONTAINER_APP_ROOT", app_root()?)
-        .env("CONTAINER_INSTALL_ROOT", install_root()?)
-        .env("XDG_CONFIG_HOME", root()?.join("config-home"))
+        .env("CONTAINER_APP_ROOT", &selected.app_root)
+        .env("CONTAINER_INSTALL_ROOT", &selected.install_root)
         .env("TMPDIR", root()?.join("tmp"))
         .env_remove("SSH_AUTH_SOCK");
+    if selected.managed {
+        command
+            .env("XDG_CONFIG_HOME", root()?.join("config-home"));
+    }
+    Ok(())
+}
+
+fn validate_absolute(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path.components().any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(invalid(format!("Apple runtime requires an absolute normalized path: {}", path.display())));
+    }
+    path_str(path)?;
+    Ok(())
+}
+
+fn managed_selection() -> Result<Selection> {
+    let install_root = root()?.join("install");
+    Ok(Selection {
+        version: VERSION.into(),
+        managed: true,
+        executable: install_root.join("bin/container"),
+        api_program: install_root.join("bin/container-apiserver"),
+        install_root,
+        app_root: state_root()?,
+    })
+}
+
+fn service_selection(output: &str) -> Result<Selection> {
+    let field = |key, separator| {
+        launchctl_value(output, key, separator)
+            .map(PathBuf::from)
+            .ok_or_else(|| service_conflict(API_LABEL))
+    };
+    let api_program = field("program", "=")?;
+    let install_root = field("CONTAINER_INSTALL_ROOT", "=>")?;
+    let app_root = field("CONTAINER_APP_ROOT", "=>")?;
+    let executable = api_program.with_file_name("container");
+    let mut selected = Selection {
+        version: VERSION.into(),
+        managed: false,
+        executable,
+        api_program,
+        install_root,
+        app_root,
+    };
+    let managed = managed_selection()?;
+    if selected.executable == managed.executable
+        && selected.api_program == managed.api_program
+        && selected.install_root == managed.install_root
+        && selected.app_root == managed.app_root
+    {
+        selected.managed = true;
+    }
+    selected.validate()?;
+    Ok(selected)
+}
+
+fn validate_installation(selected: &Selection) -> Result<()> {
+    let canonical = selected.install_root.canonicalize().map_err(io_error)?;
+    for file in selected.runtime_files() {
+        if !file.canonicalize().map_err(io_error)?.starts_with(&canonical) {
+            return Err(invalid("Apple runtime executable escapes its selected installation"));
+        }
+        file_size(&file)?;
+    }
+    Ok(())
+}
+
+fn candidate_run(
+    runner: &dyn CommandRunner,
+    selected: &Selection,
+    args: &[String],
+) -> Result<Output> {
+    // Discovery runs before persistence, so the global `container` resolver
+    // cannot configure this executable yet. Preserve its environment isolation.
+    let mut sanitized = Vec::new();
+    for (key, _) in std::env::vars_os() {
+        if let Some(key) = key.to_str()
+            && (key.starts_with("CONTAINER_") || key.starts_with("DYLD_"))
+            && !matches!(key, "CONTAINER_APP_ROOT" | "CONTAINER_INSTALL_ROOT")
+        {
+            sanitized.push("-u".into());
+            sanitized.push(key.to_owned());
+        }
+    }
+    let executable = path_str(&selected.executable)?;
+    let (program, args) = if sanitized.is_empty() {
+        (executable, args)
+    } else {
+        sanitized.push(executable.into());
+        sanitized.extend_from_slice(args);
+        ("/usr/bin/env", sanitized.as_slice())
+    };
+    runner.run_with_env(
+        program,
+        args,
+        &[
+            ("CONTAINER_APP_ROOT", &selected.app_root),
+            ("CONTAINER_INSTALL_ROOT", &selected.install_root),
+        ],
+    )
+}
+
+fn registered_services(runner: &dyn CommandRunner) -> Result<Vec<String>> {
+    let services = runner.run("/bin/launchctl", &strings(&["list"]))?;
+    Ok(services.stdout.lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .filter(|label| label.starts_with("com.apple.container."))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn verify_selected_services(runner: &dyn CommandRunner, domain: &str, labels: &[String], selected: &Selection) -> Result<()> {
+    for label in labels {
+        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{label}")]))?;
+        if !owned_service(&service.stdout, &selected.app_root, &selected.install_root)
+            || (label == API_LABEL
+                && launchctl_value(&service.stdout, "program", "=").map(Path::new)
+                    != Some(selected.api_program.as_path()))
+        {
+            return Err(service_conflict(label));
+        }
+    }
+    Ok(())
+}
+
+fn select_runtime(runner: &dyn CommandRunner, domain: &str, path: Option<&std::ffi::OsStr>) -> Result<Selection> {
+    let labels = registered_services(runner)?;
+    if labels.iter().any(|label| label == API_LABEL) {
+        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{API_LABEL}")]))?;
+        let selected = service_selection(&service.stdout)?;
+        let version = candidate_run(runner, &selected, &strings(&["--version"]))?;
+        if !valid_cli_version(version.stdout.trim()) {
+            return Err(service_conflict(API_LABEL));
+        }
+        let status = candidate_run(runner, &selected, &strings(&["system", "status", "--format", "json"]))?;
+        validate_status(&parse_json(&status.stdout, "Apple service status")?, &selected.app_root, &selected.install_root)?;
+        validate_installation(&selected)?;
+        verify_selected_services(runner, domain, &labels, &selected)?;
+        return Ok(selected);
+    }
+    // Orphaned helpers also own global Mach service names. Do not install over
+    // them merely because the API service is absent.
+    if let Some(label) = labels.first() {
+        let managed = managed_selection()?;
+        let service = runner.run("/bin/launchctl", &strings(&["print", &format!("{domain}/{label}")]))?;
+        if !owned_service(&service.stdout, &managed.app_root, &managed.install_root) {
+            return Err(service_conflict(label));
+        }
+        verify_selected_services(runner, domain, &labels, &managed)?;
+        validate_installation(&managed)?;
+        verify_cli(runner, &managed)?;
+        return Ok(managed);
+    }
+    if let Some(path) = path {
+        for directory in std::env::split_paths(path).filter(|directory| directory.is_absolute()) {
+            let candidate = directory.join("container");
+            let executable = match candidate.canonicalize() {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(error)),
+            };
+            let parent = executable.parent().ok_or_else(|| invalid("Apple CLI has no parent"))?;
+            let install_root = parent.parent().ok_or_else(|| invalid("Apple CLI has no install root"))?.to_path_buf();
+            // Homebrew's bin/container is a shell wrapper exporting an opt/
+            // install root. Use the actual cli/ siblings, not that wrapper.
+            let executable = if parent.file_name().is_some_and(|name| name == "bin")
+                && install_root.join("cli/container").is_file()
+            {
+                install_root.join("cli/container")
+            } else {
+                executable
+            };
+            let home = std::env::var_os("HOME").filter(|home| !home.is_empty())
+                .ok_or_else(|| invalid("HOME is required for an installed Apple runtime"))?;
+            let selected = Selection {
+                version: VERSION.into(),
+                managed: false,
+                api_program: executable.with_file_name("container-apiserver"),
+                executable,
+                install_root,
+                app_root: PathBuf::from(home).join("Library/Application Support/com.apple.container"),
+            };
+            let version = candidate_run(runner, &selected, &strings(&["--version"]))?;
+            if !valid_cli_version(version.stdout.trim()) {
+                continue;
+            }
+            selected.validate()?;
+            match validate_installation(&selected) {
+                Ok(()) => return Ok(selected),
+                Err(Error::CommandIo { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    managed_selection()
+}
+
+fn start_service(runner: &dyn CommandRunner, domain: &str, selected: &Selection) -> Result<()> {
+    if selected.managed {
+        run(runner, &[
+            "system".into(), "start".into(),
+            "--app-root".into(), selected.app_root.display().to_string(),
+            "--install-root".into(), selected.install_root.display().to_string(),
+            "--disable-kernel-install".into(),
+        ])?;
+    } else {
+        // SystemStart copies user configuration and overwrites the shared API
+        // plist. Register a Kalisto-local plist instead; never edit either.
+        let plist = state_root()?.join("borrowed-apiserver.plist");
+        let value = serde_json::json!({
+            "Label": API_LABEL,
+            "ProgramArguments": [selected.api_program, "start"],
+            "EnvironmentVariables": {
+                "CONTAINER_APP_ROOT": selected.app_root,
+                "CONTAINER_INSTALL_ROOT": selected.install_root,
+            },
+            "LimitLoadToSessionType": ["Aqua", "Background"],
+            "RunAtLoad": true,
+            "MachServices": { (API_LABEL): true },
+        });
+        publish_json(&plist, &value)?;
+        runner.run("/usr/bin/plutil", &strings(&["-convert", "xml1", path_str(&plist)?]))?;
+        runner.run("/bin/launchctl", &strings(&["bootstrap", domain, path_str(&plist)?]))?;
+    }
     Ok(())
 }
 
@@ -116,49 +416,47 @@ pub(crate) fn run(runner: &dyn CommandRunner, args: &[String]) -> Result<Output>
     runner.run("container", args)
 }
 
+fn prepare_service(runner: &dyn CommandRunner, domain: &str, selected: &Selection) -> Result<()> {
+    if selected.managed {
+        for directory in [root()?.join("config-home"), selected.app_root.clone()] {
+            fs::create_dir_all(directory).map_err(io_error)?;
+        }
+        install(runner)?;
+    }
+    verify_cli(runner, selected)?;
+    let labels = registered_services(runner)?;
+    verify_selected_services(runner, domain, &labels, selected)?;
+    if !labels.iter().any(|label| label == API_LABEL) {
+        start_service(runner, domain, selected)?;
+    }
+    let status = candidate_run(runner, selected, &strings(&["system", "status", "--format", "json"]))?;
+    validate_status(&parse_json(&status.stdout, "Apple service status")?, &selected.app_root, &selected.install_root)
+}
+
 pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
     check_platform(runner)?;
-    let root = root()?;
-    fs::create_dir_all(&root).map_err(io_error)?;
+    let state = state_root()?;
+    fs::create_dir_all(&state).map_err(io_error)?;
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("prepare.lock"))
+        .open(state.join("prepare.lock"))
         .map_err(io_error)?;
     lock.try_lock().map_err(|error| {
         invalid(format!(
             "another Apple runtime preparation is active: {error}"
         ))
     })?;
-    for directory in [root.join("tmp"), root.join("config-home"), app_root()?] {
-        fs::create_dir_all(directory).map_err(io_error)?;
-    }
-    install(runner)?;
-    verify_version(runner)?;
+    // Resolve the shared login-session service before any private installation
+    // or download. A foreign or incompatible daemon must never be replaced.
     let domain = launchd_domain(runner)?;
-    let registered = check_services(runner, &domain)?;
-    if registered {
-        verify_status(runner)?;
-    } else {
-        // XDG_CONFIG_HOME prevents SystemStart from copying the user's unrelated
-        // ~/.config/container/config.toml into this installation's app root.
-        run(
-            runner,
-            &[
-                "system".into(),
-                "start".into(),
-                "--app-root".into(),
-                app_root()?.display().to_string(),
-                "--install-root".into(),
-                install_root()?.display().to_string(),
-                "--disable-kernel-install".into(),
-            ],
-        )?;
-        verify_status(runner)?;
-    }
-    confine_image_temporaries(runner, &domain)?;
+    let selected = select_runtime(runner, &domain, std::env::var_os("PATH").as_deref())?;
+    let root = root()?;
+    fs::create_dir_all(root.join("tmp")).map_err(io_error)?;
+    publish_json(&state.join(SELECTION), &selected)?;
+    prepare_service(runner, &domain, &selected)?;
     prepare_kernel(runner)?;
 
     let properties = run(
@@ -183,11 +481,12 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
     run(runner, &strings(&["image", "tag", probe, &reference]))?;
     let snapshot = snapshot_root(&manifest)?;
     let mut runtime_sizes = [0; REQUIRED_BINARIES.len()];
-    for (size, relative) in runtime_sizes.iter_mut().zip(REQUIRED_BINARIES) {
-        *size = file_size(&install_root()?.join(relative))?;
+    for (size, path) in runtime_sizes.iter_mut().zip(selected.runtime_files()) {
+        *size = file_size(&path)?;
     }
     let prepared = Prepared {
         version: VERSION.into(),
+        selection: selected,
         package_sha256: PACKAGE_SHA256.into(),
         kernel_sha256: artifact::file_sha256(runner, &kernel_path()?)?,
         init_image: reference,
@@ -200,7 +499,7 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
         snapshot_info_size: file_size(&snapshot.join("snapshot-info"))?,
         runtime_sizes,
     };
-    publish_json(&root.join(MANIFEST), &prepared)?;
+    publish_json(&state.join(MANIFEST), &prepared)?;
     Ok(())
 }
 
@@ -208,8 +507,8 @@ pub(crate) fn prepare(runner: &dyn CommandRunner) -> Result<()> {
 pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
     check_platform(runner)?;
     let prepared = load_prepared()?;
-    for (relative, expected) in REQUIRED_BINARIES.iter().zip(prepared.runtime_sizes) {
-        verify_file(&install_root()?.join(relative), expected)?;
+    for (path, expected) in prepared.selection.runtime_files().iter().zip(&prepared.runtime_sizes) {
+        verify_file(path, *expected)?;
     }
     verify_version(runner)?;
     verify_file(&kernel_path()?, prepared.kernel_size)?;
@@ -218,6 +517,9 @@ pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
     verify_file(&snapshot.join("snapshot-info"), prepared.snapshot_info_size)?;
     let domain = launchd_domain(runner)?;
     if !check_services(runner, &domain)? {
+        if !prepared.selection.managed {
+            return Err(invalid("selected borrowed Apple service is not running; start it with its `container system start` before offline `kalisto up`"));
+        }
         let plist = app_root()?.join("apiserver/apiserver.plist");
         let value = read_plist(runner, &plist)?;
         validate_plist(
@@ -235,7 +537,6 @@ pub(crate) fn check_available(runner: &dyn CommandRunner) -> Result<()> {
         )?;
     }
     verify_status(runner)?;
-    confine_image_temporaries(runner, &domain)?;
     let (index, manifest) = inspect_init(runner, &prepared.init_image)?;
     if index != prepared.init_index || manifest != prepared.init_manifest {
         return Err(invalid(
@@ -373,15 +674,19 @@ fn validate_package_signature(output: &str) -> Result<()> {
 }
 
 fn verify_version(runner: &dyn CommandRunner) -> Result<()> {
-    if !program()?.is_file() {
+    verify_cli(runner, &selection()?)
+}
+
+fn verify_cli(runner: &dyn CommandRunner, selected: &Selection) -> Result<()> {
+    if !selected.executable.is_file() {
         return Err(invalid(
-            "managed Apple container 1.7.1 is missing; run `kalisto pull` first",
+            "selected Apple container 1.7.1 is missing; run `kalisto pull` first",
         ));
     }
-    let version = run(runner, &strings(&["--version"]))?;
+    let version = candidate_run(runner, selected, &strings(&["--version"]))?;
     if !valid_cli_version(version.stdout.trim()) {
         return Err(invalid(format!(
-            "expected managed Apple container {VERSION}, found {}",
+            "expected Apple container {VERSION} release build, found {}",
             version.stdout.trim()
         )));
     }
@@ -464,8 +769,8 @@ fn verify_file(path: &Path, expected: u64) -> Result<()> {
 }
 
 fn prepare_kernel(runner: &dyn CommandRunner) -> Result<()> {
-    // Download and extract on our volume, not KernelService's Foundation temp
-    // directory. Its local --binary operation only copies into appRoot/kernels.
+    // Keep the exact pinned kernel on Kalisto's cache volume. Nodes pass this
+    // binary explicitly; never change a shared service's default kernel.
     let archive = artifact::fetch_into_cache(
         runner,
         &root()?.join("downloads"),
@@ -497,19 +802,10 @@ fn prepare_kernel(runner: &dyn CommandRunner) -> Result<()> {
         break;
     }
     file_size(&binary)?;
-    run(
-        runner,
-        &strings(&[
-            "system",
-            "kernel",
-            "set",
-            "--binary",
-            path_str(&binary)?,
-            "--arch",
-            "arm64",
-            "--force",
-        ]),
-    )?;
+    let destination = kernel_path()?;
+    fs::create_dir_all(destination.parent().ok_or_else(|| invalid("kernel has no parent"))?)
+        .map_err(io_error)?;
+    fs::rename(binary, destination).map_err(io_error)?;
     Ok(())
 }
 
@@ -532,33 +828,19 @@ fn launchd_domain(runner: &dyn CommandRunner) -> Result<String> {
 }
 
 fn check_services(runner: &dyn CommandRunner, domain: &str) -> Result<bool> {
-    let services = runner.run("/bin/launchctl", &strings(&["list"]))?;
-    let mut api_registered = false;
-    let app = app_root()?;
-    let install = install_root()?;
-    for label in services
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(2))
-    {
-        if !label.starts_with("com.apple.container.") {
-            continue;
-        }
-        let target = format!("{domain}/{label}");
-        let service = runner.run("/bin/launchctl", &strings(&["print", &target]))?;
-        if !owned_service(&service.stdout, &app, &install) {
-            return Err(service_conflict(label));
-        }
-        api_registered |= label == API_LABEL;
-    }
-    Ok(api_registered)
+    let labels = registered_services(runner)?;
+    verify_selected_services(runner, domain, &labels, &selection()?)?;
+    Ok(labels.iter().any(|label| label == API_LABEL))
 }
 
 fn owned_service(output: &str, app: &Path, install: &Path) -> bool {
     launchctl_value(output, "CONTAINER_APP_ROOT", "=>").map(Path::new) == Some(app)
         && launchctl_value(output, "CONTAINER_INSTALL_ROOT", "=>").map(Path::new) == Some(install)
         && launchctl_value(output, "program", "=")
-            .is_some_and(|program| Path::new(program).starts_with(install))
+            .is_some_and(|program| {
+                let program = Path::new(program);
+                validate_absolute(program).is_ok() && program.starts_with(install)
+            })
 }
 
 fn launchctl_value<'a>(output: &'a str, key: &str, separator: &str) -> Option<&'a str> {
@@ -570,7 +852,7 @@ fn launchctl_value<'a>(output: &'a str, key: &str, separator: &str) -> Option<&'
 
 fn service_conflict(label: &str) -> Error {
     invalid(format!(
-        "Apple's login-session service `{label}` belongs to another installation or is incompatible. Kalisto will not stop or replace it. Stop that installation yourself with its `container system stop`, then run `kalisto pull` (or use the Lima backend)."
+        "Apple's login-session service `{label}` belongs to another installation or is incompatible with container {VERSION} release. Kalisto will not stop, replace, or download over it. Use a compatible service or the Lima backend."
     ))
 }
 
@@ -590,48 +872,6 @@ fn validate_status(status: &Value, app: &Path, install: &Path) -> Result<()> {
     {
         return Err(service_conflict(API_LABEL));
     }
-    Ok(())
-}
-
-fn confine_image_temporaries(runner: &dyn CommandRunner, domain: &str) -> Result<()> {
-    // PluginLoader only forwards CONTAINER_* and proxy variables, NOT TMPDIR.
-    // Image load/save/export use Foundation temporaryDirectory. Amend only the
-    // verified Kalisto-owned image helper's plist, never the user's environment.
-    let plist = app_root()?.join("plugin-state/container-core-images/service.plist");
-    let executable = install_root()?
-        .join("libexec/container/plugins/container-core-images/bin/container-core-images");
-    let mut value = read_plist(runner, &plist)?;
-    validate_plist(&value, IMAGES_LABEL, IMAGES_MACH_SERVICE, &executable)?;
-    let target = format!("{domain}/{IMAGES_LABEL}");
-    let service = runner.run("/bin/launchctl", &strings(&["print", &target]))?;
-    if !owned_service(&service.stdout, &app_root()?, &install_root()?) {
-        return Err(service_conflict(IMAGES_LABEL));
-    }
-    let temporary = root()?.join("tmp");
-    if launchctl_value(&service.stdout, "TMPDIR", "=>") == temporary.to_str() {
-        return Ok(());
-    }
-    value["EnvironmentVariables"]["TMPDIR"] = Value::String(path_str(&temporary)?.into());
-    let parent = plist
-        .parent()
-        .ok_or_else(|| invalid("Apple service plist has no parent"))?;
-    let scratch = Scratch::new(parent, "plist")?;
-    let updated = scratch.0.join("service.plist");
-    fs::write(
-        &updated,
-        serde_json::to_vec(&value).map_err(|error| invalid(error.to_string()))?,
-    )
-    .map_err(io_error)?;
-    runner.run(
-        "/usr/bin/plutil",
-        &strings(&["-convert", "xml1", path_str(&updated)?]),
-    )?;
-    fs::rename(updated, &plist).map_err(io_error)?;
-    runner.run("/bin/launchctl", &strings(&["bootout", &target]))?;
-    runner.run(
-        "/bin/launchctl",
-        &strings(&["bootstrap", domain, path_str(&plist)?]),
-    )?;
     Ok(())
 }
 
@@ -698,7 +938,7 @@ fn snapshot_root(manifest: &str) -> Result<PathBuf> {
 }
 
 fn load_prepared() -> Result<Prepared> {
-    let path = root()?.join(MANIFEST);
+    let path = state_root()?.join(MANIFEST);
     let bytes = fs::read(&path).map_err(|error| {
         invalid(format!(
             "Apple runtime is not prepared ({error}); run `kalisto pull` first"
@@ -709,7 +949,13 @@ fn load_prepared() -> Result<Prepared> {
             "invalid Apple runtime manifest: {error}; run `kalisto pull`"
         ))
     })?;
+    validate_prepared(&prepared, &selection()?)?;
+    Ok(prepared)
+}
+
+fn validate_prepared(prepared: &Prepared, selected: &Selection) -> Result<()> {
     if prepared.version != VERSION
+        || &prepared.selection != selected
         || prepared.package_sha256 != PACKAGE_SHA256
         || prepared.init_image
             != format!(
@@ -722,7 +968,7 @@ fn load_prepared() -> Result<Prepared> {
         ));
     }
     digest_hex(&prepared.init_manifest)?;
-    Ok(prepared)
+    Ok(())
 }
 
 fn digest_hex(digest: &str) -> Result<&str> {
@@ -822,7 +1068,7 @@ fn invalid(message: impl Into<String>) -> Error {
 
 fn io_error(source: std::io::Error) -> Error {
     Error::CommandIo {
-        program: "managed Apple container runtime".into(),
+        program: "Apple container runtime".into(),
         source,
     }
 }
@@ -933,5 +1179,272 @@ mod tests {
             Path::new("/kalisto/service"),
             Path::new("/kalisto/install")
         ));
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct Fixture {
+        _directory: Scratch,
+        selected: Selection,
+    }
+
+    impl Fixture {
+        fn new(layout: &str) -> Self {
+            let directory = Scratch::new(&std::env::temp_dir(), "apple-runtime-reuse").unwrap();
+            let base = directory.0.canonicalize().unwrap();
+            let install_root = base.join("Cellar/container/1.7.1_2");
+            let selected = Selection {
+                version: VERSION.into(),
+                managed: false,
+                executable: install_root.join(layout).join("container"),
+                api_program: install_root.join(layout).join("container-apiserver"),
+                install_root,
+                app_root: base.join("Application Support/com.apple.container"),
+            };
+            for file in selected.runtime_files() {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, b"existing runtime").unwrap();
+            }
+            fs::create_dir_all(&selected.app_root).unwrap();
+            Self { _directory: directory, selected }
+        }
+    }
+
+    struct DiscoveryRunner {
+        selected: Selection,
+        running: bool,
+        cli_version: &'static str,
+        status: Value,
+        fail_version: bool,
+        calls: RefCell<Vec<(String, Vec<String>)>>,
+    }
+
+    impl DiscoveryRunner {
+        fn new(selected: &Selection, running: bool) -> Self {
+            Self {
+                selected: selected.clone(),
+                running,
+                cli_version: "container CLI version 1.7.1 (build: release, commit: a15b460)",
+                status: serde_json::json!({
+                    "status": "running",
+                    "server": {"version": VERSION, "build": "release", "appName": "container-apiserver"},
+                    "paths": {"appRoot": selected.app_root, "installRoot": selected.install_root},
+                }),
+                fail_version: false,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn service(&self, program: &Path) -> String {
+            format!(
+                "program = {}\nCONTAINER_APP_ROOT => {}\nCONTAINER_INSTALL_ROOT => {}\n",
+                program.display(), self.selected.app_root.display(), self.selected.install_root.display()
+            )
+        }
+    }
+
+    impl CommandRunner for DiscoveryRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+            self.calls.borrow_mut().push((program.into(), args.to_vec()));
+            let stdout = if program == "/bin/launchctl" && args == ["list"] {
+                if self.running {
+                    format!("123\t0\t{API_LABEL}\n124\t0\t{IMAGES_LABEL}\n")
+                } else {
+                    String::new()
+                }
+            } else if program == "/bin/launchctl"
+                && args == ["print", &format!("gui/501/{API_LABEL}")]
+            {
+                self.service(&self.selected.api_program)
+            } else if program == "/bin/launchctl"
+                && args == ["print", &format!("gui/501/{IMAGES_LABEL}")]
+            {
+                self.service(&self.selected.install_root.join(REQUIRED_BINARIES[4]))
+            } else if Path::new(program) == self.selected.executable && args == ["--version"] {
+                if self.fail_version {
+                    return Err(invalid("injected CLI execution failure"));
+                }
+                self.cli_version.into()
+            } else if Path::new(program) == self.selected.executable
+                && args == ["system", "status", "--format", "json"]
+            {
+                self.status.to_string()
+            } else {
+                panic!("unexpected command (installation or service mutation): {program} {args:?}");
+            };
+            Ok(Output { stdout, stderr: String::new() })
+        }
+
+        fn run_with_env(&self, program: &str, args: &[String], env: &[(&str, &Path)]) -> Result<Output> {
+            assert_eq!(env[1], ("CONTAINER_INSTALL_ROOT", self.selected.install_root.as_path()));
+            assert_eq!(env[0].0, "CONTAINER_APP_ROOT");
+            assert!(env[0].1.is_absolute());
+            if self.running {
+                assert_eq!(env[0].1, self.selected.app_root);
+            }
+            if program == "/usr/bin/env" {
+                let executable = args.iter().position(|arg| Path::new(arg) == self.selected.executable).unwrap();
+                self.run(&args[executable], &args[executable + 1..])
+            } else {
+                self.run(program, args)
+            }
+        }
+    }
+
+    #[test]
+    fn running_homebrew_release_is_reused_without_install_or_shared_helper_mutation() {
+        let fixture = Fixture::new("cli");
+        let runner = DiscoveryRunner::new(&fixture.selected, true);
+        let plist = fixture.selected.app_root.join("service.plist");
+        fs::write(&plist, b"untouched shared service").unwrap();
+        let selected = select_runtime(&runner, "gui/501", Some(std::ffi::OsStr::new("/irrelevant"))).unwrap();
+        prepare_service(&runner, "gui/501", &selected).unwrap();
+        assert_eq!(selected, fixture.selected);
+        assert_eq!(fs::read(plist).unwrap(), b"untouched shared service");
+        assert_eq!(runner.calls.borrow().len(), 11);
+    }
+
+    #[test]
+    fn running_official_layout_is_also_borrowed() {
+        let fixture = Fixture::new("bin");
+        let runner = DiscoveryRunner::new(&fixture.selected, true);
+        assert_eq!(select_runtime(&runner, "gui/501", None).unwrap(), fixture.selected);
+    }
+
+    #[test]
+    fn running_incompatible_version_never_reaches_download_or_replacement() {
+        let fixture = Fixture::new("cli");
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.status["server"]["version"] = Value::String("1.7.0".into());
+        let error = select_runtime(&runner, "gui/501", None).unwrap_err();
+        assert!(error.to_string().contains("will not stop, replace, or download"));
+        assert_eq!(runner.calls.borrow().len(), 4);
+    }
+
+    #[test]
+    fn running_same_version_with_mismatched_roots_is_rejected() {
+        let fixture = Fixture::new("cli");
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.status["paths"]["appRoot"] = Value::String("/another/users/runtime".into());
+        assert!(select_runtime(&runner, "gui/501", None).is_err());
+    }
+
+    #[test]
+    fn discovery_does_not_hide_unrelated_cli_execution_errors() {
+        let fixture = Fixture::new("cli");
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.fail_version = true;
+        let error = select_runtime(&runner, "gui/501", None).unwrap_err();
+        assert_eq!(error.to_string(), "injected CLI execution failure");
+    }
+
+    #[test]
+    fn installed_homebrew_wrapper_resolves_native_cli_and_real_install_root() {
+        let fixture = Fixture::new("cli");
+        let bin = fixture.selected.install_root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("container"), b"#!/bin/sh\nexec ../cli/container \"$@\"\n").unwrap();
+        let runner = DiscoveryRunner::new(&fixture.selected, false);
+        let selected = select_runtime(&runner, "gui/501", Some(bin.as_os_str())).unwrap();
+        assert_eq!(selected.executable, fixture.selected.executable);
+        assert_eq!(selected.install_root, fixture.selected.install_root);
+        assert!(!selected.managed);
+    }
+
+    #[test]
+    fn no_compatible_installation_selects_signed_private_fallback() {
+        let fixture = Fixture::new("bin");
+        let mut runner = DiscoveryRunner::new(&fixture.selected, false);
+        runner.cli_version = "container CLI version 1.8.0 (build: release, commit: other)";
+        let bin = fixture.selected.executable.parent().unwrap();
+        let selected = select_runtime(&runner, "gui/501", Some(bin.as_os_str())).unwrap();
+        assert_eq!(selected, managed_selection().unwrap());
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn persisted_selection_restores_borrowed_executable_and_roots_without_discovery() {
+        let fixture = Fixture::new("cli");
+        let path = fixture._directory.0.join(SELECTION);
+        publish_json(&path, &fixture.selected).unwrap();
+        assert_eq!(load_selection_at(&path).unwrap(), Some(fixture.selected));
+    }
+
+    #[test]
+    fn selection_rejects_a_daemon_outside_the_cli_installation_layout() {
+        let fixture = Fixture::new("cli");
+        let mut selected = fixture.selected;
+        selected.api_program = PathBuf::from("/another/runtime/container-apiserver");
+        assert!(selected.validate().is_err());
+    }
+
+    #[test]
+    fn helper_program_cannot_escape_matching_installation_roots_with_parent_components() {
+        let output = "program = /runtime/../foreign/container-core-images\nCONTAINER_APP_ROOT => /state\nCONTAINER_INSTALL_ROOT => /runtime\n";
+        assert!(!owned_service(output, Path::new("/state"), Path::new("/runtime")));
+    }
+
+    #[test]
+    fn incomplete_installed_runtime_uses_private_fallback_without_hiding_other_failures() {
+        let fixture = Fixture::new("bin");
+        fs::remove_file(fixture.selected.install_root.join(REQUIRED_BINARIES[4])).unwrap();
+        let runner = DiscoveryRunner::new(&fixture.selected, false);
+        let bin = fixture.selected.executable.parent().unwrap();
+        let selected = select_runtime(&runner, "gui/501", Some(bin.as_os_str())).unwrap();
+        assert_eq!(selected, managed_selection().unwrap());
+    }
+
+    #[test]
+    fn borrowed_cli_configuration_never_overrides_shared_user_configuration() {
+        let fixture = Fixture::new("cli");
+        let mut command = Command::new(&fixture.selected.executable);
+        configure_selection(&mut command, &fixture.selected).unwrap();
+        let changes = command.get_envs().collect::<Vec<_>>();
+        assert!(!changes.iter().any(|(key, _)| *key == "XDG_CONFIG_HOME"));
+        let temporary = root().unwrap().join("tmp");
+        assert!(changes.iter().any(|(key, value)| {
+            *key == "TMPDIR" && *value == Some(temporary.as_os_str())
+        }));
+    }
+}
+
+#[cfg(test)]
+mod prepared_selection_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_assets_from_another_service_cannot_validate_selected_runtime() {
+        let selected = Selection {
+            version: VERSION.into(),
+            managed: false,
+            executable: PathBuf::from("/brew/container/cli/container"),
+            api_program: PathBuf::from("/brew/container/cli/container-apiserver"),
+            install_root: PathBuf::from("/brew/container"),
+            app_root: PathBuf::from("/users/alice/container"),
+        };
+        let index = format!("sha256:{}", "a".repeat(64));
+        let prepared = Prepared {
+            version: VERSION.into(),
+            selection: selected.clone(),
+            package_sha256: PACKAGE_SHA256.into(),
+            kernel_sha256: "b".repeat(64),
+            init_image: format!("kalisto.invalid/vminit:sha256-{}", "a".repeat(64)),
+            init_index: index,
+            init_manifest: format!("sha256:{}", "c".repeat(64)),
+            snapshot_sha256: "d".repeat(64),
+            snapshot_info_sha256: "e".repeat(64),
+            kernel_size: 100,
+            snapshot_size: 100,
+            snapshot_info_size: 100,
+            runtime_sizes: [100; REQUIRED_BINARIES.len()],
+        };
+        validate_prepared(&prepared, &selected).unwrap();
+        let mut foreign = selected;
+        foreign.app_root = PathBuf::from("/users/bob/container");
+        assert!(validate_prepared(&prepared, &foreign).is_err());
     }
 }

@@ -33,6 +33,16 @@ it. It never starts Kubernetes or creates cluster nodes/state. Preparation is re
 architecture, versions and enabled components; rerun it when those inputs change or
 cache is removed. Repeating the same `pull` verifies and reuses a complete cache.
 
+Apple preparation prefers a compatible 1.7.1 CLI/runtime already on `PATH`,
+including Homebrew and its running login-session service. The signed private
+runtime is downloaded only when no compatible installation exists. A borrowed
+service keeps its executable, installation/application roots, configuration,
+default system properties, and existing data; only Kalisto's own nodes, networks,
+and VM directories are task-owned. Runtime selection is stored in per-user data,
+not the shared artifact cache. An incompatible running service fails clearly
+without stopping it or downloading a replacement. Do not stop a compatible
+Homebrew daemon to prepare Kalisto; use Lima explicitly if the service is incompatible.
+
 `up` needs matching prepared assets and does not download startup assets. Default
 CNI is `none`: select `--addons cni/cilium` in **both** commands for Cilium networking
 and CoreDNS. Ingress is not installed by default.
@@ -172,6 +182,7 @@ never infer permission to stop a running cluster or delete the original to make 
 - Pass explicit names to cluster-scoped commands; inspect existing resources first.
 - Select Cilium in both `pull` and `up` when pod networking is required.
 - Prepare matching assets before startup; never delete locks/caches as an automatic fix.
+- Reuse compatible Apple services; never stop/reconfigure a borrowed daemon or delete its application root.
 - Do not equate a saved definition or accepted task with a ready cluster.
 - Monitor background jobs until completion; never leave more than 30 seconds between checks.
 - Read failures before retrying. Failed startup is not permission to destroy data.
@@ -189,6 +200,14 @@ Each includes VM creation, image imports, three Ready nodes, authenticated host 
 all rendered Cilium rollouts, both-worker DNS and cross-node Service HTTP. Preparation
 is outside that clock. This is not a universal hardware guarantee, nor a sub-minute
 claim for first-time downloads/image preparation.
+
+The native CI scenario requires an already-running Homebrew 1.7.1 service and
+compares its CLI/daemon executable, roots, process identity, configuration, and
+default system properties before preparation and after preparation, restart/scale,
+and destruction. It verifies no private installer download/selection; its cleanup
+leaves the borrowed service and persistent user data untouched. The Apple timing
+above predates this reuse-specific proof; full Cilium/API/DNS/cross-node HTTP
+assertions and the sixty-second limit remain unchanged.
 
 See [quick start](../README.md#quick-start) and the
 [budget test](../tests/macos_three_node_boot_budget.rs). Normal agent use does not
