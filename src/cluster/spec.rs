@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::backend::BackendKind;
 use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION, MetalLbConfig};
 use crate::k3s::{ComponentToggles, ServerMode};
-use crate::paths::{artifacts_root, config_root, data_root};
+use crate::paths::data_root;
 
 pub const DEFAULT_K3S_VERSION: &str = "v1.33.5+k3s1";
 pub const DEFAULT_CONTROL_PLANE_CPUS: u8 = 4;
@@ -94,7 +94,7 @@ impl ClusterSpec {
         cni_plugin.apply_component_defaults(&mut component_toggles);
         Self {
             backend,
-            template: default_template(&workspace_root),
+            template: "template://default".to_owned(),
             image_arch: None,
             firecracker_kernel: None,
             firecracker_rootfs: None,
@@ -205,10 +205,6 @@ pub(crate) fn default_network(backend: BackendKind) -> String {
     }
 }
 
-fn default_lima_image_arch_suffix() -> &'static str {
-    ImageArch::host_default().lima_artifact_suffix()
-}
-
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
@@ -218,79 +214,15 @@ pub fn parse_image_arch(value: &str) -> std::result::Result<ImageArch, String> {
     })
 }
 
-fn default_lima_finalized_template_filename() -> String {
-    format!(
-        "ubuntu-24.04-minimal-k3s-{}-finalized.yaml",
-        default_lima_image_arch_suffix()
-    )
-}
-
-fn default_lima_seed_template_filename() -> String {
-    format!(
-        "ubuntu-24.04-minimal-k3s-{}.yaml",
-        default_lima_image_arch_suffix()
-    )
-}
-
-#[must_use]
-pub fn default_template(workspace_root: &Path) -> String {
-    if let Some(template) = lima_template_under(artifacts_root().ok().as_deref()) {
-        return template;
-    }
-
-    if let Some(template) = lima_template_under_workspace_ancestors(workspace_root) {
-        return template;
-    }
-
-    if let Ok(config_root) = config_root()
-        && let Some(template) = lima_template_under(Some(&config_root))
-    {
-        return template;
-    }
-
-    "template://default".to_owned()
-}
-
-fn lima_template_under_workspace_ancestors(workspace_root: &Path) -> Option<String> {
-    for root in workspace_root.ancestors() {
-        if let Some(template) = lima_template_under(Some(&root.join("artifacts"))) {
-            return Some(template);
-        }
-    }
-    None
-}
-
-fn lima_template_under(root: Option<&Path>) -> Option<String> {
-    let root = root?;
-    let finalized = root
-        .join("lima-node")
-        .join(default_lima_finalized_template_filename());
-    if finalized.is_file() {
-        return Some(finalized.display().to_string());
-    }
-
-    let seeded = root
-        .join("lima-node")
-        .join(default_lima_seed_template_filename());
-    if seeded.is_file() {
-        return Some(seeded.display().to_string());
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use crate::backend::BackendKind;
-    use crate::test_support::env_lock;
 
     use crate::cluster::addon::{CniPlugin, DEFAULT_CILIUM_VERSION};
 
     use super::{
         ClusterSpec, DEFAULT_CONTROL_PLANE_CPUS, DEFAULT_CONTROL_PLANE_MEMORY_GIB,
-        DEFAULT_WORKER_CPUS, DEFAULT_WORKER_MEMORY_GIB, NodeResources, default_template,
+        DEFAULT_WORKER_CPUS, DEFAULT_WORKER_MEMORY_GIB, NodeResources,
     };
 
     #[test]
@@ -299,92 +231,6 @@ mod tests {
             ClusterSpec::default_name(std::path::Path::new("/tmp/my-workspace")),
             "my-workspace"
         );
-    }
-
-    #[test]
-    fn default_template_prefers_finalized_artifact() {
-        let _guard = env_lock();
-        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        let root = std::env::temp_dir().join(format!("kalisto-spec-{}", std::process::id()));
-        let data_home = root.join("xdg-data");
-        let finalized = root
-            .join("artifacts")
-            .join("lima-node")
-            .join(super::default_lima_finalized_template_filename());
-        fs::create_dir_all(finalized.parent().unwrap()).unwrap();
-        fs::write(&finalized, "vmType: vz\n").unwrap();
-
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data_home);
-        }
-
-        assert_eq!(default_template(&root), finalized.display().to_string());
-
-        restore_env("XDG_DATA_HOME", original_xdg_data_home);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn default_template_prefers_xdg_artifact_root_over_workspace() {
-        let _guard = env_lock();
-        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        let root = std::env::temp_dir().join(format!("kalisto-spec-xdg-{}", std::process::id()));
-        let data_home = root.join("xdg-data");
-        let workspace_root = root.join("workspace");
-        let workspace_template = workspace_root
-            .join("artifacts")
-            .join("lima-node")
-            .join(super::default_lima_finalized_template_filename());
-        let xdg_template = data_home
-            .join("kalisto")
-            .join("artifacts")
-            .join("lima-node")
-            .join(super::default_lima_finalized_template_filename());
-        fs::create_dir_all(workspace_template.parent().unwrap()).unwrap();
-        fs::create_dir_all(xdg_template.parent().unwrap()).unwrap();
-        fs::write(&workspace_template, "workspace\n").unwrap();
-        fs::write(&xdg_template, "xdg\n").unwrap();
-
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data_home);
-        }
-
-        assert_eq!(
-            default_template(&workspace_root),
-            xdg_template.display().to_string()
-        );
-
-        restore_env("XDG_DATA_HOME", original_xdg_data_home);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn default_template_finds_artifacts_in_workspace_ancestors() {
-        let _guard = env_lock();
-        let original_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        let root =
-            std::env::temp_dir().join(format!("kalisto-spec-ancestor-{}", std::process::id()));
-        let data_home = root.join("xdg-data");
-        let workspace_root = root.join("examples").join("harness").join("job-smoke");
-        let ancestor_template = root
-            .join("artifacts")
-            .join("lima-node")
-            .join(super::default_lima_finalized_template_filename());
-        fs::create_dir_all(workspace_root.as_path()).unwrap();
-        fs::create_dir_all(ancestor_template.parent().unwrap()).unwrap();
-        fs::write(&ancestor_template, "ancestor\n").unwrap();
-
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &data_home);
-        }
-
-        assert_eq!(
-            default_template(&workspace_root),
-            ancestor_template.display().to_string()
-        );
-
-        restore_env("XDG_DATA_HOME", original_xdg_data_home);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -422,17 +268,6 @@ mod tests {
             assert_eq!(spec.network, "apple-container");
         } else {
             assert_eq!(spec.network, "lima:user-v2");
-        }
-    }
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => unsafe {
-                std::env::set_var(name, value);
-            },
-            None => unsafe {
-                std::env::remove_var(name);
-            },
         }
     }
 }

@@ -29,7 +29,7 @@ pub struct Cli {
 #[structopt(rename_all = "kebab")]
 pub enum Command {
     Create(UpArgs),
-    /// Cache node images, K3s and Cilium assets before starting fresh nodes.
+    /// Cache assets for the selected backend before starting fresh nodes.
     Pull(UpArgs),
     /// Export stopped native VZ nodes, including credentials and VM-local data.
     Export(ExportArgs),

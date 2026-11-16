@@ -35,8 +35,8 @@ verifies/reuses a complete cache rather than rebuilding the OS image. Bare
 
 `pull` reuses a compatible installed Apple CLI/runtime (including Homebrew) from
 `PATH`. Only when no compatible installation exists does it fetch the pinned,
-signed private runtime. It also prepares the kernel/init image, managed Helm,
-Crane, kubectl, K3s, and platform-digest-pinned OCI images including a BusyBox
+signed private runtime. It also prepares the kernel/init image, managed Crane,
+kubectl, Helm when Cilium is selected, K3s, and platform-digest-pinned OCI images including a BusyBox
 diagnostic image. A temporary ordinary container prepares the reusable Ubuntu/k3s
 node image, never starting Kubernetes or creating cluster state; the builder is
 deleted after use. Standard flow requires no checkout, manual templates, Homebrew,
@@ -145,6 +145,29 @@ Run live validation only in the authorized native macOS CI job. The existing Lim
 timings above are not Apple-container measurements. Cold archive export/import
 currently remains Lima-only; existing Lima clusters and archives are not converted
 by selecting a different backend.
+
+## Backend-specific preparation
+
+`pull` prepares only the selected backend; it does not prepare the other engines.
+Apple containers are the macOS default, Firecracker is the Linux default, and
+`--backend` or `cluster.backend` selects an explicit alternative.
+
+| Backend | Preparation command | Backend-specific assets |
+| --- | --- | --- |
+| Apple containers (macOS default) | `kalisto pull` | Compatible Apple runtime, Linux kernel/init and Ubuntu/k3s OCI node image; no Lima VM disk or template |
+| Lima (optional) | `kalisto pull --backend lima` | Managed Lima runtime and VM disk/template under `artifacts/node-image`; no Apple runtime or node image |
+| Firecracker (Linux default) | `kalisto pull --backend firecracker` | Configured/discovered Firecracker kernel and rootfs; no Apple, Lima, Helm or OCI boot-profile preparation |
+
+Apple and Lima also cache Kubernetes boot images and managed kubectl. Add
+`--addons cni/cilium` to prepare Cilium images and its Helm chart, then select the
+same add-on during `up`. Firecracker prepares matching host kubectl, but its
+kernel/rootfs publication is still in progress: provide existing artifacts or
+configured manifest/artifact URLs as described in
+[Linux prerequisites](docs/prerequisites-linux-firecracker.md). This does not
+extend the macOS offline-startup or sub-minute guarantee to Firecracker.
+CLI and MCP pull results identify the selected backend and report only its
+prepared boot profile or kernel/rootfs paths. Disk templates are never discovered
+for default Apple-container startup, and only Lima logs a template path.
 
 ## Optional Lima backend
 
@@ -477,9 +500,10 @@ KALISTO_BUILD_VERSION=1.4.3-rc.1+build42 cargo build
 
 ## Advanced: legacy Lima image build helpers
 
-The standard binary-only path is `kalisto pull`: it prepares a sanitized compressed
+For the optional Lima backend, `kalisto pull` prepares a sanitized compressed
 Ubuntu raw disk through native VZ without starting Kubernetes. No scripts in this
-section are required for that flow.
+section are required for that flow. Lima YAML templates are Lima-only; the default
+Apple-container backend neither needs nor consumes a disk image template.
 
 The optional maintainer scripts below provide a separate two-stage image flow:
 
@@ -488,7 +512,7 @@ The optional maintainer scripts below provide a separate two-stage image flow:
 
 Relevant files:
 
-- [images/macos/lima-node/ubuntu-24.04.yaml](images/macos/lima-node/ubuntu-24.04.yaml)
+- [images/macos/node-image/ubuntu-24.04.yaml](images/macos/node-image/ubuntu-24.04.yaml)
 - [scripts/macos/provision_lima_node.sh](scripts/macos/provision_lima_node.sh)
 - [scripts/macos/build_lima_node_image.sh](scripts/macos/build_lima_node_image.sh)
 - [scripts/macos/finalize_lima_node_image.sh](scripts/macos/finalize_lima_node_image.sh)
@@ -522,31 +546,31 @@ brew install qemu
 
 Default artifacts:
 
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
-- `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.yaml`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.manifest`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+- `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
 
 ## Advanced: releasing prebuilt Lima images
 
 This optional publishing workflow uses the legacy helpers above, not the managed
-native preparation performed by `kalisto pull`.
+native preparation performed by `kalisto pull` for the optional Lima backend.
 
 For a published prebuilt image, the important runtime artifact is the finalized
 disk image. Kalisto can render the matching Lima template locally from that image,
 so the minimum published artifact set is:
 
 - required:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2`
 - recommended:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.manifest`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml`
 - optional intermediate seed artifacts:
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml`
-  - `artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.manifest`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.yaml`
+  - `artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.manifest`
 
 Build and finalize the release image with these scripts:
 
@@ -556,8 +580,8 @@ sh scripts/macos/finalize_lima_node_image.sh
 ```
 
 The legacy finalize script requires `qemu-img` to export a compact finalized
-`qcow2`. The standard native `kalisto pull` path instead exports compressed raw
-and does not require a host QEMU installation.
+`qcow2`. The optional Lima backend's native `kalisto pull` path instead exports
+compressed raw and does not require a host QEMU installation.
 
 The first script produces the seed image and manifest. The second script boots
 that seed once under Lima, waits for the guest to contain the Kalisto node-image
@@ -567,18 +591,18 @@ manifest.
 To install a release artifact into Kalisto's managed XDG cache locally:
 
 ```bash
-mkdir -p ~/.local/share/kalisto/artifacts/lima-node
-cp artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
-  ~/.local/share/kalisto/artifacts/lima-node/
+mkdir -p ~/.local/share/kalisto/artifacts/node-image
+cp artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/node-image/
 sh scripts/macos/render_lima_artifact_template.sh \
-  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
-  ~/.local/share/kalisto/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
+  ~/.local/share/kalisto/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2 \
+  ~/.local/share/kalisto/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml
 ```
 
 Kalisto now looks in this XDG cache first:
 
 ```text
-~/.local/share/kalisto/artifacts/lima-node/
+~/.local/share/kalisto/artifacts/node-image/
 ```
 
 If you publish the finalized image at a stable URL, Kalisto can fetch it on miss

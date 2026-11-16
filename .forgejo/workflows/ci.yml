@@ -157,6 +157,7 @@ jobs:
             *) printf 'Unsupported container service status (%s): %s\n' "$status_code" "$status" >&2; exit 1 ;;
           esac
           cd "$KALISTO_APPLE_WORKSPACE"
+          cargo test --locked --release --lib runtime::tests -- --nocapture
           cargo test --locked --release --lib \
             apple_container::image::tests::loopback_import_serves_exact_manifest_and_layer_without_extracting -- --nocapture
           cargo test --locked --release --test macos_three_node_boot_budget \
@@ -169,6 +170,7 @@ jobs:
           path: |
             ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/result.json
             ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/*-image-timings.log
+            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/backend-isolation.json
             ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/runtime-*.json
           if-no-files-found: warn
           retention-days: 7

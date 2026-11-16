@@ -33,6 +33,14 @@ it. It never starts Kubernetes or creates cluster nodes/state. Preparation is re
 architecture, versions and enabled components; rerun it when those inputs change or
 cache is removed. Repeating the same `pull` verifies and reuses a complete cache.
 
+Preparation is backend-specific. The default Apple path never resolves or
+downloads a Lima VM disk/template. Explicit `--backend lima` prepares Lima
+instead, without installing Apple containers. On Linux, `--backend firecracker`
+prepares only configured/discovered kernel/rootfs artifacts and managed kubectl;
+it does not prepare the macOS offline CNI profiles. Firecracker still needs its
+documented host prerequisites and artifact sources. CLI and `clusters.pull`
+results identify the selected backend.
+
 Apple preparation prefers a compatible 1.7.1 CLI/runtime already on `PATH`,
 including Homebrew and its running login-session service. The signed private
 runtime is downloaded only when no compatible installation exists. A borrowed

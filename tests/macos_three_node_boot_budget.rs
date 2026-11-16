@@ -641,6 +641,27 @@ fn cold_cli_boot(backend: BackendKind) {
         "cold CLI boot, API and functional CNI exceeded 60 seconds: {elapsed:?}"
     );
     if backend == BackendKind::AppleContainer {
+        let pull_output = fs::read_to_string(evidence.join("pull.log")).unwrap();
+        let up_output = fs::read_to_string(evidence.join("up.log")).unwrap();
+        assert!(
+            pull_output
+                .lines()
+                .any(|line| line == "backend: apple-container")
+        );
+        assert!(
+            !up_output.contains("template="),
+            "Apple startup must not advertise an unused Lima template"
+        );
+        fs::write(
+            evidence.join("backend-isolation.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "backend": "apple-container",
+                "pull_reports_selected_backend": true,
+                "startup_logs_lima_template": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         prove_persistent_restart_and_worker_scale(&name, &prepared_spec, &kubeconfig);
         borrowed_runtime
             .as_ref()

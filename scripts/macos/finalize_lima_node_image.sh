@@ -3,9 +3,9 @@ set -eu
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 RENDER_SCRIPT="${ROOT_DIR}/scripts/macos/render_lima_artifact_template.sh"
-INPUT_IMAGE_PATH="${1:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2}"
-OUTPUT_IMAGE_PATH="${2:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2}"
-OUTPUT_TEMPLATE_PATH="${3:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml}"
+INPUT_IMAGE_PATH="${1:-${ROOT_DIR}/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2}"
+OUTPUT_IMAGE_PATH="${2:-${ROOT_DIR}/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2}"
+OUTPUT_TEMPLATE_PATH="${3:-${ROOT_DIR}/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64-finalized.yaml}"
 OUTPUT_MANIFEST_PATH="${OUTPUT_IMAGE_PATH%.*}.manifest"
 WORK_DIR="${KALISTO_FINALIZE_WORK_DIR:-${ROOT_DIR}/target/finalize-lima-image}"
 INSTANCE_NAME="${KALISTO_FINALIZE_INSTANCE_NAME:-kalisto-image-finalize-$(date +%s)}"

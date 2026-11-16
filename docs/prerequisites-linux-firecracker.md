@@ -23,7 +23,7 @@ These prerequisites are for:
 - Firecracker as the VM engine
 - `k3s` inside the guest
 
-This is separate from the existing macOS + Lima path.
+This is separate from the default macOS Apple-container path and optional Lima path.
 
 ## Host Requirements
 
@@ -80,7 +80,19 @@ At minimum, the Firecracker backend needs:
 
 These should be treated as backend-specific artifacts even if they are built from the same Ubuntu guest recipe used by Lima.
 
+`kalisto pull --backend firecracker` resolves or downloads only the configured
+Firecracker kernel/rootfs and prepares the matching managed host kubectl. It does
+not install macOS runtime helpers, fetch Lima disks/templates, or build Apple OCI
+node images. Supply the existing local artifacts or manifest/artifact URLs
+described below; there is no implicit public kernel/rootfs download source yet.
+This preparation does not provide the offline CNI boot profiles or sub-minute
+startup guarantee of the macOS backends.
+
 The intended artifact split is:
+
+- Apple containers (macOS default):
+  - Apple Linux kernel/init image
+  - Kalisto-managed Ubuntu/k3s OCI node image
 
 - Lima:
   - Lima template YAML
@@ -96,7 +108,7 @@ Reusing the same Ubuntu base is desirable. Reusing the Lima template artifact di
 For the Firecracker engine to work in Kalisto, the project must provide:
 
 - backend auto-selection based on host OS
-  - macOS -> Lima
+  - macOS -> Apple containers (Lima explicitly optional)
   - Linux -> Firecracker
 - persisted backend identity in cluster state
 - Firecracker runtime configuration surface

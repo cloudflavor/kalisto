@@ -56,7 +56,7 @@ build:bin:
     paths:
       - target/*/release/kalisto
 
-.build:lima-node-rootfs:
+.build:node-image-rootfs:
   stage: build
   image: ubuntu:noble
   cache:
@@ -96,17 +96,17 @@ build:bin:
     paths:
       - artifacts/lima-rootfs/*/rootfs.tar
 
-.build:lima-node-image:
+.build:node-image:
   stage: build
   image: ubuntu:noble
   cache:
-    key: "lima-node-image-${KALISTO_UBUNTU_ARCH}-v1"
+    key: "node-image-${KALISTO_UBUNTU_ARCH}-v1"
     paths:
       - .cache/k3s/
-      - .cache/lima-node/work/
+      - .cache/node-image/work/
   before_script:
     - mkdir -p "${KALISTO_IMAGE_WORK_DIR}" "${KALISTO_IMAGE_SCRATCH_DIR}"
-    - chmod -R u+rwX,go+rwX "${CI_PROJECT_DIR}/.cache/k3s" "${CI_PROJECT_DIR}/.cache/lima-node" || true
+    - chmod -R u+rwX,go+rwX "${CI_PROJECT_DIR}/.cache/k3s" "${CI_PROJECT_DIR}/.cache/node-image" || true
     - |
       apt_get() {
         if [ "$(id -u)" -eq 0 ]; then
@@ -135,10 +135,10 @@ build:bin:
     - ./scripts/macos/build_lima_node_image.sh
   artifacts:
     paths:
-      - artifacts/lima-node/
+      - artifacts/node-image/
 
-build:lima-node-rootfs:arm64:
-  extends: .build:lima-node-rootfs
+build:node-image-rootfs:arm64:
+  extends: .build:node-image-rootfs
   image:
     name: ubuntu:noble
     docker:
@@ -149,8 +149,8 @@ build:lima-node-rootfs:arm64:
     KALISTO_UBUNTU_ARCH: arm64
     KALISTO_BUILDKIT_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/lima-rootfs/arm64"
 
-build:lima-node-rootfs:amd64:
-  extends: .build:lima-node-rootfs
+build:node-image-rootfs:amd64:
+  extends: .build:node-image-rootfs
   image:
     name: ubuntu:noble
     docker:
@@ -161,10 +161,10 @@ build:lima-node-rootfs:amd64:
     KALISTO_UBUNTU_ARCH: amd64
     KALISTO_BUILDKIT_OUTPUT_DIR: "$CI_PROJECT_DIR/artifacts/lima-rootfs/amd64"
 
-build:lima-node-image:arm64:
-  extends: .build:lima-node-image
+build:node-image:arm64:
+  extends: .build:node-image
   needs:
-    - job: build:lima-node-rootfs:arm64
+    - job: build:node-image-rootfs:arm64
       artifacts: true
   image:
     name: ubuntu:noble
@@ -173,8 +173,8 @@ build:lima-node-image:arm64:
       user: root
   variables:
     KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
-    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
-    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-lima-node-arm64"
+    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/node-image/work"
+    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-node-image-arm64"
     LIBGUESTFS_BACKEND: direct
     KALISTO_HOST_GRUB_PACKAGE: grub-efi-arm64-bin
     KALISTO_UBUNTU_ARCH: arm64
@@ -182,10 +182,10 @@ build:lima-node-image:arm64:
   script:
     - KALISTO_PREBUILT_ROOTFS_ARCHIVE="$CI_PROJECT_DIR/artifacts/lima-rootfs/arm64/rootfs.tar" ./scripts/macos/build_lima_node_image.sh
 
-build:lima-node-image:amd64:
-  extends: .build:lima-node-image
+build:node-image:amd64:
+  extends: .build:node-image
   needs:
-    - job: build:lima-node-rootfs:amd64
+    - job: build:node-image-rootfs:amd64
       artifacts: true
   image:
     name: ubuntu:noble
@@ -194,8 +194,8 @@ build:lima-node-image:amd64:
       user: root
   variables:
     KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
-    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/lima-node/work"
-    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-lima-node-amd64"
+    KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/node-image/work"
+    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-node-image-amd64"
     LIBGUESTFS_BACKEND: direct
     KALISTO_HOST_GRUB_PACKAGE: grub-efi-amd64-bin
     KALISTO_UBUNTU_ARCH: amd64

@@ -278,8 +278,11 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         backend = spec.backend.as_str(),
         workers = spec.worker_count,
         api_port = spec.api_port,
-        template = %spec.template
+        template = tracing::field::Empty
     );
+    if spec.backend == BackendKind::Lima {
+        up_span.record("template", tracing::field::display(&spec.template));
+    }
     let _up_guard = up_span.enter();
     info!("starting cluster bring-up");
     debug_feedback(format!(
@@ -3583,7 +3586,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
         let mut spec =
             crate::cluster::spec::ClusterSpec::new("default".to_owned(), workspace_root.clone());
         spec.backend = BackendKind::Lima;
-        let template_root = workspace_root.join("artifacts").join("lima-node");
+        let template_root = workspace_root.join("artifacts").join("node-image");
         fs::create_dir_all(&template_root).unwrap();
         let template = template_root.join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
         fs::write(&template, "vmType: vz\n").unwrap();
@@ -3619,7 +3622,7 @@ addresses = ["10.20.0.200-10.20.0.220"]
         let mut spec =
             crate::cluster::spec::ClusterSpec::new("default".to_owned(), workspace_root.clone());
         spec.backend = BackendKind::Lima;
-        let template_root = workspace_root.join("artifacts").join("lima-node");
+        let template_root = workspace_root.join("artifacts").join("node-image");
         fs::create_dir_all(&template_root).unwrap();
         let template = template_root.join("ubuntu-24.04-minimal-k3s-arm64-finalized.yaml");
         fs::write(&template, "vmType: vz\n").unwrap();

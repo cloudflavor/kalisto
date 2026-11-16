@@ -2,8 +2,8 @@
 set -eu
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
-IMAGE_PATH="${1:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.qcow2}"
-OUTPUT_PATH="${2:-${ROOT_DIR}/artifacts/lima-node/ubuntu-24.04-minimal-k3s-arm64.yaml}"
+IMAGE_PATH="${1:-${ROOT_DIR}/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.qcow2}"
+OUTPUT_PATH="${2:-${ROOT_DIR}/artifacts/node-image/ubuntu-24.04-minimal-k3s-arm64.yaml}"
 TEMPLATE_ARCH="${KALISTO_LIMA_TEMPLATE_ARCH:-}"
 if [ ! -f "${IMAGE_PATH}" ]; then
   echo "missing image artifact: ${IMAGE_PATH}" >&2
