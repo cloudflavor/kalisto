@@ -391,6 +391,7 @@ fn cold_cli_boot(backend: BackendKind) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kalisto"));
     command
         .env("RUST_LOG", "info")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir(&workspace)
         .args([
             "up",
@@ -407,20 +408,17 @@ fn cold_cli_boot(backend: BackendKind) {
         .stderr(Stdio::from(up_log));
     if backend != BackendKind::AppleContainer {
         command.args(["--backend", backend.as_str()]);
-        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }
     if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
         command.args(["--api-port", &port]);
     }
 
-    // Preparation may build a sanitized OS image, never a Kubernetes cluster or
-    // any benchmark VM. Apple commands retain PATH to reuse the user's Homebrew CLI.
+    // Preparation may build a sanitized OS-only image, never a Kubernetes cluster.
+    // Both commands run outside the checkout with a system-only PATH.
     let mut pull = Command::new(command.get_program());
     let pull_log = fs::File::create(evidence.join("pull.log")).unwrap();
     pull.env("RUST_LOG", "info,kalisto::apple_container::registry=debug");
-    if backend != BackendKind::AppleContainer {
-        pull.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-    }
+    pull.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     let pull_status = pull
         .current_dir(&workspace)
         .arg("pull")
@@ -631,7 +629,7 @@ fn cold_cli_boot(backend: BackendKind) {
             "worker_cross_node_http_probes": 2,
             "probe_images_prepared": true,
             "empty_working_directory": true,
-            "system_only_path": backend != BackendKind::AppleContainer,
+            "system_only_path": true,
             "borrowed_homebrew_runtime": borrowed_runtime.is_some(),
             "under_60_seconds": elapsed < Duration::from_secs(60)
         }))
