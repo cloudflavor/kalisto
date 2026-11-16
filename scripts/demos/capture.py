@@ -97,8 +97,9 @@ def engine_snapshot(env):
             match = re.match(r"\s*([^=]+?)\s*(?:=>|=)\s*(.*)$", line)
             if match and match[1].strip() in keys:
                 values[match[1].strip()] = match[2].strip()
-        require(values.get("CONTAINER_APP_ROOT") == str(app)
-                and values.get("CONTAINER_INSTALL_ROOT") == str(install),
+        require("CONTAINER_APP_ROOT" in values and "CONTAINER_INSTALL_ROOT" in values
+                and Path(values["CONTAINER_APP_ROOT"]) == app
+                and Path(values["CONTAINER_INSTALL_ROOT"]) == install,
                 "Daemon roots do not match the running installation")
         services[label] = values
     api = services["com.apple.container.apiserver"]
@@ -118,8 +119,8 @@ def verify_borrowed(work, env, before):
     if selection_path.exists():
         selected = json.loads(selection_path.read_text())
         require(selected["managed"] is False and selected["executable"] == before["native"]
-                and selected["app_root"] == before["paths"]["appRoot"]
-                and selected["install_root"] == before["paths"]["installRoot"],
+                and Path(selected["app_root"]) == Path(before["paths"]["appRoot"])
+                and Path(selected["install_root"]) == Path(before["paths"]["installRoot"]),
                 "Kalisto did not borrow the existing daemon unchanged")
     private_runtime = work / "data/kalisto/artifacts/runtime-v1/apple-container-1.7.1-arm64"
     require(not private_runtime.exists(), "A private Apple runtime must never be installed")
