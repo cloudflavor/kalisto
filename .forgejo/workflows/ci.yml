@@ -157,6 +157,8 @@ jobs:
             *) printf 'Unsupported container service status (%s): %s\n' "$status_code" "$status" >&2; exit 1 ;;
           esac
           cd "$KALISTO_APPLE_WORKSPACE"
+          cargo test --locked --release --lib \
+            apple_container::image::tests::loopback_import_serves_exact_manifest_and_layer_without_extracting -- --nocapture
           cargo test --locked --release --test macos_three_node_boot_budget \
             apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
       - name: Upload benchmark measurements

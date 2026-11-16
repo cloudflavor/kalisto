@@ -417,7 +417,7 @@ fn cold_cli_boot(backend: BackendKind) {
     // any benchmark VM. Apple commands retain PATH to reuse the user's Homebrew CLI.
     let mut pull = Command::new(command.get_program());
     let pull_log = fs::File::create(evidence.join("pull.log")).unwrap();
-    pull.env("RUST_LOG", "info");
+    pull.env("RUST_LOG", "info,kalisto::apple_container::registry=debug");
     if backend != BackendKind::AppleContainer {
         pull.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }

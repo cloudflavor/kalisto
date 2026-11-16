@@ -455,8 +455,8 @@ mod tests {
         ));
         let output = fs::File::create_new(&path).unwrap();
         let path = ArchiveFile(path);
-        let layer = b"unique node layer bytes, not an archive header";
-        let reference = write_image(&mut Cursor::new(layer), output, "v1.33.5+k3s1").unwrap();
+        let layer = b"unique node layer bytes, not an archive header".repeat(8192);
+        let reference = write_image(&mut Cursor::new(&layer), output, "v1.33.5+k3s1").unwrap();
         let layout = path.0.with_extension("layout");
         fs::create_dir(&layout).unwrap();
         let layout = LayoutDirectory(layout);
@@ -476,7 +476,10 @@ mod tests {
             let manifest: Value = serde_json::from_slice(body(&response)).unwrap();
             let layer_digest = manifest["layers"][0]["digest"].as_str().unwrap();
             let blob_path = format!("/v2/kalisto-node/blobs/{layer_digest}");
-            assert_eq!(body(&request(&registry, "GET", &blob_path)), layer);
+            assert_eq!(
+                body(&request(&registry, "GET", &blob_path)),
+                layer.as_slice()
+            );
             assert!(body(&request(&registry, "HEAD", &blob_path)).is_empty());
             assert!(
                 request(&registry, "GET", "/v2/kalisto-node/blobs/../../etc/passwd")

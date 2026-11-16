@@ -232,13 +232,33 @@ fn serve(
     let Some(blob) = blobs.get(hash) else {
         return empty_response(stream, "404 Not Found");
     };
+    let range = header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("range").then(|| value.trim())
+    });
+    tracing::debug!(
+        method,
+        path,
+        range,
+        bytes = blob.size,
+        "Serving prepared OCI content"
+    );
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {media_type}\r\nDocker-Distribution-API-Version: registry/2.0\r\nDocker-Content-Digest: sha256:{hash}\r\nConnection: close\r\n\r\n",
         blob.size
     )?;
-    if method == "GET" && source.copy_blob(hash, *blob, stream)? != blob.size {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    if method == "GET" {
+        let transferred = source.copy_blob(hash, *blob, stream)?;
+        tracing::debug!(
+            path,
+            transferred,
+            expected = blob.size,
+            "Sent prepared OCI content"
+        );
+        if transferred != blob.size {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
     }
     Ok(())
 }
