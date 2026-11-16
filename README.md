@@ -108,6 +108,12 @@ KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1 \
   apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
 ```
 
+Native [macOS CI](https://forgejo.example.test/cloudflavor/kalisto/actions/runs/32)
+measured **52.04s** for that fresh three-node scenario with Apple `container` 1.7.1.
+Stop/resume preserved Kubernetes state, and scaling to four Ready nodes passed
+afterward, outside the startup timer. This is one completed run, not a universal
+hardware performance guarantee.
+
 Run live validation only in the authorized native macOS CI job. The existing Lima
 timings above are not Apple-container measurements. Cold archive export/import
 currently remains Lima-only; existing Lima clusters and archives are not converted
