@@ -58,6 +58,26 @@ class PublicationPrivacyTests(unittest.TestCase):
             self.assertEqual(metadata["sha256"], hashlib.sha256(target.read_bytes()).hexdigest())
             self.assertNotIn("private-person", target.read_text())
 
+    def test_successful_exit_metadata_preserves_output_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw, target = Path(directory) / "raw.cast", Path(directory) / "start.cast"
+            header = {"version": 2, "width": 110, "height": 30, "timestamp": 1700000000}
+            events = [[0.25, "o", "$ kalisto ls\r\n"], [8.5, "o", "demo\r\n"], [8.6, "x", "0"]]
+            raw.write_text("\n".join(json.dumps(row) for row in [header, *events]) + "\n")
+            metadata = publish_cast(raw, target, "start", {"/private/example": "<workspace>"}, [])
+            published = [json.loads(line) for line in target.read_text().splitlines()]
+            self.assertEqual(published[1:], events[:2])
+            self.assertEqual(metadata["duration_seconds"], 8.5)
+
+    def test_unsuccessful_exit_metadata_cannot_be_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw, target = Path(directory) / "raw.cast", Path(directory) / "start.cast"
+            header = {"version": 2, "width": 110, "height": 30, "timestamp": 1700000000}
+            events = [[0.25, "o", "partial output\r\n"], [8.6, "x", "1"]]
+            raw.write_text("\n".join(json.dumps(row) for row in [header, *events]) + "\n")
+            with self.assertRaises(CaptureError):
+                publish_cast(raw, target, "start", {"/private/example": "<workspace>"}, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,13 @@ functional Cilium/DNS/cross-node HTTP performance acceptance test in
 | `resume.cast` | Create `demo-state` with `value=saved-before-stop`, stop only the owned cluster with `kalisto down`, inspect that all three nodes are actually Stopped, resume with the same profile, and verify the ConfigMap's original UID and data plus the surviving HTTP workload and response. |
 | `scale.cast` | Show the original three Ready nodes, run `kalisto scale --workers 3`, require exactly four Ready nodes, increase the HTTP Deployment to three replicas, require distinct worker placements, and repeat the HTTP proof. |
 
+On Apple-container resume, guest addresses can change. Before starting a stopped
+k3s process, Kalisto checks any existing kubelet serving certificate against the
+current guest IPv4 address. Only a mismatched kubelet leaf certificate is renewed
+using `k3s certificate rotate --service kubelet`; cluster CA, datastore, and TLS
+verification remain intact. The resume scene's real port-forward verifies this
+consumer path rather than treating Ready nodes alone as proof of recovery.
+
 The HTTP fixture is [`scripts/demos/app.yaml`](../scripts/demos/app.yaml): a small
 BusyBox HTTP server, a content ConfigMap, and a Service. Required pod anti-affinity
 and control-plane exclusion make worker placement observable rather than assumed.
@@ -154,6 +161,8 @@ also disable idle-time shortening (for the website player, `idleTimeLimit:
 Infinity` and speed 1). All original output events remain in order at their
 original numeric timestamps. `duration_seconds` is the last output event timestamp,
 i.e. the actual cast playback duration; it is not an independent stopwatch claim.
+The recorder's final successful exit metadata (`x`, `0`) is validated and omitted
+from the output-only publication; unsuccessful exit metadata rejects publication.
 
 The only permitted terminal-output substitutions are exact known private prefixes:
 
@@ -205,7 +214,7 @@ compatibility shim or an older claim.
 
 The host-safe `scripts/demos/test_capture.py` regression suite exercises every
 two-chunk split of a private path, multiple spanning substitutions, concatenated
-identity/credential rejection, and unchanged timing/header privacy. During the
-parent's native CI verification, run
+identity/credential rejection, unchanged timing/header privacy, and exit metadata.
+During native CI verification, run
 `python3 -m unittest discover -s scripts/demos -p 'test_*.py' -v`.
 It does not invoke the engine or produce publication recordings.

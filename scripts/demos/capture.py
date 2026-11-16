@@ -223,16 +223,24 @@ def privacy_gate(text, forbidden):
 def publish_cast(raw, target, scene, replacements, forbidden):
     lines = raw.read_text().splitlines()
     header = json.loads(lines[0])
-    events = [json.loads(line) for line in lines[1:]]
+    recorded = [json.loads(line) for line in lines[1:]]
     require(header["version"] == 2 and header["width"] == 110 and header["height"] == 30,
             "Recorder must produce fixed 110x30 asciicast v2")
     previous = 0
-    for event in events:
-        require(len(event) == 3 and event[1] == "o" and isinstance(event[2], str)
+    events = []
+    for index, event in enumerate(recorded):
+        require(len(event) == 3 and isinstance(event[2], str)
                 and isinstance(event[0], (int, float)) and math.isfinite(event[0])
-                and event[0] >= previous, "Recorder emitted invalid timing or non-output events")
+                and event[0] >= previous, "Recorder emitted invalid timing or event data")
         previous = event[0]
-    require(events and previous > 0, "Recording must contain actual timed output")
+        if event[1] == "x":
+            require(index == len(recorded) - 1 and event[2] == "0",
+                    "Recorder reported an unsuccessful session exit")
+            continue
+        require(event[1] == "o", "Recorder emitted a non-output event")
+        events.append(event)
+    require(events and events[-1][0] > 0, "Recording must contain actual timed output")
+    previous = events[-1][0]
     events = redact_events(events, replacements)
     # Drop incidental recorder metadata rather than publishing its environment.
     public_header = {"version": 2, "width": 110, "height": 30,
