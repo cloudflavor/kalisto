@@ -15,7 +15,7 @@ not required.
   Complete both before measuring offline cluster startup.
 
 Intel Macs and older macOS versions must select the
-[optional Lima backend](../README.md#optional-lima-backend) explicitly. These
+[optional Lima backend](https://cloudflavor.io/kalisto/docs/lima/) explicitly. These
 Apple-container prerequisites do not apply to Lima or Linux Firecracker.
 
 ## Install and start Apple container
@@ -40,7 +40,7 @@ See the [Homebrew formula](https://formulae.brew.sh/formula/container) and
 ## Prepare Kalisto after the runtime is ready
 
 Install the standalone Kalisto binary, then follow the
-[quick start](../README.md#prepare-and-start). `kalisto pull` prepares the Linux
+[quick start](https://cloudflavor.io/kalisto/docs/getting-started/). `kalisto pull` prepares the Linux
 kernel/init, node image, Kubernetes images and managed tools for the selected
 profile. `kalisto up` does not install the host engine or download missing startup
 assets. Runtime installation, service setup and preparation are outside the
