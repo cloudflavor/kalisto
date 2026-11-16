@@ -132,6 +132,9 @@ impl ArchiveRegistry {
                 while !worker_stopping.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Darwin inherits O_NONBLOCK from the listener.
+                            // Response writes must wait for client backpressure.
+                            stream.set_nonblocking(false)?;
                             stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                             stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                             if let Err(error) = serve(&mut stream, &mut source, &blobs) {
