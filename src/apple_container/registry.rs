@@ -237,10 +237,8 @@ fn serve(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {media_type}\r\nDocker-Distribution-API-Version: registry/2.0\r\nDocker-Content-Digest: sha256:{hash}\r\nConnection: close\r\n\r\n",
         blob.size
     )?;
-    if method == "GET" {
-        if source.copy_blob(hash, *blob, stream)? != blob.size {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-        }
+    if method == "GET" && source.copy_blob(hash, *blob, stream)? != blob.size {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
     Ok(())
 }
