@@ -69,6 +69,33 @@ def execute(args, env, *, cwd=None, log=None):
     return result.stdout.decode("utf-8")
 
 
+def capture_node_diagnostics(work, env, label):
+    marker = work / "private/cluster.json"
+    if not marker.exists():
+        return
+    name = json.loads(marker.read_text())["name"]
+    require(re.fullmatch(r"showcase-[0-9a-f]{16}", name), "Invalid owned diagnostic cluster")
+    guest = (
+        "ip -4 -o address show scope global; ip -4 -o route; "
+        "openssl x509 -in /var/lib/rancher/k3s/agent/serving-kubelet.crt "
+        "-noout -ext subjectAltName -dates; "
+        "sha256sum /var/lib/rancher/k3s/agent/serving-kubelet.crt; "
+        "find /var/lib/rancher/k3s -maxdepth 2 -type d -name 'tls-*'"
+    )
+    commands = [("nodes", ["kalisto", "kubectl", "--name", name, "--", "get", "nodes", "-o", "wide"])]
+    commands.extend((suffix, ["/opt/homebrew/bin/container", "exec", "--user", "root",
+                             f"kalisto-{name}-{suffix}", "/bin/sh", "-lc", guest])
+                    for suffix in ("cp", "w0", "w1"))
+    for suffix, args in commands:
+        target = work / "private" / f"{label}-{suffix}.log"
+        try:
+            result = subprocess.run(args, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=10, check=False)
+            target.write_bytes(result.stdout)
+        except subprocess.TimeoutExpired:
+            target.write_text("Owned diagnostic command timed out.\n")
+
+
 def engine_snapshot(env):
     executable = shutil.which("container", path=env["PATH"])
     require(executable is not None, "Installed Homebrew container is required")
@@ -315,6 +342,8 @@ def record(work, env):
         (demo / "app.yaml").write_text(fixture)
         shutil.copy2(HERE / "scene.py", demo / "scene.py")
     for scene in SCENES:
+        if scene == "resume":
+            capture_node_diagnostics(work, env, "before-resume")
         print(f"Recording genuine {scene} scene.", flush=True)
         execute([asciinema, "rec", "--output-format", "asciicast-v2", "--window-size", "110x30",
                  "--return", "--headless", "--quiet", "--capture-env", "TERM,SHELL",
@@ -374,6 +403,10 @@ def main():
     try:
         record(work, env)
     except BaseException:
+        try:
+            capture_node_diagnostics(work, env, "failure")
+        except BaseException:
+            pass  # Preserve the original failure and always attempt owned cleanup.
         try:
             cleanup(work, env)
         except BaseException:
