@@ -323,8 +323,8 @@ mod tests {
         assert!(command.contains("KALISTO_K3S_NODE_ROLE=agent"));
         assert!(
             command.contains(
-                  "KALISTO_K3S_SERVER_URL='https://lima-kalisto-cp-test.example.test:6443'"
-              )
+                "KALISTO_K3S_SERVER_URL='https://lima-kalisto-cp-test.example.test:6443'"
+            )
         );
         assert!(command.contains("KALISTO_K3S_TOKEN='secret-token'"));
         assert!(command.contains("KALISTO_K3S_NODE_NAME='kalisto-w0-test'"));
