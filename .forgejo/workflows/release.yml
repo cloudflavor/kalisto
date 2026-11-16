@@ -99,18 +99,32 @@ jobs:
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
-      CARGO_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/cargo-home
-      RUSTUP_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-rustup
-      CARGO_TARGET_DIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-target/${{ matrix.target }}
-      TMPDIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/build-tmp
+      KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
+      KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
     steps:
       - name: Verify mounted external storage and checkout into owned workspace
         run: |
           set -eu
-          python3 -c 'import os; assert os.path.ismount("${{ vars.KALISTO_MACOS_VOLUME }}"), "external build volume not mounted; refusing internal storage"'
-          mkdir -p ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds "$TMPDIR"
-          workspace=$(mktemp -d ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/tomis.XXXXXX)
+          storage=$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          assert Path(os.environ["KALISTO_MACOS_VOLUME"]).is_absolute(), "external volume must be an absolute path"
+          assert Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).is_absolute(), "build root must be an absolute path"
+          volume = Path(os.environ["KALISTO_MACOS_VOLUME"]).resolve(strict=True)
+          root = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve()
+          assert volume != Path("/") and os.path.ismount(volume), "external build volume must be mounted"
+          assert root != volume and root.is_relative_to(volume), "build root must be beneath the external volume"
+          root.mkdir(parents=True, exist_ok=True)
+          assert root.stat().st_dev == volume.stat().st_dev, "build root must remain on the external volume"
+          print(root)
+          PY
+          )
+          workspace=$(mktemp -d "$storage/kalisto-release.XXXXXX")
           printf 'KALISTO_RELEASE_WORKSPACE=%s\nKALISTO_RELEASE_DIST=%s/dist\n' "$workspace" "$workspace" >> "$GITHUB_ENV"
+          mkdir -p "$workspace/tmp"
+          export TMPDIR="$workspace/tmp"
+          printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/release-target/%s\nTMPDIR=%s/tmp\n' "$storage" '${{ matrix.target }}' "$workspace" >> "$GITHUB_ENV"
           cd "$workspace"
           git init -q .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
@@ -131,8 +145,9 @@ jobs:
         if: always()
         run: |
           if [ -n "${KALISTO_RELEASE_WORKSPACE:-}" ]; then
+            storage=$(cd "$KALISTO_MACOS_BUILD_ROOT" && pwd -P)
             case "$KALISTO_RELEASE_WORKSPACE" in
-              ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/tomis.*) rm -rf -- "$KALISTO_RELEASE_WORKSPACE" ;;
+              "$storage"/kalisto-release.*) rm -rf -- "$KALISTO_RELEASE_WORKSPACE" ;;
               *) echo 'Refusing cleanup outside owned external workspace' >&2; exit 1 ;;
             esac
           fi

@@ -8,15 +8,15 @@ Integration tests live in `tests/`. Artifact builders and release helpers live i
 
 ## Portable installation contract
 
-- Installing the Kalisto binary must be sufficient: `kalisto pull` prepares required images and managed runtime tools, then `kalisto up` works outside this checkout.
-- Do not require Homebrew, Docker, host sudo, repository scripts, manually installed Helm/Crane/Lima, custom templates, or machine-specific environment overrides for the standard macOS flow.
-- Keep paths relative to the current user's configuration/data directories. Never ship this Mac's absolute build paths as runtime defaults.
-- Startup after preparation must create fresh VMs and reach the requested fully functional three-node profile within 60 seconds, including authenticated API, CNI rollouts, worker DNS, and cross-node traffic. No downloads during `up`.
+- After installing the Kalisto binary and documented host prerequisites, `kalisto pull` prepares required images and managed runtime tools, then `kalisto up` works outside this checkout.
+- Do not require a source checkout, Docker, host sudo, repository scripts, manually installed Helm/Crane/Lima, custom templates, or machine-specific environment overrides for the standard macOS flow. Apple's `container` CLI and a running compatible service are prerequisites; Homebrew is a supported installation method.
+- Keep paths relative to the current user's configuration/data directories. Never ship a contributor's absolute build paths as runtime defaults.
+- Startup after preparation must create fresh VMs and reach the requested fully functional three-node profile within 60 seconds, including authenticated API, full selected Cilium rollouts, worker DNS, and cross-node Service HTTP traffic. No downloads during `up`.
 - Preserve explicit CNI selection; do not silently enable Flannel to satisfy the budget.
 
 ## macOS Storage
 
-On this Mac, keep Rust compilation, node-image builds, build outputs, caches, and large build temporaries under `/Volumes/Builds/runner/`. Verify the external volume is mounted and preserve the checkout's external `target` and `artifacts` symlinks. Linux VM runtime disks may use the local SSD (`~/.lima`) for boot performance; moving build output onto the internal SSD is not an allowed optimization. Builds and validation remain CI-only unless explicitly authorized locally.
+Keep Rust compilation, node-image builds, build outputs, caches, and large build temporaries on a configured external build volume. Verify that volume is mounted, configure `CARGO_TARGET_DIR` and build-cache/temporary directories there, and preserve any checkout `target` and `artifacts` symlinks to that volume. Linux VM runtime disks may use the local SSD (`~/.lima`) for boot performance; moving build output onto the internal SSD is not an allowed optimization. Builds and validation remain CI-only unless explicitly authorized locally.
 
 ## Build, Test, and Development Commands
 
@@ -26,7 +26,7 @@ On this Mac, keep Rust compilation, node-image builds, build outputs, caches, an
 - `cargo run -- bench --runs 3` — run lifecycle benchmarks.
 - `cargo test` — run the default Rust test suite.
 - `cargo fmt` and `cargo clippy --all-targets --all-features` — format and lint before opening a PR.
-- Use the Opal MCP tools for pipeline work: `mcp__opal__opal_plan` to inspect jobs, `mcp__opal__opal_run` to execute the local pipeline flow, and `mcp__opal__opal_view` to inspect results and logs. Do not invoke `opal` through the shell for normal pipeline runs.
+- Use the configured CI pipeline to run checks and inspect job results and logs. Do not run builds, tests, linters, formatters, or benchmarks locally unless explicitly authorized.
 
 Live infrastructure tests are opt-in and require host prerequisites:
 
@@ -40,7 +40,7 @@ Use standard Rust formatting with 4-space indentation and keep changes `rustfmt`
 
 ## Testing Guidelines
 
-Place new integration coverage in `tests/` and name files after the behavior under test, for example `firecracker_live.rs`. Keep default tests host-safe; gate real Lima or `k3s` flows behind environment variables. When changing CLI, backend, or artifact resolution logic, run the narrowest relevant test first, then broader validation.
+Place new integration coverage in `tests/` and name files after the behavior under test, for example `firecracker_live.rs`. Keep default tests host-safe; gate real Lima or `k3s` flows behind environment variables. When changing CLI, backend, or artifact resolution logic, select the narrowest relevant CI test first, then broader CI validation.
 
 ## Commit & Pull Request Guidelines
 
@@ -48,6 +48,6 @@ Follow the repository’s existing commit style: concise, imperative subjects wi
 
 PRs should describe the user-visible effect, note the platform/backend touched (`lima`, `firecracker`, `k3s`), list commands run, and include logs or screenshots when output changes materially. Link related issues or follow-up work when applicable.
 
-# Searching for files and directories
-Use the fff MCP tools for all file search operations instead of default tools.
+## Searching for files and directories
 
+Use available repository search tools; do not assume a particular MCP service is installed.

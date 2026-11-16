@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package verified binaries and publish complete, immutable forgejo releases."""
+"""Package verified binaries and publish complete, immutable Forgejo releases."""
 
 import argparse
 import gzip
@@ -24,8 +24,6 @@ TARGETS = {
 }
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-SERVER = "https://forgejo.example.test"
-REPOSITORY = "cloudflavor/kalisto"
 
 
 def release_version(tag):
@@ -126,24 +124,34 @@ def collect_artifacts(root, tag, commit):
 class ApiError(RuntimeError):
     def __init__(self, code):
         self.code = code
-        super().__init__(f"forgejo release API returned HTTP {code}")
+        super().__init__(f"Forgejo release API returned HTTP {code}")
 
 
 class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin):
+        super().__init__()
+        self.origin = origin
+
     def redirect_request(self, request, response, code, message, headers, newurl):
         parsed = urllib.parse.urlsplit(newurl)
-        if f"{parsed.scheme}://{parsed.netloc}" != SERVER:
+        if f"{parsed.scheme}://{parsed.netloc}" != self.origin or parsed.username or parsed.password:
             raise ValueError("refusing to forward release credentials to another origin")
         return super().redirect_request(request, response, code, message, headers, newurl)
 
 
-class forgejo:
-    def __init__(self, token, server=SERVER, repository=REPOSITORY):
-        if server.rstrip("/") != SERVER or repository != REPOSITORY:
-            raise ValueError("release destination must be forgejo cloudflavor/kalisto")
+class Forgejo:
+    def __init__(self, token, server, repository):
+        parsed = urllib.parse.urlsplit(server)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+            raise ValueError("release server must be an explicitly configured HTTPS origin")
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or any(part in (".", "..") for part in repository.split("/"))):
+            raise ValueError("release repository must be explicitly configured as owner/name")
         if not token:
             raise ValueError("release token is missing")
-        self.base = f"{SERVER}/api/v1/repos/{REPOSITORY}"
+        self.origin = f"{parsed.scheme}://{parsed.netloc}"
+        self.base = f"{self.origin}/api/v1/repos/{repository}"
         self.token = token
 
     def request(self, method, path, payload=None, content_type="application/json", raw=False):
@@ -151,7 +159,7 @@ class forgejo:
         request = urllib.request.Request(self.base + path, data=data, method=method,
             headers={"Authorization": f"token {self.token}", "Content-Type": content_type})
         try:
-            with urllib.request.build_opener(SameOriginRedirect()).open(request, timeout=120) as response:
+            with urllib.request.build_opener(SameOriginRedirect(self.origin)).open(request, timeout=120) as response:
                 content = response.read()
         except urllib.error.HTTPError as error:
             raise ApiError(error.code) from None
@@ -167,12 +175,12 @@ class forgejo:
     def download(self, asset):
         url = asset["browser_download_url"]
         parsed = urllib.parse.urlsplit(url)
-        if f"{parsed.scheme}://{parsed.netloc}" != SERVER or parsed.username or parsed.password:
-            raise ValueError("release asset URL is outside forgejo")
+        if f"{parsed.scheme}://{parsed.netloc}" != self.origin or parsed.username or parsed.password:
+            raise ValueError("release asset URL is outside the configured Forgejo origin")
         if not 0 <= asset["size"] <= 256 * 1024 * 1024:
             raise ValueError("release asset size exceeds limit")
         request = urllib.request.Request(url, headers={"Authorization": f"token {self.token}"})
-        with urllib.request.build_opener(SameOriginRedirect()).open(request, timeout=120) as response:
+        with urllib.request.build_opener(SameOriginRedirect(self.origin)).open(request, timeout=120) as response:
             data = response.read(asset["size"] + 1)
         if len(data) != asset["size"]:
             raise ValueError("release asset size mismatch")
@@ -264,7 +272,7 @@ def main():
     else:
         if os.environ.get("GITHUB_EVENT_NAME") != "push" or os.environ.get("GITHUB_REF") != f"refs/tags/{args.tag}":
             raise ValueError("publication is allowed only for a pushed release tag")
-        api = forgejo(os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_SERVER_URL", ""),
+        api = Forgejo(os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_SERVER_URL", ""),
                       os.environ.get("GITHUB_REPOSITORY", ""))
         print(publish(api, args.root, args.tag, args.commit)["html_url"])
 

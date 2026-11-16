@@ -27,7 +27,7 @@ jobs:
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           for attempt in 1 2 3 4 5 6; do
             if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
-            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch repository" >&2; exit 1; fi
             sleep 10
           done
           git checkout -q FETCH_HEAD
@@ -54,7 +54,7 @@ jobs:
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           for attempt in 1 2 3 4 5 6; do
             if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
-            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch repository" >&2; exit 1; fi
             sleep 10
           done
           git checkout -q FETCH_HEAD
@@ -80,7 +80,7 @@ jobs:
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           for attempt in 1 2 3 4 5 6; do
             if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
-            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch repository" >&2; exit 1; fi
             sleep 10
           done
           git checkout -q FETCH_HEAD
@@ -104,14 +104,14 @@ jobs:
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           for attempt in 1 2 3 4 5 6; do
             if git fetch -q --depth=1 "$url" "${GITHUB_SHA}"; then break; fi
-            if [ "$attempt" = 6 ]; then echo "Could not fetch from forgejo" >&2; exit 1; fi
+            if [ "$attempt" = 6 ]; then echo "Could not fetch repository" >&2; exit 1; fi
             sleep 10
           done
           git checkout -q FETCH_HEAD
       - name: Build release binary
         run: cargo build --release --bin kalisto
       - name: Smoke run
-        run: /tmp/kalisto-target-build/release/kalisto ls
+        run: '"$CARGO_TARGET_DIR/release/kalisto" ls'
 
   apple-container-live:
     needs: [rust-fmt, rust-clippy, rust-test]
@@ -119,29 +119,44 @@ jobs:
     runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
     timeout-minutes: 60
     env:
-      CARGO_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/cargo-home
-      RUSTUP_HOME: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/release-rustup
-      CARGO_TARGET_DIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target
-      TMPDIR: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/tmp
-      KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET: '1'
+      KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
+      KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
+      KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET: "1"
     steps:
-      - name: Verify external storage and prepare isolated checkout
+      - name: Verify external storage and checkout into owned workspace
         run: |
           set -eu
-          python3 -c 'import os; assert os.path.ismount("${{ vars.KALISTO_MACOS_VOLUME }}"), "external build volume is not mounted"'
-          mkdir -p ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds "$TMPDIR"
-          workspace=$(mktemp -d ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/kalisto-apple.XXXXXX)
-          data=$(mktemp -d "$HOME/Library/Caches/kalisto-apple-ci.XXXXXX")
-          mkdir -p "$data/kalisto" "$workspace/config" "$CARGO_TARGET_DIR" ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/artifacts
-          ln -s ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/artifacts "$data/kalisto/artifacts"
-          printf 'KALISTO_APPLE_WORKSPACE=%s\nXDG_DATA_HOME=%s\nXDG_CONFIG_HOME=%s/config\n' "$workspace" "$data" "$workspace" >> "$GITHUB_ENV"
+          storage=$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          assert Path(os.environ["KALISTO_MACOS_VOLUME"]).is_absolute(), "external volume must be an absolute path"
+          assert Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).is_absolute(), "build root must be an absolute path"
+          volume = Path(os.environ["KALISTO_MACOS_VOLUME"]).resolve(strict=True)
+          root = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve()
+          assert volume != Path("/") and os.path.ismount(volume), "external build volume must be mounted"
+          assert root != volume and root.is_relative_to(volume), "build root must be beneath the external volume"
+          root.mkdir(parents=True, exist_ok=True)
+          assert root.stat().st_dev == volume.stat().st_dev, "build root must remain on the external volume"
+          print(root)
+          PY
+          )
+          workspace=$(mktemp -d "$storage/kalisto-native.XXXXXX")
+          printf 'KALISTO_APPLE_WORKSPACE=%s\n' "$workspace" >> "$GITHUB_ENV"
+          mkdir -p "$workspace/tmp" "$workspace/data/kalisto" "$storage/cargo-home" \
+            "$storage/release-rustup" "$storage/sccache" \
+            "$storage/apple-container-ci/target" "$storage/apple-container-ci/artifacts"
+          ln -s "$storage/apple-container-ci/artifacts" "$workspace/data/kalisto/artifacts"
+          export TMPDIR="$workspace/tmp"
+          export CARGO_TARGET_DIR="$storage/apple-container-ci/target"
+          printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\nTMPDIR=%s/tmp\nXDG_DATA_HOME=%s/data\nXDG_CONFIG_HOME=%s/config\nXDG_CACHE_HOME=%s/cache\n' "$CARGO_TARGET_DIR" "$workspace" "$workspace" "$workspace" "$workspace" >> "$GITHUB_ENV"
           cd "$workspace"
           git init -q .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           git fetch -q --depth=1 "$url" "$GITHUB_SHA"
-          git checkout -q --detach "$GITHUB_SHA"
-          ln -s "$CARGO_TARGET_DIR" target
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+          ln -s "$CARGO_TARGET_DIR" "$workspace/target"
       - name: Prove running Homebrew reuse and fresh functional three-node Cilium within sixty seconds
         run: |
           set -eu
@@ -168,10 +183,10 @@ jobs:
         with:
           name: apple-container-boot-budget
           path: |
-            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/result.json
-            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/*-image-timings.log
-            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/backend-isolation.json
-            ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/apple-container-ci/target/kalisto/boot-budget/*/runtime-*.json
+            ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/result.json
+            ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/*-image-timings.log
+            ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/backend-isolation.json
+            ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/runtime-*.json
           if-no-files-found: warn
           retention-days: 7
       - name: Clean only this job's clusters and ephemeral data
@@ -179,8 +194,9 @@ jobs:
         run: |
           set -eu
           if [ -z "${KALISTO_APPLE_WORKSPACE:-}" ] || [ -z "${XDG_DATA_HOME:-}" ]; then exit 0; fi
-          case "$KALISTO_APPLE_WORKSPACE" in ${{ vars.KALISTO_MACOS_BUILD_ROOT }}/TemporaryBuilds/kalisto-apple.*) ;; *) exit 1 ;; esac
-          case "$XDG_DATA_HOME" in "$HOME"/Library/Caches/kalisto-apple-ci.*) ;; *) exit 1 ;; esac
+          storage=$(cd "$KALISTO_MACOS_BUILD_ROOT" && pwd -P)
+          case "$KALISTO_APPLE_WORKSPACE" in "$storage"/kalisto-native.*) ;; *) exit 1 ;; esac
+          case "$XDG_DATA_HOME" in "$KALISTO_APPLE_WORKSPACE"/data) ;; *) exit 1 ;; esac
           if [ -x "$CARGO_TARGET_DIR/release/kalisto" ]; then
             "$CARGO_TARGET_DIR/release/kalisto" destroy --all
           fi
@@ -202,4 +218,4 @@ jobs:
           else:
               assert not runtime.exists(), "runtime ownership is unknown; retaining isolated data"
           PY
-          rm -rf -- "$XDG_DATA_HOME" "$KALISTO_APPLE_WORKSPACE"
+          rm -rf -- "$KALISTO_APPLE_WORKSPACE"

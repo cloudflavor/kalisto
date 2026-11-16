@@ -14,6 +14,7 @@ git diff --exit-code --quiet HEAD --
 rustup toolchain install "$toolchain" --profile minimal --no-self-update
 rustup target add --toolchain "$toolchain" "$target"
 
+link_self_contained=0
 case "$target" in
   x86_64-unknown-linux-musl|aarch64-unknown-linux-musl)
     sysroot=$(rustc +"$toolchain" --print sysroot)
@@ -22,11 +23,37 @@ case "$target" in
     test -x "$linker"
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$linker"
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$linker"
-    export RUSTFLAGS="${RUSTFLAGS:-} -C link-self-contained=yes"
+    link_self_contained=1
     ;;
   aarch64-apple-darwin|x86_64-apple-darwin) ;;
   *) echo 'Unsupported release target' >&2; exit 1 ;;
 esac
+
+# Do not embed runner usernames, cache roots or checkout paths in shipped binaries.
+# Encoded flags preserve paths containing spaces and retain configured compiler flags.
+export CARGO_ENCODED_RUSTFLAGS
+CARGO_ENCODED_RUSTFLAGS=$(python3 - "$link_self_contained" <<'PY'
+import os
+from pathlib import Path
+import shlex
+import sys
+
+encoded = os.environ.get("CARGO_ENCODED_RUSTFLAGS")
+flags = encoded.split("\x1f") if encoded else shlex.split(os.environ.get("RUSTFLAGS", ""))
+home = Path.home()
+roots = [
+    (home, "/builder"),
+    (Path(os.environ.get("CARGO_HOME", home / ".cargo")), "/cargo"),
+    (Path(os.environ.get("RUSTUP_HOME", home / ".rustup")), "/rustup"),
+    (Path.cwd(), "/kalisto"),
+]
+for path, replacement in sorted(roots, key=lambda item: len(str(item[0].resolve()))):
+    flags.append(f"--remap-path-prefix={path.resolve()}={replacement}")
+if sys.argv[1] == "1":
+    flags.extend(["-C", "link-self-contained=yes"])
+print("\x1f".join(flags))
+PY
+)
 
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
 cargo +"$toolchain" build --locked --release --bin kalisto --target "$target"

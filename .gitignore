@@ -1,7 +1,7 @@
 /.cache/
 /.cargo/
 /artifacts/
-/target/
+target/
 /.kalisto/
 # Cold exports contain cluster credentials and application data.
 *.kalisto

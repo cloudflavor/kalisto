@@ -5,11 +5,14 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.request
 
 import release
 
 SHA = "a" * 40
 TAG = "v1.2.3"
+SERVER = "https://codeberg.org"
+REPOSITORY = "example/kalisto"
 
 
 def binary(target):
@@ -50,7 +53,7 @@ class FakeApi:
             self.release = dict(payload, id=7)
             return self.release
         if method == "GET" and path == "/releases/7/assets":
-            return [{"name": name, "id": index, "size": len(data), "browser_download_url": f"{release.SERVER}/asset/{name}"}
+            return [{"name": name, "id": index, "size": len(data), "browser_download_url": f"{SERVER}/asset/{name}"}
                     for index, (name, data) in enumerate(self.assets.items())]
         if method == "PATCH":
             assert len(self.assets) == 5
@@ -165,14 +168,74 @@ class ReleaseTests(unittest.TestCase):
         release.publish(api, dist, TAG, SHA)
         self.assertTrue(api.published)
 
-    def test_destination_and_redirect_never_send_token_to_another_host(self):
+    def test_destination_requires_explicit_https_origin_repository_and_token(self):
+        for server in ["", "http://example.com", "https://token@example.com",
+                       "https://example.com/path", "https://example.com?query=1",
+                       "https://example.com#fragment"]:
+            with self.assertRaises(ValueError, msg=server):
+                release.Forgejo("dummy", server, REPOSITORY)
+        for repository in ["", "kalisto", "../kalisto", "example/..", "example/kalisto/extra"]:
+            with self.assertRaises(ValueError, msg=repository):
+                release.Forgejo("dummy", SERVER, repository)
         with self.assertRaises(ValueError):
-            release.forgejo("dummy", "https://codeberg.org")
-        with self.assertRaises(ValueError):
-            release.forgejo("dummy", repository="other/kalisto")
-        redirect = release.SameOriginRedirect()
-        with self.assertRaises(ValueError):
-            redirect.redirect_request(None, None, 302, "", {}, "https://example.com/asset")
+            release.Forgejo("", SERVER, REPOSITORY)
+        for server in [SERVER, "https://forgejo.example.org:8443/"]:
+            api = release.Forgejo("dummy", server, REPOSITORY)
+            self.assertEqual(api.base, f"{server.rstrip('/')}/api/v1/repos/{REPOSITORY}")
+
+    def test_redirects_and_downloads_never_send_token_to_another_origin(self):
+        api = release.Forgejo("dummy", SERVER, REPOSITORY)
+        redirect = release.SameOriginRedirect(api.origin)
+        for url in ["https://example.com/asset", "http://codeberg.org/asset",
+                    "https://codeberg.org:8443/asset", "https://token@codeberg.org/asset"]:
+            with self.assertRaises(ValueError, msg=url):
+                redirect.redirect_request(None, None, 302, "", {}, url)
+            with patch("urllib.request.build_opener") as opener:
+                with self.assertRaises(ValueError, msg=url):
+                    api.download({"browser_download_url": url, "size": 0})
+                opener.assert_not_called()
+        request = urllib.request.Request(f"{SERVER}/old")
+        redirected = redirect.redirect_request(request, None, 302, "", {}, f"{SERVER}/new")
+        self.assertEqual(redirected.full_url, f"{SERVER}/new")
+
+    def test_configured_origin_is_used_for_requests_and_readback(self):
+        api = release.Forgejo("dummy", "https://forgejo.example.org:8443", REPOSITORY)
+        with patch("urllib.request.build_opener") as build_opener:
+            response = build_opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = b'{"id": 7}'
+            self.assertEqual(api.request("GET", "/releases/7"), {"id": 7})
+            request = build_opener.return_value.open.call_args.args[0]
+            self.assertEqual(request.full_url, f"{api.base}/releases/7")
+            self.assertEqual(build_opener.call_args.args[0].origin, api.origin)
+            response.read.return_value = b"archive"
+            self.assertEqual(api.download({"browser_download_url": f"{api.origin}/asset",
+                                           "size": 7}), b"archive")
+            self.assertEqual(build_opener.call_args.args[0].origin, api.origin)
+
+    def test_missing_workflow_destination_cannot_publish(self):
+        with patch.dict("os.environ", {"GITHUB_EVENT_NAME": "push",
+                                      "GITHUB_REF": f"refs/tags/{TAG}",
+                                      "GITHUB_TOKEN": "dummy"}, clear=True), \
+                patch("sys.argv", ["release.py", "publish", "--root", str(self.root),
+                                   "--tag", TAG, "--commit", SHA]), \
+                patch.object(release, "publish") as publish:
+            with self.assertRaises(ValueError):
+                release.main()
+            publish.assert_not_called()
+
+    def test_pushed_tag_uses_explicit_workflow_destination(self):
+        environment = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": f"refs/tags/{TAG}",
+                       "GITHUB_TOKEN": "dummy", "GITHUB_SERVER_URL": SERVER,
+                       "GITHUB_REPOSITORY": REPOSITORY}
+        with patch.dict("os.environ", environment, clear=True), \
+                patch("sys.argv", ["release.py", "publish", "--root", str(self.root),
+                                   "--tag", TAG, "--commit", SHA]), \
+                patch.object(release, "Forgejo") as forgejo, \
+                patch.object(release, "publish", return_value={"html_url": f"{SERVER}/release"}) as publish, \
+                patch("builtins.print"):
+            release.main()
+            forgejo.assert_called_once_with("dummy", SERVER, REPOSITORY)
+            publish.assert_called_once_with(forgejo.return_value, str(self.root), TAG, SHA)
 
     def test_pr_manual_or_wrong_tag_context_cannot_publish(self):
         for event, ref in [("pull_request", "refs/tags/v1.2.3"),
@@ -186,7 +249,7 @@ class ReleaseTests(unittest.TestCase):
                 publish.assert_not_called()
 
     def test_tag_api_filters_exact_ref_and_resolves_annotated_tag(self):
-        api = release.forgejo("dummy")
+        api = release.Forgejo("dummy", SERVER, REPOSITORY)
         responses = [
             [{"ref": "refs/tags/v1.2.30", "object": {"type": "commit", "sha": "c" * 40}},
              {"ref": "refs/tags/v1.2.3", "object": {"type": "tag", "sha": "d" * 40}}],

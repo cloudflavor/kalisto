@@ -12,9 +12,13 @@ Current scope:
 
 ## Binary releases
 
-Pushed version tags publish packages to [forgejo Releases](https://forgejo.example.test/cloudflavor/kalisto/releases):
+The release workflow is configured to publish packages for
 **macOS amd64/arm64 and static Linux amd64/arm64**, with SHA-256 checksums.
-All targets must build successfully before the release is published.
+All targets must build successfully before publication. No release is currently
+published; when available, packages will appear in the
+[GitHub release index](https://github.com/cloudflavor/kalisto/releases).
+The canonical repository is [cloudflavor/kalisto on GitHub](https://github.com/cloudflavor/kalisto),
+with a [Codeberg mirror](https://codeberg.org/cloudflavor/kalisto).
 See [release targets, verification and tagging](docs/releases.md). Published
 binaries do not imply runtime validation on every architecture; the Linux
 Firecracker result below was measured on `x86_64`.
@@ -204,8 +208,7 @@ KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1 \
   apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
 ```
 
-Native [macOS CI](https://forgejo.example.test/cloudflavor/kalisto/actions/runs/41)
-measured **46.71s** for that fresh three-node scenario using the existing Homebrew
+Native macOS CI measured **46.71s** for that fresh three-node scenario using the existing Homebrew
 Apple `container` 1.7.1 service without replacing or reconfiguring it.
 Stop/resume preserved Kubernetes state, and scaling to four Ready nodes passed
 afterward, outside the startup timer. This is one completed run, not a universal
@@ -536,9 +539,9 @@ The test supplies its own empty workdir and does not use `KALISTO_LIMA_TEMPLATE`
 Evidence under `target/kalisto/boot-budget/` includes aggregate `summary.json`, per-run
 `result.json`, preparation/startup logs, pod/events JSON, and VM boot/image-import
 logs captured before cleanup. CI is the default execution path; local builds and
-benchmarks require explicit user authorization. On this development Mac, build/image
-artifacts, caches, and large temporaries must stay on `/Volumes/Builds/runner/`;
-cluster VM runtime disks may use the local SSD.
+benchmarks require explicit user authorization. Build/image artifacts, caches, and
+large temporaries must stay on a configured, mounted external build volume, never
+the internal SSD; cluster VM runtime disks may use the local SSD.
 
 ## Contributor harness examples
 

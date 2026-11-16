@@ -41,7 +41,7 @@ The current supported runtime is:
 
 ### Image pipeline
 
-- GitLab / `opal` pipeline for:
+- CI pipeline for:
   - `fmt`
   - `clippy`
   - `test`
@@ -56,7 +56,7 @@ The current supported runtime is:
 - cached `k3s` asset reuse
 - macOS finalization pass for warmed Lima image artifacts
 - shared guest provisioning script for Lima and Firecracker image builds
-- repo-scoped `opal` runtime config for larger Apple `container` job VMs
+- repo-scoped pipeline runtime configuration for larger Apple `container` job VMs
 
 ### Benchmarks observed so far
 

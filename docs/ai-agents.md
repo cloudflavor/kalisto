@@ -22,10 +22,11 @@ non-JSON CLI text remains a convenience format, not an API.
 ## Prepare once, then boot
 
 The standard macOS flow runs Kalisto-managed k3s on Apple containers (Apple silicon,
-macOS 26 or newer). It requires the standalone binary, not a checkout, manual template,
-Homebrew, Docker, QEMU installation, host sudo, or Lima. Lima remains available via
-`--backend lima` on both preparation and startup, or `cluster.backend = "lima"` in
-`kalisto.toml`.
+macOS 26 or newer). It requires the standalone binary plus Apple's compatible
+`container` CLI and running system service; Homebrew is a supported way to install
+that prerequisite. It does not require a checkout, Docker, QEMU installation,
+host sudo, or Lima. Lima remains available via `--backend lima` on both preparation
+and startup, or `cluster.backend = "lima"` in `kalisto.toml`.
 
 `pull` manages tools and cached assets. First preparation can take minutes and may
 create a temporary ordinary container to prepare the reusable node image, then deletes
@@ -41,15 +42,16 @@ it does not prepare the macOS offline CNI profiles. Firecracker still needs its
 documented host prerequisites and artifact sources. CLI and `clusters.pull`
 results identify the selected backend.
 
-Apple preparation prefers a compatible 1.7.1 CLI/runtime already on `PATH`,
-including Homebrew and its running login-session service. The signed private
-runtime is downloaded only when no compatible installation exists. A borrowed
-service keeps its executable, installation/application roots, configuration,
-default system properties, and existing data; only Kalisto's own nodes, networks,
-and VM directories are task-owned. Runtime selection is stored in per-user data,
-not the shared artifact cache. An incompatible running service fails clearly
-without stopping it or downloading a replacement. Do not stop a compatible
-Homebrew daemon to prepare Kalisto; use Lima explicitly if the service is incompatible.
+Apple preparation reuses a compatible 1.7.1 CLI/runtime already on `PATH`,
+including Homebrew and its running login-session service. Install and start that
+prerequisite before preparation; see [Apple-container prerequisites](prerequisites-macos-apple-container.md).
+A borrowed service keeps its executable, installation/application roots,
+configuration, default system properties, and existing data; only Kalisto's own
+nodes, networks, and VM directories are task-owned. Runtime selection is stored
+in per-user data, not the shared artifact cache. An incompatible running service
+fails clearly without stopping it or downloading a replacement. Do not stop a
+compatible Homebrew daemon to prepare Kalisto; use Lima explicitly if the service
+is incompatible.
 
 `up` needs matching prepared assets and does not download startup assets. Default
 CNI is `none`: select `--addons cni/cilium` in **both** commands for Cilium networking

@@ -174,7 +174,7 @@ build:node-image:arm64:
   variables:
     KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
     KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/node-image/work"
-    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-node-image-arm64"
+    KALISTO_IMAGE_SCRATCH_DIR: "$CI_PROJECT_DIR/.cache/node-image/scratch/$CI_JOB_ID"
     LIBGUESTFS_BACKEND: direct
     KALISTO_HOST_GRUB_PACKAGE: grub-efi-arm64-bin
     KALISTO_UBUNTU_ARCH: arm64
@@ -195,7 +195,7 @@ build:node-image:amd64:
   variables:
     KALISTO_K3S_CACHE_DIR: "$CI_PROJECT_DIR/.cache/k3s"
     KALISTO_IMAGE_WORK_DIR: "$CI_PROJECT_DIR/.cache/node-image/work"
-    KALISTO_IMAGE_SCRATCH_DIR: "/var/tmp/kalisto-node-image-amd64"
+    KALISTO_IMAGE_SCRATCH_DIR: "$CI_PROJECT_DIR/.cache/node-image/scratch/$CI_JOB_ID"
     LIBGUESTFS_BACKEND: direct
     KALISTO_HOST_GRUB_PACKAGE: grub-efi-amd64-bin
     KALISTO_UBUNTU_ARCH: amd64
