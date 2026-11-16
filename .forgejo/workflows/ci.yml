@@ -159,9 +159,10 @@ jobs:
           )
           workspace=$(mktemp -d "$storage/kalisto-native.XXXXXX")
           printf 'KALISTO_APPLE_WORKSPACE=%s\n' "$workspace" >> "$GITHUB_ENV"
-          mkdir -p "$workspace/tmp" "$workspace/data/kalisto" "$storage/cargo-home" \
+          mkdir -p "$workspace/tmp" "$workspace/data" "$workspace/state" "$storage/cargo-home" \
             "$storage/release-rustup" "$storage/sccache" \
             "$storage/apple-container-ci/target" "$storage/apple-container-ci/artifacts"
+          ln -s "$workspace/state" "$workspace/data/kalisto"
           ln -s "$storage/apple-container-ci/artifacts" "$workspace/data/kalisto/artifacts"
           export TMPDIR="$workspace/tmp"
           export CARGO_TARGET_DIR="$storage/apple-container-ci/target"
@@ -190,6 +191,7 @@ jobs:
           esac
           cd "$KALISTO_APPLE_WORKSPACE"
           cargo test --locked --release --lib runtime::tests -- --nocapture
+          cargo test --locked --release --lib backend::apple_container::tests -- --nocapture
           python3 scripts/ci/progress_manifest.py "$KALISTO_APPLE_WORKSPACE/progress-check"
           cargo test --manifest-path "$KALISTO_APPLE_WORKSPACE/progress-check/Cargo.toml" \
             --test terminal-progress -- --nocapture --test-threads=1

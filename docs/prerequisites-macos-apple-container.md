@@ -52,6 +52,14 @@ root filesystem for each init container. After upgrading from a native-snapshott
 build, run `kalisto pull` again to prepare the revised node-image profile before
 creating a fresh cluster. Existing node disks are not converted in place.
 
+## State directory symlinks
+
+The user data directory may be symlinked to another volume. Apple-container
+bind mounts use the canonical directory; Kalisto resolves host file aliases
+before staging private manifests into that mount. A failed startup retains its
+definition and node disks: resume it with `kalisto up --name <cluster>` and the
+same profile and API port rather than deleting or recreating it.
+
 ## Existing services, upgrades and firewalls
 
 Kalisto reuses a compatible installed CLI and shared running service without
