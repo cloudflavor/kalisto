@@ -111,6 +111,12 @@ separately from the shared artifact cache. An incompatible running service cause
 a clear error before any replacement is downloaded; Kalisto never takes it over.
 Use the explicit Lima backend if the running service is incompatible.
 
+Application firewalls such as [LuLu](https://objective-see.org/products/lulu.html)
+may require separate allow rules for Homebrew's `container-core-images` and
+`container-runtime-linux` executables after an upgrade. Rules for Apple-signed
+copies do not necessarily match Homebrew builds. Approve only the required
+helpers; do not disable the firewall.
+
 The Apple backend uses the same three-node, authenticated-API, Cilium rollout,
 worker DNS, and cross-node Service HTTP budget scenario as Lima:
 
@@ -120,8 +126,9 @@ KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1 \
   apple_container_k3s_has_functional_three_node_cilium_under_one_minute -- --nocapture
 ```
 
-Native [macOS CI](https://forgejo.example.test/cloudflavor/kalisto/actions/runs/32)
-measured **52.04s** for that fresh three-node scenario with Apple `container` 1.7.1.
+Native [macOS CI](https://forgejo.example.test/cloudflavor/kalisto/actions/runs/41)
+measured **46.71s** for that fresh three-node scenario using the existing Homebrew
+Apple `container` 1.7.1 service without replacing or reconfiguring it.
 Stop/resume preserved Kubernetes state, and scaling to four Ready nodes passed
 afterward, outside the startup timer. This is one completed run, not a universal
 hardware performance guarantee.
@@ -129,11 +136,10 @@ hardware performance guarantee.
 The native CI scenario borrows a running Homebrew 1.7.1 service; CI setup may start
 a stopped installation, but never replaces a running daemon.
 It records CLI/daemon identity, service roots, process identity, and default system
-properties before flag-free `pull`/`up`, then compares them after preparation,
+properties before flag-free `pull`/`up` with system-only `PATH`, then compares them after preparation,
 stop/resume, scaling, and cluster destruction. It also checks that no private
 installer is fetched or selected. CI cleanup never stops the borrowed daemon or
-removes its persistent application root. The measurement above predates this
-reuse-specific proof; its startup/network assertions and sixty-second limit remain.
+removes its persistent application root.
 
 Run live validation only in the authorized native macOS CI job. The existing Lima
 timings above are not Apple-container measurements. Cold archive export/import
