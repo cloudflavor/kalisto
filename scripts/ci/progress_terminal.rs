@@ -45,10 +45,15 @@ impl Fixture {
         for (key, value) in environment {
             command.env(key, value);
         }
-        let mut reader = pair.master.try_clone_reader().expect("clone terminal reader");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("clone terminal reader");
         let reading = thread::spawn(move || {
             let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes).expect("read terminal output");
+            reader
+                .read_to_end(&mut bytes)
+                .expect("read terminal output");
             String::from_utf8(bytes).expect("terminal output is UTF-8")
         });
         let mut child = pair.slave.spawn_command(command).expect("spawn renderer");
@@ -84,8 +89,14 @@ fn terminal_progress_reaches_the_actual_item_total_and_preserves_warnings() {
     let fixture = Fixture::new();
     let (success, output) = fixture.terminal(&[], &[]);
     assert!(success, "{output:?}");
-    assert!(output.contains("\u{1b}["), "no terminal graphics: {output:?}");
-    assert!(output.contains("3/3"), "missing completed count: {output:?}");
+    assert!(
+        output.contains("\u{1b}["),
+        "no terminal graphics: {output:?}"
+    );
+    assert!(
+        output.contains("3/3"),
+        "missing completed count: {output:?}"
+    );
     assert!(output.contains("visible warning during copy"), "{output:?}");
     assert!(!output.contains("diagnostic details"), "{output:?}");
     for index in 0..3 {

@@ -217,7 +217,6 @@ dependencies = [
  "unicode-width 0.1.14",
  "vec_map",
 ]
-]
 
 [[package]]
 name = "console"
@@ -229,6 +228,7 @@ dependencies = [
  "libc",
  "unicode-width 0.2.3",
  "windows-sys",
+]
 
 [[package]]
 name = "const-oid"
