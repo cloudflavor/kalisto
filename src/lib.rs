@@ -6,6 +6,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod error;
+mod firecracker_assets;
 pub mod harness;
 pub mod k3s;
 pub mod kubectl;

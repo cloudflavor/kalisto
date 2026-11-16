@@ -1200,7 +1200,10 @@ fn scale_at_root(
         network: state.network.clone(),
         firecracker_kernel: state.firecracker_kernel.clone(),
         firecracker_rootfs: state.firecracker_rootfs.clone(),
-        boot_assets_root: if state.backend == BackendKind::AppleContainer {
+        boot_assets_root: if matches!(
+            state.backend,
+            BackendKind::AppleContainer | BackendKind::Firecracker
+        ) {
             Some(crate::pull::load(&cluster_spec_from_state(&state))?)
         } else if state.backend == BackendKind::Lima {
             let mut asset_spec = cluster_spec_from_state(&state);

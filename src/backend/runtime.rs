@@ -43,7 +43,7 @@ impl BackendKind {
 
     #[must_use]
     pub(crate) fn uses_prepared_assets(self) -> bool {
-        matches!(self, Self::Lima | Self::AppleContainer)
+        matches!(self, Self::Firecracker | Self::Lima | Self::AppleContainer)
     }
 }
 
@@ -148,6 +148,38 @@ pub trait ClusterBackend: Send + Sync {
         command: &str,
     ) -> Result<Output>;
 
+    /// Make a host file available in the guest with mode 0600.
+    ///
+    /// The default uses the identical host paths exposed by shared runtime
+    /// mounts. Backends without those mounts must implement file transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is unavailable or installation fails.
+    fn copy_file_to_guest(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &std::path::Path,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> Result<()> {
+        let quote = |path: &std::path::Path| {
+            format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+        };
+        let command = if source == destination {
+            format!("test -f {0} && chmod 0600 -- {0}", quote(destination))
+        } else {
+            format!(
+                "install -D -m 0600 -- {} {}",
+                quote(source),
+                quote(destination)
+            )
+        };
+        self.guest_sudo_shell(runner, instance_name, runtime_root, &command)?;
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns an error when the operation cannot be completed.
@@ -204,6 +236,17 @@ pub fn backend_for(kind: BackendKind) -> &'static dyn ClusterBackend {
 #[cfg(test)]
 mod tests {
     use super::BackendKind;
+
+    #[test]
+    fn every_backend_uses_prepared_assets() {
+        for backend in [
+            BackendKind::Firecracker,
+            BackendKind::Lima,
+            BackendKind::AppleContainer,
+        ] {
+            assert!(backend.uses_prepared_assets());
+        }
+    }
 
     #[test]
     fn backend_kind_roundtrips() {

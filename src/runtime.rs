@@ -24,19 +24,22 @@ struct Tool {
     executable: PathBuf,
 }
 
-fn macos_arch() -> Result<(&'static str, &'static str)> {
-    if std::env::consts::OS != "macos" {
-        return Err(invalid("managed runtime helpers currently require macOS"));
+fn host_arch() -> Result<(&'static str, &'static str)> {
+    if !matches!(std::env::consts::OS, "macos" | "linux") {
+        return Err(invalid("managed runtime helpers require macOS or Linux"));
     }
     match std::env::consts::ARCH {
         "aarch64" => Ok(("arm64", "arm64")),
         "x86_64" => Ok(("x86_64", "amd64")),
-        other => Err(invalid(format!("unsupported macOS architecture: {other}"))),
+        other => Err(invalid(format!("unsupported host architecture: {other}"))),
     }
 }
 
 fn lima_tool() -> Result<Tool> {
-    let (arch, _) = macos_arch()?;
+    if std::env::consts::OS != "macos" {
+        return Err(invalid("managed Lima requires macOS"));
+    }
+    let (arch, _) = host_arch()?;
     let archive = format!("lima-{LIMA_VERSION}-Darwin-{arch}.tar.gz");
     Ok(Tool {
         name: "limactl",
@@ -51,8 +54,13 @@ fn lima_tool() -> Result<Tool> {
 }
 
 fn crane_tool() -> Result<Tool> {
-    let (arch, _) = macos_arch()?;
-    let archive = format!("go-containerregistry_Darwin_{arch}.tar.gz");
+    let (arch, _) = host_arch()?;
+    let os = if cfg!(target_os = "macos") {
+        "Darwin"
+    } else {
+        "Linux"
+    };
+    let archive = format!("go-containerregistry_{os}_{arch}.tar.gz");
     Ok(Tool {
         name: "crane",
         version: CRANE_VERSION,
@@ -68,15 +76,20 @@ fn crane_tool() -> Result<Tool> {
 }
 
 fn helm_tool() -> Result<Tool> {
-    let (_, arch) = macos_arch()?;
-    let archive = format!("helm-v{HELM_VERSION}-darwin-{arch}.tar.gz");
+    let (_, arch) = host_arch()?;
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let archive = format!("helm-v{HELM_VERSION}-{os}-{arch}.tar.gz");
     Ok(Tool {
         name: "helm",
         version: HELM_VERSION,
         url: format!("https://get.helm.sh/{archive}"),
         checksums: format!("https://get.helm.sh/{archive}.sha256sum"),
         archive,
-        executable: format!("darwin-{arch}/helm").into(),
+        executable: format!("{os}-{arch}/helm").into(),
     })
 }
 
@@ -114,10 +127,6 @@ pub fn program(name: &str) -> Option<PathBuf> {
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn prepare(runner: &dyn CommandRunner, backend: BackendKind, cilium: bool) -> Result<()> {
-    match backend {
-        BackendKind::Firecracker => return Ok(()),
-        BackendKind::AppleContainer | BackendKind::Lima => {}
-    }
     let root = root()?;
     fs::create_dir_all(&root).map_err(io_error)?;
     let lock = fs::OpenOptions::new()
@@ -293,25 +302,11 @@ mod tests {
         assert!(checksum(&format!("{hash} tool.tar.gz.exe\n"), "tool.tar.gz").is_err());
     }
 
-    #[test]
-    fn firecracker_never_downloads_macos_helpers() {
-        struct NoCommands;
-
-        impl CommandRunner for NoCommands {
-            fn run(&self, program: &str, args: &[String]) -> Result<crate::process::Output> {
-                panic!("unexpected Firecracker helper command: {program} {args:?}");
-            }
-        }
-
-        for cilium in [false, true] {
-            prepare(&NoCommands, BackendKind::Firecracker, cilium).unwrap();
-        }
-    }
-
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     mod preparation {
         use std::cell::RefCell;
         use std::ffi::OsString;
+        use std::fmt::Write as _;
         use std::io::Cursor;
 
         use flate2::Compression;
@@ -364,10 +359,10 @@ mod tests {
         }
 
         impl DownloadRunner {
-            fn new(archives: &[String; 3], helm_arch: &str) -> Self {
+            fn new(archives: &[String; 3], helm_executable: &str) -> Self {
                 let encoder = GzEncoder::new(Vec::new(), Compression::default());
                 let mut archive = tar::Builder::new(encoder);
-                for executable in ["bin/limactl", "crane", &format!("darwin-{helm_arch}/helm")] {
+                for executable in ["bin/limactl", "crane", helm_executable] {
                     let mut header = tar::Header::new_gnu();
                     header.set_size(4);
                     header.set_mode(0o755);
@@ -378,10 +373,10 @@ mod tests {
                 }
                 let archive = archive.into_inner().unwrap().finish().unwrap();
                 let digest = format!("{:x}", Sha256::digest(&archive));
-                let checksums = archives
-                    .iter()
-                    .map(|name| format!("{digest}  {name}\n"))
-                    .collect();
+                let checksums = archives.iter().fold(String::new(), |mut content, name| {
+                    let _ = writeln!(content, "{digest}  {name}");
+                    content
+                });
                 Self {
                     archive,
                     checksums,
@@ -430,10 +425,15 @@ mod tests {
                 "x86_64" => ("x86_64", "amd64"),
                 other => panic!("unsupported test architecture: {other}"),
             };
+            let (crane_os, helm_os) = if cfg!(target_os = "macos") {
+                ("Darwin", "darwin")
+            } else {
+                ("Linux", "linux")
+            };
             let archives = [
                 format!("lima-{LIMA_VERSION}-Darwin-{arch}.tar.gz"),
-                format!("go-containerregistry_Darwin_{arch}.tar.gz"),
-                format!("helm-v{HELM_VERSION}-darwin-{helm_arch}.tar.gz"),
+                format!("go-containerregistry_{crane_os}_{arch}.tar.gz"),
+                format!("helm-v{HELM_VERSION}-{helm_os}-{helm_arch}.tar.gz"),
             ];
             let urls = [
                 format!("https://github.com/lima-vm/lima/releases/download/v{LIMA_VERSION}"),
@@ -447,7 +447,7 @@ mod tests {
                 "checksums.txt".to_owned(),
                 format!("{}.sha256sum", archives[2]),
             ];
-            let runner = DownloadRunner::new(&archives, helm_arch);
+            let runner = DownloadRunner::new(&archives, &format!("{helm_os}-{helm_arch}/helm"));
             prepare(&runner, backend, cilium).unwrap();
             let expected_downloads: Vec<_> = selected
                 .iter()
@@ -476,24 +476,40 @@ mod tests {
             assert_eq!(*runner.extractions.borrow(), expected_archives);
         }
 
+        #[cfg(target_os = "macos")]
         #[test]
         fn apple_without_cilium_downloads_only_crane() {
             assert_prepared_tools(BackendKind::AppleContainer, false, &[1]);
         }
 
+        #[cfg(target_os = "macos")]
         #[test]
         fn apple_with_cilium_downloads_crane_and_helm_only() {
             assert_prepared_tools(BackendKind::AppleContainer, true, &[1, 2]);
         }
 
+        #[cfg(target_os = "macos")]
         #[test]
         fn lima_without_cilium_downloads_limactl_and_crane_only() {
             assert_prepared_tools(BackendKind::Lima, false, &[0, 1]);
         }
 
+        #[cfg(target_os = "macos")]
         #[test]
         fn lima_with_cilium_downloads_limactl_crane_and_helm() {
             assert_prepared_tools(BackendKind::Lima, true, &[0, 1, 2]);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn firecracker_without_cilium_prepares_only_crane() {
+            assert_prepared_tools(BackendKind::Firecracker, false, &[1]);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn firecracker_with_cilium_prepares_crane_and_helm() {
+            assert_prepared_tools(BackendKind::Firecracker, true, &[1, 2]);
         }
     }
 }

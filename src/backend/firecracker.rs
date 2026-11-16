@@ -110,6 +110,13 @@ impl ClusterBackend for FirecrackerBackend {
 
         ensure_path_exists(kernel, "firecracker kernel")?;
         ensure_path_exists(rootfs, "firecracker rootfs")?;
+        let assets_disk = config
+            .boot_assets_root
+            .as_ref()
+            .map(|assets| assets.root.join(crate::firecracker_assets::DISK_FILENAME));
+        if let Some(disk) = &assets_disk {
+            ensure_path_exists(disk, "firecracker prepared assets disk")?;
+        }
         fs::create_dir_all(&instance.runtime_root).map_err(io_error("create_dir_all"))?;
 
         let runtime = RuntimeFiles::new(&instance.runtime_root);
@@ -130,7 +137,7 @@ impl ClusterBackend for FirecrackerBackend {
         prepare_instance_rootfs(runner, rootfs, &runtime)?;
         write_file(
             &runtime.config,
-            &build_config_json(kernel, instance, &runtime, &net),
+            &build_config_json(kernel, instance, &runtime, &net, assets_disk.as_deref()),
         )?;
 
         let stdout_file = fs::File::create(&runtime.stdout_log).map_err(io_error("create"))?;
@@ -168,7 +175,12 @@ impl ClusterBackend for FirecrackerBackend {
         write_file(&runtime.tap_name, &format!("{}\n", net.tap_name))?;
 
         let log_streamer = VmLogStreamer::start_if_enabled(&runtime, config.stream_vm_logs);
-        let wait_result = wait_for_ssh(runner, &runtime, &net, &mut child);
+        let wait_result = wait_for_ssh(runner, &runtime, &net, &mut child).and_then(|()| {
+            if let Some(assets) = &config.boot_assets_root {
+                mount_prepared_assets(runner, &runtime, &net, &assets.root)?;
+            }
+            Ok(())
+        });
         if let Some(log_streamer) = log_streamer {
             log_streamer.stop();
         }
@@ -267,6 +279,65 @@ impl ClusterBackend for FirecrackerBackend {
             instance_name,
             &format!("sudo sh -lc {}", shell_quote(command)),
         )
+    }
+
+    fn copy_file_to_guest(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let runtime = RuntimeFiles::new(runtime_root);
+        let net = load_network_config(&runtime, instance_name)?;
+        let source = source
+            .canonicalize()
+            .map_err(io_error("resolve transfer source"))?;
+        let temporary = run_ssh_command(
+            runner,
+            &runtime.ssh_key,
+            &net,
+            "umask 077; mktemp /tmp/kalisto-transfer.XXXXXXXXXX",
+        )?
+        .stdout
+        .trim()
+        .to_owned();
+        if !temporary.starts_with("/tmp/kalisto-transfer.")
+            || temporary.contains(char::is_whitespace)
+        {
+            return Err(Error::InvalidArgs(
+                "invalid guest transfer temporary path".to_owned(),
+            ));
+        }
+        let result: Result<()> = (|| {
+            let (mut args, host) = ssh_connection_args(&runtime.ssh_key, &net, "-P")?;
+            args.push("-O".into());
+            args.push("--".into());
+            args.push(source.display().to_string());
+            args.push(format!("{SSH_USER}@{host}:{}", shell_quote(&temporary)));
+            runner.run("scp", &args)?;
+            self.guest_sudo_shell(
+                runner,
+                instance_name,
+                runtime_root,
+                &format!(
+                    "install -D -m 0600 -- {} {}",
+                    shell_quote(&temporary),
+                    shell_quote(&destination.to_string_lossy())
+                ),
+            )?;
+            Ok(())
+        })();
+        let cleanup = run_ssh_command(
+            runner,
+            &runtime.ssh_key,
+            &net,
+            &format!("rm -f -- {}", shell_quote(&temporary)),
+        );
+        result?;
+        cleanup?;
+        Ok(())
     }
 
     fn control_plane_host(&self, instance_name: &str, runtime_root: &Path) -> Result<String> {
@@ -683,6 +754,17 @@ fn ensure_rootless_cluster_network(
 ) -> Result<RootlessClusterNetwork> {
     let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
     fs::create_dir_all(&root).map_err(io_error("create_dir_all"))?;
+    // Concurrent node starts must share one fully initialized namespace.
+    let network_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("initialization.lock"))
+        .map_err(io_error("open rootless network lock"))?;
+    network_lock
+        .lock()
+        .map_err(io_error("lock rootless network"))?;
 
     let anchor_path = root.join("anchor.pid");
     let slirp_path = root.join("slirp4netns.pid");
@@ -1096,46 +1178,40 @@ fn build_config_json(
     instance: &InstanceConfig,
     runtime: &RuntimeFiles,
     net: &NetworkConfig,
+    assets_disk: Option<&Path>,
 ) -> String {
-    let mem_size_mib = u32::from(instance.memory_gib) * 1024;
-    format!(
-        // TODO: change this garbage to a struct and json
-        concat!(
-            "{{\n",
-            "  \"boot-source\": {{\n",
-            "    \"kernel_image_path\": \"{}\",\n",
-            "    \"boot_args\": \"{}\"\n",
-            "  }},\n",
-            "  \"drives\": [\n",
-            "    {{\n",
-            "      \"drive_id\": \"rootfs\",\n",
-            "      \"path_on_host\": \"{}\",\n",
-            "      \"is_root_device\": true,\n",
-            "      \"is_read_only\": false\n",
-            "    }}\n",
-            "  ],\n",
-            "  \"machine-config\": {{\n",
-            "    \"vcpu_count\": {},\n",
-            "    \"mem_size_mib\": {},\n",
-            "    \"smt\": false\n",
-            "  }},\n",
-            "  \"network-interfaces\": [\n",
-            "    {{\n",
-            "      \"iface_id\": \"eth0\",\n",
-            "      \"host_dev_name\": \"{}\",\n",
-            "      \"guest_mac\": \"{}\"\n",
-            "    }}\n",
-            "  ]\n",
-            "}}\n"
-        ),
-        json_escape(kernel.display().to_string().as_str()),
-        json_escape(BOOT_ARGS),
-        json_escape(runtime.instance_rootfs.display().to_string().as_str()),
-        instance.cpus,
-        mem_size_mib,
-        json_escape(&net.tap_name),
-        json_escape(&net.guest_mac),
-    )
+    let mut drives = vec![json!({
+        "drive_id": "rootfs",
+        "path_on_host": runtime.instance_rootfs,
+        "is_root_device": true,
+        "is_read_only": false,
+    })];
+    if let Some(disk) = assets_disk {
+        drives.push(json!({
+            "drive_id": "assets",
+            "path_on_host": disk,
+            "is_root_device": false,
+            "is_read_only": true,
+        }));
+    }
+    json!({
+        "boot-source": {
+            "kernel_image_path": kernel,
+            "boot_args": BOOT_ARGS,
+        },
+        "drives": drives,
+        "machine-config": {
+            "vcpu_count": instance.cpus,
+            "mem_size_mib": u32::from(instance.memory_gib) * 1024,
+            "smt": false,
+        },
+        "network-interfaces": [{
+            "iface_id": "eth0",
+            "host_dev_name": net.tap_name,
+            "guest_mac": net.guest_mac,
+        }],
+    })
+    .to_string()
 }
 
 fn firecracker_command(
@@ -1236,7 +1312,9 @@ fn prepare_instance_rootfs(
     base_rootfs: &Path,
     runtime: &RuntimeFiles,
 ) -> Result<()> {
-    let _ = fs::remove_file(&runtime.instance_rootfs);
+    if runtime.instance_rootfs.is_file() {
+        return Ok(());
+    }
     runner.run(
         "cp",
         &[
@@ -1288,6 +1366,15 @@ fn inject_nocloud_seed(
 }
 
 fn ensure_ssh_key(runner: &dyn CommandRunner, ssh_key: &Path) -> Result<()> {
+    // A resumed disk already trusts this key. Never replace it merely because
+    // its derived public-key file was removed.
+    if ssh_key.is_file() && !ssh_key.with_extension("pub").is_file() {
+        let public_key = runner.run(
+            "ssh-keygen",
+            &["-y".into(), "-f".into(), ssh_key.display().to_string()],
+        )?;
+        return write_file(&ssh_key.with_extension("pub"), &public_key.stdout);
+    }
     if ssh_key.is_file() && ssh_key.with_extension("pub").is_file() {
         return Ok(());
     }
@@ -1538,12 +1625,51 @@ fn run_ssh(
     run_ssh_command(runner, &runtime.ssh_key, &net, command)
 }
 
+fn mount_prepared_assets(
+    runner: &dyn CommandRunner,
+    runtime: &RuntimeFiles,
+    net: &NetworkConfig,
+    assets_root: &Path,
+) -> Result<()> {
+    if !assets_root.is_absolute() {
+        return Err(Error::InvalidArgs(
+            "firecracker prepared assets root must be absolute".to_owned(),
+        ));
+    }
+    let root = shell_quote(&assets_root.to_string_lossy());
+    let command = format!(
+        "set -eu; test \"$(blkid -s LABEL -o value /dev/vdb)\" = KALISTO_ASSETS; \
+         mkdir -p -- {root}; \
+         if ! mountpoint -q -- {root}; then mount -t ext4 -o ro,noload /dev/vdb {root}; fi; \
+         findmnt -rn -S /dev/vdb -M {root} -o OPTIONS | grep -Eq '(^|,)ro(,|$)'; \
+         test -s {root}/k3s; test -s {root}/images.tar"
+    );
+    run_ssh_command(
+        runner,
+        &runtime.ssh_key,
+        net,
+        &format!("sudo sh -lc {}", shell_quote(&command)),
+    )?;
+    Ok(())
+}
+
 fn run_ssh_command(
     runner: &dyn CommandRunner,
     ssh_key: &Path,
     net: &NetworkConfig,
     command: &str,
 ) -> Result<Output> {
+    let (mut args, host) = ssh_connection_args(ssh_key, net, "-p")?;
+    args.push(format!("{SSH_USER}@{host}"));
+    args.push(command.to_owned());
+    runner.run("ssh", &args)
+}
+
+fn ssh_connection_args<'a>(
+    ssh_key: &Path,
+    net: &'a NetworkConfig,
+    port_flag: &str,
+) -> Result<(Vec<String>, &'a str)> {
     let (host, port) = match net.mode {
         FirecrackerNetworkMode::Bridge => (net.guest_ip.as_str(), None),
         FirecrackerNetworkMode::RootlessSlirp => (
@@ -1570,12 +1696,10 @@ fn run_ssh_command(
         ssh_key.display().to_string(),
     ];
     if let Some(port) = port {
-        args.push("-p".into());
+        args.push(port_flag.into());
         args.push(port.to_string());
     }
-    args.push(format!("{SSH_USER}@{host}"));
-    args.push(command.to_owned());
-    runner.run("ssh", &args)
+    Ok((args, host))
 }
 
 fn stop_process(
@@ -1934,13 +2058,6 @@ fn stable_hash(input: &str) -> u32 {
     value
 }
 
-fn json_escape(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
-
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
@@ -2027,6 +2144,7 @@ mod tests {
         let runtime_root = Path::new("/tmp/runtime");
         let runtime = super::RuntimeFiles::new(runtime_root);
         let net = NetworkConfig::for_bridge_instance("vm");
+        let disk = Path::new("/tmp/assets/firecracker-assets.ext4");
         let json = build_config_json(
             Path::new("/tmp/vmlinux"),
             &InstanceConfig {
@@ -2038,15 +2156,158 @@ mod tests {
             },
             &runtime,
             &net,
+            Some(disk),
         );
+        let config: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(config["machine-config"]["mem_size_mib"], 4096);
+        assert_eq!(config["network-interfaces"][0]["iface_id"], "eth0");
+        assert_eq!(config["drives"].as_array().unwrap().len(), 2);
+        assert_eq!(config["drives"][0]["drive_id"], "rootfs");
+        assert_eq!(
+            config["drives"][0]["path_on_host"],
+            runtime.instance_rootfs.to_str().unwrap()
+        );
+        assert_eq!(config["drives"][0]["is_root_device"], true);
+        assert_eq!(config["drives"][0]["is_read_only"], false);
+        assert_eq!(config["drives"][1]["path_on_host"], disk.to_str().unwrap());
+        assert_eq!(config["drives"][1]["is_root_device"], false);
+        assert_eq!(config["drives"][1]["is_read_only"], true);
+        assert!(
+            config["boot-source"]["boot_args"]
+                .as_str()
+                .unwrap()
+                .contains("ds=nocloud;s=file:///var/lib/cloud/seed/nocloud/")
+        );
+    }
 
-        assert!(json.contains("\"boot-source\""));
-        assert!(json.contains("\"drives\""));
-        assert!(json.contains("\"network-interfaces\""));
-        assert!(json.contains("\"mem_size_mib\": 4096"));
-        assert!(json.contains(runtime.instance_rootfs.display().to_string().as_str()));
-        assert!(!json.contains("\"drive_id\": \"seed\""));
-        assert!(json.contains("ds=nocloud;s=file:///var/lib/cloud/seed/nocloud/"));
+    #[test]
+    fn existing_rootfs_is_preserved_without_copying_or_reseeding() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-preserve-rootfs-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let runtime = super::RuntimeFiles::new(&root);
+        fs::write(&runtime.instance_rootfs, b"existing kubernetes state").unwrap();
+        fs::write(&runtime.ssh_key, b"existing private key").unwrap();
+        fs::write(
+            runtime.ssh_key.with_extension("pub"),
+            b"existing public key",
+        )
+        .unwrap();
+
+        super::prepare_instance_rootfs(&PanicRunner, Path::new("/unused/base"), &runtime).unwrap();
+        super::ensure_ssh_key(&PanicRunner, &runtime.ssh_key).unwrap();
+        assert_eq!(
+            fs::read(&runtime.instance_rootfs).unwrap(),
+            b"existing kubernetes state"
+        );
+        assert_eq!(fs::read(&runtime.ssh_key).unwrap(), b"existing private key");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        commands: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push((program.to_owned(), args.to_vec()));
+            Ok(Output {
+                stdout: if args
+                    .last()
+                    .is_some_and(|arg| arg.starts_with("umask 077; mktemp"))
+                {
+                    "/tmp/kalisto-transfer.unit\n".to_owned()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn prepared_disk_is_mounted_readonly_at_host_assets_path_and_verified() {
+        let runner = RecordingRunner::default();
+        let runtime = super::RuntimeFiles::new(Path::new("/tmp/runtime"));
+        let net = NetworkConfig::for_bridge_instance("vm");
+        super::mount_prepared_assets(&runner, &runtime, &net, Path::new("/cache/assets")).unwrap();
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        let (program, args) = &commands[0];
+        assert_eq!(program, "ssh");
+        let command = args.last().unwrap();
+        assert!(command.starts_with("sudo sh -lc "));
+        assert!(command.contains("mount -t ext4 -o ro,noload /dev/vdb"));
+        assert!(command.contains("/cache/assets"));
+        assert!(command.contains("KALISTO_ASSETS"));
+        assert!(command.contains("findmnt"));
+        assert!(command.contains("/k3s"));
+        assert!(command.contains("/images.tar"));
+    }
+
+    #[test]
+    fn manifest_transfer_uses_scp_and_restrictive_guest_install() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-transfer-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("cilium.yaml");
+        fs::write(&source, "manifest contents\n".repeat(20_000)).unwrap();
+        fs::write(root.join("network-mode"), "slirp4netns\n").unwrap();
+        fs::write(root.join("ssh-port"), "12345\n").unwrap();
+        let runner = RecordingRunner::default();
+        BACKEND
+            .copy_file_to_guest(
+                &runner,
+                "vm",
+                &root,
+                &source,
+                Path::new("/var/lib/kalisto/vm/cilium.yaml"),
+            )
+            .unwrap();
+        let commands = runner.commands.lock().unwrap();
+        let (_, scp) = commands
+            .iter()
+            .find(|(program, _)| program == "scp")
+            .unwrap();
+        assert!(scp.iter().any(|arg| arg == "-O"));
+        assert!(scp.windows(2).any(|args| args == ["-P", "12345"]));
+        assert!(
+            scp.iter()
+                .any(|arg| arg == &root.join("id_ed25519").display().to_string())
+        );
+        assert!(scp.last().unwrap().starts_with("ubuntu@127.0.0.1:"));
+        assert!(commands.iter().any(|(program, args)| {
+            program == "ssh"
+                && args.last().is_some_and(|arg| {
+                    arg.contains("install -D -m 0600")
+                        && arg.contains("/var/lib/kalisto/vm/cilium.yaml")
+                })
+        }));
+        assert!(
+            commands
+                .iter()
+                .all(|(_, args)| { args.iter().all(|arg| !arg.contains("manifest contents")) })
+        );
+        assert!(
+            commands
+                .last()
+                .unwrap()
+                .1
+                .last()
+                .unwrap()
+                .starts_with("rm -f -- ")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

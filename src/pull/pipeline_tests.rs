@@ -33,6 +33,31 @@ impl CommandRunner for RecordingRunner {
                         let _ = writeln!(content, "{}  {name}", "a".repeat(64));
                         content
                     })
+                } else if args.last().unwrap().ends_with("/checksums.txt") {
+                    [
+                        "Darwin_arm64",
+                        "Darwin_x86_64",
+                        "Linux_arm64",
+                        "Linux_x86_64",
+                    ]
+                    .iter()
+                    .fold(String::new(), |mut content, platform| {
+                        let _ = writeln!(
+                            content,
+                            "{}  go-containerregistry_{platform}.tar.gz",
+                            "a".repeat(64)
+                        );
+                        content
+                    })
+                } else if args.last().unwrap().ends_with(".sha256sum") {
+                    let filename = args
+                        .last()
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .trim_end_matches(".sha256sum");
+                    format!("{}  {filename}\n", "a".repeat(64))
                 } else if args.last().unwrap().ends_with("/kubectl.sha256") {
                     "a".repeat(64)
                 } else if args.last().unwrap().ends_with("/k3s-images.txt") {
@@ -90,6 +115,25 @@ impl CommandRunner for RecordingRunner {
                     .unwrap(),
                 )
                 .unwrap();
+            }
+            "tar" if args[0] == "-tzf" => stdout = "crane\nlinux-amd64/helm\n".into(),
+            "tar" if args[0] == "-xzf" => {
+                let destination =
+                    Path::new(&args[args.iter().position(|arg| arg == "-C").unwrap() + 1]);
+                fs::write(destination.join("crane"), "tool").unwrap();
+                for platform in ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"] {
+                    fs::create_dir_all(destination.join(platform)).unwrap();
+                    fs::write(destination.join(platform).join("helm"), "tool").unwrap();
+                }
+            }
+            "mke2fs" => {
+                let source = Path::new(&args[args.iter().position(|arg| arg == "-d").unwrap() + 1]);
+                assert_eq!(
+                    fs::read_to_string(source.join("images.tar")).unwrap(),
+                    "oci archive"
+                );
+                assert!(!source.join("cilium.yaml").exists());
+                fs::write(args.last().unwrap(), "prepared ext4 image").unwrap();
             }
             "tar" => {
                 let layout = &args[args.iter().position(|arg| arg == "-C").unwrap() + 1];
@@ -173,11 +217,12 @@ impl Drop for TestEnvironment {
 }
 
 #[test]
-fn firecracker_pull_prepares_only_kernel_rootfs_and_host_kubectl() {
+fn firecracker_pull_prepares_offline_images_and_a_shared_readonly_asset_disk() {
     let _guard = env_lock();
     let environment = TestEnvironment::new("firecracker");
     let mut spec = ClusterSpec::new("firecracker".into(), environment.root.clone());
     spec.backend = BackendKind::Firecracker;
+    spec.cni_plugin = CniPlugin::Cilium;
     let kernel = environment.root.join("vmlinux");
     let rootfs = environment.root.join("rootfs.raw");
     fs::write(&kernel, "kernel").unwrap();
@@ -186,11 +231,18 @@ fn firecracker_pull_prepares_only_kernel_rootfs_and_host_kubectl() {
     spec.firecracker_rootfs = Some(rootfs.clone());
     let runner = RecordingRunner::default();
 
-    let artifacts = prepare_firecracker(&spec, &runner).unwrap();
+    let (artifacts, assets) = prepare_firecracker(&spec, &runner).unwrap();
 
     assert_eq!(artifacts.kernel, kernel);
     assert_eq!(artifacts.rootfs, rootfs);
-    assert!(!cache_root().unwrap().exists());
+    assert!(
+        assets
+            .root
+            .join(crate::firecracker_assets::DISK_FILENAME)
+            .is_file()
+    );
+    assert!(assets.probe_image().contains("@sha256:"));
+    assert_eq!(assets.rollouts().count(), 2);
     assert!(!spec.state_root().exists());
     assert!(
         crate::kubectl::binary(&spec.k3s_version, &runner)
@@ -199,12 +251,11 @@ fn firecracker_pull_prepares_only_kernel_rootfs_and_host_kubectl() {
     );
     assert!(
         runner.commands.lock().unwrap().iter().all(|command| {
-            command == "firecracker --version"
-                || command.starts_with("sha256sum ")
-                || command.starts_with("shasum ")
-                || (command.starts_with("curl ") && command.contains("https://dl.k8s.io/"))
+            !command.starts_with("limactl ")
+                && !command.starts_with("container ")
+                && !command.starts_with("unshare ")
         }),
-        "Firecracker preparation must not fetch Lima, Apple, Helm or OCI assets"
+        "Firecracker pull must not create nodes or prepare other backends"
     );
 }
 
