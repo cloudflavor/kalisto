@@ -217,9 +217,8 @@ pub(crate) fn shared_file_install_command(
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> String {
-    let quote = |path: &std::path::Path| {
-        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
-    };
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
     if source == destination {
         format!("test -f {0} && chmod 0600 -- {0}", quote(destination))
     } else {

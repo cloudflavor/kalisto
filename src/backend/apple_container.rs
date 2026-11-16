@@ -1052,7 +1052,10 @@ mod tests {
                 if args.first().is_some_and(|argument| argument == "exec") {
                     SystemRunner.run(
                         "/bin/sh",
-                        &["-c".into(), args.last().expect("guest shell command").clone()],
+                        &[
+                            "-c".into(),
+                            args.last().expect("guest shell command").clone(),
+                        ],
                     )
                 } else {
                     self.0.run(program, args)
@@ -1066,8 +1069,10 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root = std::env::temp_dir()
-                .join(format!("kalisto-shared-file-{}-{nonce}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "kalisto-shared-file-{}-{nonce}",
+                std::process::id()
+            ));
             fs::create_dir(&root).unwrap();
             let fixture = TemporaryRoot(root);
             let mounted = fixture.0.join("mounted state");
