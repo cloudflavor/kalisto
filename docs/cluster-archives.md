@@ -171,6 +171,6 @@ Sensitive archives and generated recovery keys are deleted, not published as CI 
 storage and caches must use the mounted external build volume. Respect the user's
 execution policy; do not run this live test without explicit authorization.
 
-Native restore evidence is pending; no CI success is claimed. The current Codeberg
-repository has no enabled Actions runner/integration. See [README](../README.md)
-and [AI agent guidance](ai-agents.md).
+Native restore evidence is pending; no native archive CI success is claimed.
+See the canonical [archive guide](https://cloudflavor.io/kalisto/docs/archives/)
+and [AI agent guidance](https://cloudflavor.io/kalisto/docs/agents/).

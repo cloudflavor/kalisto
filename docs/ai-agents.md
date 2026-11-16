@@ -219,6 +219,6 @@ leaves the borrowed service and persistent user data untouched. The Apple timing
 above predates this reuse-specific proof; full Cilium/API/DNS/cross-node HTTP
 assertions and the sixty-second limit remain unchanged.
 
-See [quick start](../README.md#quick-start) and the
+See [quick start](https://cloudflavor.io/kalisto/docs/getting-started/) and the
 [budget test](../tests/macos_three_node_boot_budget.rs). Normal agent use does not
 require running that benchmark.
