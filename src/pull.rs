@@ -59,7 +59,10 @@ pub struct PreparedAssets {
 pub enum PullOutcome {
     AppleContainer(PreparedAssets),
     Lima(PreparedAssets),
-    Firecracker(artifact::ResolvedFirecrackerArtifacts),
+    Firecracker {
+        artifacts: artifact::ResolvedFirecrackerArtifacts,
+        assets: PreparedAssets,
+    },
 }
 
 impl std::fmt::Display for PullOutcome {
@@ -67,12 +70,14 @@ impl std::fmt::Display for PullOutcome {
         let (backend, assets) = match self {
             Self::AppleContainer(assets) => ("apple-container", assets),
             Self::Lima(assets) => ("lima", assets),
-            Self::Firecracker(artifacts) => {
+            Self::Firecracker { artifacts, assets } => {
                 return write!(
                     formatter,
-                    "backend: firecracker\nkernel: {}\nrootfs: {}",
+                    "backend: firecracker\nkernel: {}\nrootfs: {}\nprepared assets: {}\nprobe image: {}",
                     artifacts.kernel.display(),
-                    artifacts.rootfs.display()
+                    artifacts.rootfs.display(),
+                    assets.root.display(),
+                    assets.probe_image()
                 );
             }
         };
@@ -93,11 +98,6 @@ pub fn cache_root() -> Result<PathBuf> {
 }
 
 fn profile(spec: &ClusterSpec) -> Result<String> {
-    if !spec.backend.uses_prepared_assets() {
-        return Err(invalid(
-            "pull supports the Lima and apple-container backends",
-        ));
-    }
     if spec.backend == BackendKind::AppleContainer
         && spec.image_arch.unwrap_or_else(ImageArch::host_default) != ImageArch::Aarch64
     {
@@ -137,10 +137,10 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
         });
     Ok(format!(
         "{}{}-{}-{}-{}-{components:02x}",
-        if spec.backend == BackendKind::AppleContainer {
-            "apple-container-v2-"
-        } else {
-            ""
+        match spec.backend {
+            BackendKind::AppleContainer => "apple-container-v2-",
+            BackendKind::Firecracker => "firecracker-v1-",
+            BackendKind::Lima => "",
         },
         spec.k3s_version,
         spec.image_arch
@@ -164,9 +164,8 @@ pub fn prepare(spec: &ClusterSpec) -> Result<PullOutcome> {
             prepare_apple_container(spec, &SystemRunner).map(PullOutcome::AppleContainer)
         }
         BackendKind::Lima => prepare_lima(spec, &SystemRunner).map(PullOutcome::Lima),
-        BackendKind::Firecracker => {
-            prepare_firecracker(spec, &SystemRunner).map(PullOutcome::Firecracker)
-        }
+        BackendKind::Firecracker => prepare_firecracker(spec, &SystemRunner)
+            .map(|(artifacts, assets)| PullOutcome::Firecracker { artifacts, assets }),
     }
 }
 
@@ -199,10 +198,17 @@ fn prepare_lima(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<Prepar
 fn prepare_firecracker(
     spec: &ClusterSpec,
     runner: &dyn CommandRunner,
-) -> Result<artifact::ResolvedFirecrackerArtifacts> {
+) -> Result<(artifact::ResolvedFirecrackerArtifacts, PreparedAssets)> {
+    profile(spec)?;
     let artifacts = artifact::prepare_firecracker(spec, runner)?;
+    crate::runtime::prepare(
+        runner,
+        BackendKind::Firecracker,
+        spec.cni_plugin == CniPlugin::Cilium,
+    )?;
     crate::kubectl::binary(&spec.k3s_version, runner)?;
-    Ok(artifacts)
+    let assets = prepare_with_runner(spec, runner)?;
+    Ok((artifacts, assets))
 }
 
 #[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
@@ -433,6 +439,14 @@ pub fn prepare_with_runner(
     )?;
     files.push(hash_file(runner, &staging, "images.tar")?);
     fs::remove_dir_all(layout).map_err(io_error)?;
+    if spec.backend == BackendKind::Firecracker {
+        crate::firecracker_assets::prepare(&staging, runner)?;
+        files.push(hash_file(
+            runner,
+            &staging,
+            crate::firecracker_assets::DISK_FILENAME,
+        )?);
+    }
     if spec.backend == BackendKind::AppleContainer {
         let image = crate::apple_container::image::prepare(spec, &staging, runner)?;
         fs::write(staging.join("apple-node-image"), format!("{image}\n")).map_err(io_error)?;
@@ -495,6 +509,9 @@ pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<Prepared
     };
     if spec.backend == BackendKind::AppleContainer {
         required.extend(["apple-node-image", "apple-node-image.tar"]);
+    }
+    if spec.backend == BackendKind::Firecracker {
+        required.push(crate::firecracker_assets::DISK_FILENAME);
     }
     let names = manifest
         .files
@@ -668,6 +685,13 @@ impl PreparedAssets {
                     .file_name()
                     .ok_or_else(|| invalid("invalid per-cluster manifest path"))?,
             );
+        backend.copy_file_to_guest(
+            runner,
+            &node.name,
+            &node.artifacts.root,
+            &host_manifest,
+            &guest_manifest,
+        )?;
         let mut command = format!(
             "{kubectl} apply --server-side --field-manager=kalisto -f {}",
             shell_escape(&guest_manifest.display().to_string())
@@ -1171,7 +1195,13 @@ pub(crate) fn test_fixture(spec: &ClusterSpec) {
     let root = cache_root().unwrap().join(profile(spec).unwrap());
     fs::create_dir_all(&root).unwrap();
     let mut files = Vec::new();
-    for name in ["k3s", "k3s-images.tar.zst", "images.tar"] {
+    for name in ["k3s", "k3s-images.tar.zst", "images.tar"]
+        .into_iter()
+        .chain(
+            (spec.backend == BackendKind::Firecracker)
+                .then_some(crate::firecracker_assets::DISK_FILENAME),
+        )
+    {
         fs::write(root.join(name), "test").unwrap();
         files.push(CachedFile {
             name: name.to_owned(),

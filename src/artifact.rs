@@ -40,6 +40,7 @@ struct ArtifactManagerConfig {
     rootfs_url: Option<String>,
     kernel_sha256: Option<String>,
     rootfs_sha256: Option<String>,
+    allow_download: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,7 +133,7 @@ pub fn pull_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Resu
             }
             Ok(resolved)
         }
-        BackendKind::Firecracker => resolve_cluster_spec(spec, runner),
+        BackendKind::Firecracker => resolve_firecracker_spec(spec, runner, true),
     }
 }
 
@@ -151,14 +152,21 @@ pub fn resolve_cluster_spec(spec: &ClusterSpec, runner: &dyn CommandRunner) -> R
             }
             Ok(resolved)
         }
-        BackendKind::Firecracker => {
-            let artifacts = prepare_firecracker(spec, runner)?;
-            let mut resolved = spec.clone();
-            resolved.firecracker_kernel = Some(artifacts.kernel);
-            resolved.firecracker_rootfs = Some(artifacts.rootfs);
-            Ok(resolved)
-        }
+        BackendKind::Firecracker => resolve_firecracker_spec(spec, runner, false),
     }
+}
+
+fn resolve_firecracker_spec(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+    allow_download: bool,
+) -> Result<ClusterSpec> {
+    let artifacts = ArtifactManagerConfig::from_env(spec, runner, allow_download)?
+        .resolve_firecracker(spec, runner)?;
+    let mut resolved = spec.clone();
+    resolved.firecracker_kernel = Some(artifacts.kernel);
+    resolved.firecracker_rootfs = Some(artifacts.rootfs);
+    Ok(resolved)
 }
 
 /// Resolve configured local or managed Firecracker kernel/rootfs artifacts,
@@ -167,7 +175,7 @@ pub(crate) fn prepare_firecracker(
     spec: &ClusterSpec,
     runner: &dyn CommandRunner,
 ) -> Result<ResolvedFirecrackerArtifacts> {
-    ArtifactManagerConfig::from_env(spec, runner)?.resolve_firecracker(spec, runner)
+    ArtifactManagerConfig::from_env(spec, runner, true)?.resolve_firecracker(spec, runner)
 }
 
 fn resolve_lima_template(
@@ -320,8 +328,21 @@ fn load_manifest(
     runner: &dyn CommandRunner,
     cache_root: &Path,
     search_roots: &[PathBuf],
+    allow_download: bool,
 ) -> Result<ManifestData> {
     if let Ok(manifest_url) = std::env::var("KALISTO_FIRECRACKER_MANIFEST_URL") {
+        if !allow_download
+            && !manifest_url.starts_with("file://")
+            && !Path::new(&manifest_url).is_file()
+        {
+            let cached = cache_root.join(FIRECRACKER_ARTIFACT_MANIFEST_FILENAME);
+            let content = fs::read_to_string(cached).map_err(|error| {
+                Error::InvalidArgs(format!(
+                    "Firecracker manifest is not cached: {error}; run kalisto pull before up"
+                ))
+            })?;
+            return Ok(ManifestData::parse(&content));
+        }
         let content = read_manifest_url(runner, cache_root, &manifest_url)?;
         return Ok(ManifestData::parse(&content));
     }
@@ -526,7 +547,11 @@ fn numeric_version_key(version: &str) -> Vec<u64> {
 }
 
 impl ArtifactManagerConfig {
-    fn from_env(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<Self> {
+    fn from_env(
+        spec: &ClusterSpec,
+        runner: &dyn CommandRunner,
+        allow_download: bool,
+    ) -> Result<Self> {
         let default_cache_root = artifacts_root()?.join(FIRECRACKER_ARTIFACT_DIR);
         let cache_root = std::env::var_os("KALISTO_FIRECRACKER_ARTIFACT_CACHE_DIR")
             .filter(|value| !value.is_empty())
@@ -570,9 +595,10 @@ impl ArtifactManagerConfig {
         search_roots.push(cache_root.clone());
         dedupe_paths(&mut search_roots);
 
-        let manifest = load_manifest(runner, &cache_root, &search_roots)?;
+        let manifest = load_manifest(runner, &cache_root, &search_roots, allow_download)?;
 
         Ok(Self {
+            allow_download,
             managed_cache_root,
             search_roots,
             managed_k3s_version: std::env::var("KALISTO_FIRECRACKER_MANAGED_K3S_VERSION")
@@ -695,6 +721,12 @@ impl ArtifactManagerConfig {
                 &self.search_roots,
             )));
         };
+        if !self.allow_download {
+            return Err(Error::InvalidArgs(format!(
+                "Firecracker {} is not cached; run kalisto pull before up",
+                request.label
+            )));
+        }
 
         let fetched = fetch_into_cache(
             runner,
@@ -1178,6 +1210,19 @@ mod tests {
         assert_eq!(runner.downloads.lock().unwrap().len(), 2);
         assert_eq!(*runner.commands.lock().unwrap(), ["curl", "curl"]);
         assert!(lima_root.is_file());
+        let offline = resolve_cluster_spec(&spec, &runner).unwrap();
+        assert_eq!(
+            offline.firecracker_rootfs.as_deref(),
+            Some(resolved.rootfs.as_path())
+        );
+        fs::remove_file(&resolved.rootfs).unwrap();
+        let error = resolve_cluster_spec(&spec, &runner).unwrap_err();
+        assert!(error.to_string().contains("run kalisto pull before up"));
+        assert_eq!(
+            runner.downloads.lock().unwrap().len(),
+            2,
+            "startup must not download missing artifacts"
+        );
 
         for (name, value) in original_env {
             restore_env(name, value);
@@ -1198,6 +1243,7 @@ mod tests {
             rootfs_url: None,
             kernel_sha256: None,
             rootfs_sha256: None,
+            allow_download: false,
         };
         let mut spec = firecracker_spec(&root);
         spec.k3s_version = "v0.0.0-test".to_owned();
@@ -1240,6 +1286,7 @@ mod tests {
             rootfs_url: None,
             kernel_sha256: Some("abc123".to_owned()),
             rootfs_sha256: Some("def456".to_owned()),
+            allow_download: false,
         };
 
         let resolved = config
