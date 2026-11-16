@@ -6,17 +6,18 @@ Current scope:
 
 - default macOS backend: Apple `container` running Kalisto-managed k3s nodes
 - optional macOS backend: native Lima `vz` (Rosetta opt-in)
-- Linux backend: Firecracker (in progress)
+- Linux backend: [Firecracker](#linux-firecracker-quick-start), with rootless networking and prepared offline boot assets
 - Kubernetes distro: `k3s`
-- image pipeline: prepared Ubuntu/k3s node images; optional Lima VM disks
+- image pipeline: prepared Ubuntu/k3s node images, optional Lima VM disks, and a read-only Firecracker boot-asset disk
 
 ## Binary releases
 
 Pushed version tags publish packages to [forgejo Releases](https://forgejo.example.test/cloudflavor/kalisto/releases):
 **macOS amd64/arm64 and static Linux amd64/arm64**, with SHA-256 checksums.
 All targets must build successfully before the release is published.
-See [release targets, verification and tagging](docs/releases.md). Linux backend
-support remains in progress; available binaries do not imply feature parity.
+See [release targets, verification and tagging](docs/releases.md). Published
+binaries do not imply runtime validation on every architecture; the Linux
+Firecracker result below was measured on `x86_64`.
 
 ## Quick Start
 
@@ -43,7 +44,7 @@ and kernel setup happens before the cluster startup measurement.
 See [macOS Apple-container prerequisites](docs/prerequisites-macos-apple-container.md)
 for installation, upgrades and firewall requirements.
 
-### Prepare and start
+### macOS: prepare and start
 
 After installing Apple `container` and the standalone Kalisto binary, run from any directory:
 
@@ -79,8 +80,8 @@ support enabled rather than a separate proxy DaemonSet. Default CNI remains `non
 explicit Cilium selection is required for pod networking. MCP exposes the same
 preparation through `clusters.pull`, using the lifecycle arguments of `clusters.up`.
 
-The prepared startup profiles support Lima and Apple containers, no CNI or Cilium,
-and optional `lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
+The prepared startup profiles support Lima, Apple containers and Firecracker,
+no CNI or Cilium, and optional `lb/servicelb` only. Other startup add-ons are rejected rather than downloaded
 silently; install those explicitly after startup. Existing Helm-managed Cilium
 clusters require migration; prepared startup currently targets fresh clusters.
 
@@ -91,6 +92,58 @@ Ready nodes, authenticated host API, Cilium rollouts, and DNS/Service HTTP probe
 from both workers. Image imports and VM creation remain inside the timer;
 `pull` preparation stays outside it. These measurements are not a universal
 hardware performance guarantee.
+
+### Linux Firecracker quick start
+
+Validated on Fedora 44 `x86_64` with Firecracker **1.18.0**, accessible `/dev/kvm`,
+and rootless `slirp4netns` networking. Install the Linux host prerequisites:
+Firecracker, `debugfs`/`mke2fs`, OpenSSH, `ip`, `iptables`, `sysctl`,
+`slirp4netns`, `unshare` and `nsenter`; see the
+[Linux prerequisite guide](docs/prerequisites-linux-firecracker.md).
+Kalisto manages Linux Crane, Helm and kubectl during preparation; no host Docker
+or manually installed Helm/Crane is required.
+
+**Provide an existing Firecracker-compatible kernel and rootfs, or configure
+their manifest/download URLs. There is not yet an implicit public artifact
+source.** A Lima disk/template is not a Firecracker rootfs.
+
+```bash
+KERNEL=/absolute/path/to/kalisto-vmlinux
+ROOTFS=/absolute/path/to/rootfs.raw
+
+kalisto pull --backend firecracker --addons cni/cilium \
+  --firecracker-kernel "$KERNEL" --firecracker-rootfs "$ROOTFS"
+kalisto up --backend firecracker --name dev --workers 2 --addons cni/cilium \
+  --firecracker-kernel "$KERNEL" --firecracker-rootfs "$ROOTFS"
+kalisto kubectl --name dev -- get nodes
+```
+
+`pull` prepares digest-pinned K3s, Cilium and diagnostic images in a shared
+read-only ext4 disk; it creates no cluster or Kubernetes nodes. `up` creates fresh
+VMs, mounts those assets read-only and imports images locally. Missing preparation
+is an error, not an online fallback. Per-cluster Cilium TLS manifests remain
+private and are copied into the guest, not baked into the shared disk.
+
+The default Linux network is rootless `slirp4netns`; host sudo is not needed for
+that mode. `--network bridge` remains an explicit privileged alternative.
+Cilium must be selected explicitly; bare `pull`/`up` do not enable a CNI.
+
+| Native Linux validation | Elapsed |
+| --- | --- |
+| Preparation, outside the startup clock | 40.68s |
+| Fresh three-node startup and functional probes | **42.95s** |
+
+The startup measurement includes three Ready nodes, authenticated host API,
+all Cilium rollouts, and DNS plus cross-node Service HTTP from both workers.
+It uses cached probe images with pull policy `Never`, not pre-created VMs.
+Stop/resume preserved a ConfigMap, and scale-out reached four Ready nodes
+afterward, outside that timer. These are observed results, not a universal
+hardware guarantee. See the [live test command](#live-tests).
+
+`kalisto down --name dev` retains the disks and SSH identities;
+`kalisto up --name dev` resumes the saved profile without repeating artifact
+flags. `kalisto destroy --name dev` removes that cluster; prepared assets remain
+cached for the next fresh cluster.
 
 ## Apple container backend
 
@@ -181,18 +234,18 @@ Apple containers are the macOS default, Firecracker is the Linux default, and
 | --- | --- | --- |
 | Apple containers (macOS default) | `kalisto pull` | Linux kernel/init and Ubuntu/k3s OCI node image, using the installed Apple `container` runtime; no Lima VM disk or template |
 | Lima (optional) | `kalisto pull --backend lima` | Managed Lima runtime and VM disk/template under `artifacts/node-image`; no Apple runtime or node image |
-| Firecracker (Linux default) | `kalisto pull --backend firecracker` | Configured/discovered Firecracker kernel and rootfs; no Apple, Lima, Helm or OCI boot-profile preparation |
+| Firecracker (Linux default) | `kalisto pull --backend firecracker` | Configured/discovered kernel/rootfs, managed Linux tools and a read-only offline boot-asset disk; no Apple or Lima runtime |
 
-Apple and Lima also cache Kubernetes boot images and managed kubectl. Add
+All three backends cache Kubernetes boot images and managed kubectl. Add
 `--addons cni/cilium` to prepare Cilium images and its Helm chart, then select the
-same add-on during `up`. Firecracker prepares matching host kubectl, but its
-kernel/rootfs publication is still in progress: provide existing artifacts or
-configured manifest/artifact URLs as described in
-[Linux prerequisites](docs/prerequisites-linux-firecracker.md). This does not
-extend the macOS offline-startup or sub-minute guarantee to Firecracker.
-CLI and MCP pull results identify the selected backend and report only its
-prepared boot profile or kernel/rootfs paths. Disk templates are never discovered
-for default Apple-container startup, and only Lima logs a template path.
+same add-on during `up`. Firecracker uses a shared read-only ext4 disk for these
+assets; image imports, fresh VM creation and CNI startup remain inside the boot
+timer. Firecracker kernel/rootfs publication is still in progress: provide
+existing artifacts or configured manifest/artifact URLs as described in
+[Linux prerequisites](docs/prerequisites-linux-firecracker.md).
+CLI and MCP pull results identify the selected backend and its prepared profile;
+Firecracker also reports the resolved kernel/rootfs. Disk templates are never
+discovered for default Apple-container startup, and only Lima logs a template path.
 
 ## Optional Lima backend
 
@@ -634,8 +687,8 @@ If you publish the finalized image at a stable URL, Kalisto can fetch it on miss
 into that cache when these environment variables are set:
 
 ```bash
-export KALISTO_LIMA_IMAGE_URL=<published-url>/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2
-export KALISTO_LIMA_IMAGE_SHA256=<sha256>
+export KALISTO_LIMA_IMAGE_URL="<published-url>/ubuntu-24.04-minimal-k3s-arm64-finalized.qcow2"
+export KALISTO_LIMA_IMAGE_SHA256="<sha256>"
 ```
 
 `KALISTO_LIMA_IMAGE_FILENAME` is also supported if the published file name differs
@@ -643,7 +696,9 @@ from the default finalized image name.
 
 ## Firecracker artifact pipeline
 
-The Linux Firecracker path should reuse the same Ubuntu guest lineage as Lima, but emit Firecracker-specific artifacts.
+The Linux builders reuse the Ubuntu guest provisioning recipe but emit
+Firecracker-specific kernel/rootfs artifacts. They are maintainer tooling, not
+steps run by `kalisto up`.
 
 Current shape:
 
@@ -658,8 +713,8 @@ Current shape:
 - prerequisites:
   - [docs/prerequisites-linux-firecracker.md](docs/prerequisites-linux-firecracker.md)
 
-For rootless Linux Firecracker networking, install `slirp4netns` and use
-`--network slirp4netns`.
+Rootless `slirp4netns` is the default Linux network; install its host
+prerequisites before preparation/startup.
 
 Build the Firecracker kernel, rootfs, and unified manifest locally on Linux:
 
@@ -671,20 +726,20 @@ Build the Firecracker kernel, rootfs, and unified manifest locally on Linux:
 
 By default, the Linux Firecracker scripts detect the installed Firecracker
 version and host architecture, then place artifacts under a versioned directory
-such as `artifacts/firecracker-node/v1.13/x86_64/`.
+such as `artifacts/firecracker-node/v1.18/x86_64/`.
 
-Default artifacts for a host running Firecracker `v1.13.x` on `x86_64`:
+Default artifacts for a host running Firecracker `v1.18.x` on `x86_64`:
 
-- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux`
-- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux.config`
-- `artifacts/firecracker-node/v1.13/x86_64/kalisto-vmlinux.manifest`
-- `artifacts/firecracker-node/v1.13/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.raw`
-- `artifacts/firecracker-node/v1.13/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.manifest`
-- `artifacts/firecracker-node/v1.13/x86_64/firecracker-artifacts.manifest`
+- `artifacts/firecracker-node/v1.18/x86_64/kalisto-vmlinux`
+- `artifacts/firecracker-node/v1.18/x86_64/kalisto-vmlinux.config`
+- `artifacts/firecracker-node/v1.18/x86_64/kalisto-vmlinux.manifest`
+- `artifacts/firecracker-node/v1.18/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.raw`
+- `artifacts/firecracker-node/v1.18/x86_64/ubuntu-24.04-minimal-k3s-amd64-rootfs.manifest`
+- `artifacts/firecracker-node/v1.18/x86_64/firecracker-artifacts.manifest`
 
 ## Firecracker artifact manager
 
-`kalisto up` on Linux now resolves Firecracker boot artifacts in this order:
+`kalisto pull --backend firecracker` resolves kernel/rootfs artifacts in this order:
 
 1. explicit CLI paths:
    - `--firecracker-kernel`
@@ -695,15 +750,18 @@ Default artifacts for a host running Firecracker `v1.13.x` on `x86_64`:
 3. legacy artifact roots:
    - `artifacts/firecracker-node/`
    - `~/.local/share/kalisto/artifacts/firecracker-node/`
-4. optional fetch-on-miss URLs declared explicitly or through a published Kalisto manifest
+4. explicitly configured URLs or a Kalisto manifest, fetched on cache miss only during `pull`
 
-On Linux, Kalisto now detects the installed Firecracker version from `firecracker --version`, maps it to the matching upstream artifact track such as `v1.13`, and prefers the cache path under:
+`up` uses local prepared assets and refuses kernel/rootfs or remote-manifest
+downloads. A cache miss instructs you to run `pull` before starting the cluster.
+Kalisto detects the installed Firecracker release track, such as `v1.18`,
+and host architecture, and prefers:
 
 ```text
-~/.local/share/kalisto/artifacts/firecracker-node/v1.13/x86_64/
+~/.local/share/kalisto/artifacts/firecracker-node/v1.18/x86_64/
 ```
 
-If no managed artifacts are present locally, Kalisto can fetch them into that
+If no managed artifacts are present locally, `pull` can fetch them into that
 versioned directory from either:
 
 - `KALISTO_FIRECRACKER_MANIFEST_URL`, which supplies the managed filenames,
@@ -716,7 +774,7 @@ from the upstream Firecracker CI bucket. The writable Firecracker rootfs
 remains Kalisto-managed and is still expected to come from a local workspace
 artifact, a published Kalisto artifact set, or an explicit path override.
 
-Supported fetch-on-miss environment variables:
+Supported preparation and artifact-resolution environment variables:
 
 - `KALISTO_FIRECRACKER_MANIFEST_URL`
 - `KALISTO_FIRECRACKER_KERNEL_URL`
@@ -811,6 +869,22 @@ Prepared product startup instead defaults to no CNI and requires explicit Cilium
 selection for networking; the probe defaults above do not describe that workflow.
 
 ## Live tests
+
+The Firecracker functional boot test is opt-in and requires the Linux
+prerequisites plus existing local kernel/rootfs artifacts:
+
+```bash
+KALISTO_LIVE_FIRECRACKER_TESTS=1 \
+KALISTO_FIRECRACKER_KERNEL=/absolute/path/to/kalisto-vmlinux \
+KALISTO_FIRECRACKER_ROOTFS=/absolute/path/to/rootfs.raw \
+  cargo test --release --locked --test linux_firecracker_live -- --nocapture
+```
+
+It runs the real CLI from an empty directory with a dedicated reusable XDG cache
+and fresh unique cluster state. Its strict 60-second deadline covers startup and
+functional probes, not `pull`; persistence and scale-out are checked afterward.
+Logs/results are retained under `target/kalisto/firecracker-budget/` (or the
+corresponding `CARGO_TARGET_DIR`); only the test-owned cluster is destroyed.
 
 The live Lima tests are opt-in:
 
