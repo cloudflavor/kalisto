@@ -68,6 +68,7 @@ jobs:
         if: always()
         run: sccache --show-stats
       - name: Upload resolved dependency lock
+        if: always()
         uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
         with:
           name: resolved-dependencies
