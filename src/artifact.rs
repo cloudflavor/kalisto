@@ -1407,7 +1407,10 @@ mod tests {
         }
         assert!(runner.commands.lock().unwrap().is_empty());
         assert!(!packed.exists());
-        assert_eq!(fs::read_to_string(&cached_template).unwrap(), "invalid: [yaml");
+        assert_eq!(
+            fs::read_to_string(&cached_template).unwrap(),
+            "invalid: [yaml"
+        );
         assert_eq!(fs::read_to_string(&raw).unwrap(), "Lima disk");
 
         restore_env("XDG_DATA_HOME", original_xdg_data_home);

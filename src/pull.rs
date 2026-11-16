@@ -170,7 +170,10 @@ pub fn prepare(spec: &ClusterSpec) -> Result<PullOutcome> {
     }
 }
 
-fn prepare_apple_container(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PreparedAssets> {
+fn prepare_apple_container(
+    spec: &ClusterSpec,
+    runner: &dyn CommandRunner,
+) -> Result<PreparedAssets> {
     profile(spec)?;
     crate::runtime::prepare(
         runner,

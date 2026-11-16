@@ -192,7 +192,11 @@ fn firecracker_pull_prepares_only_kernel_rootfs_and_host_kubectl() {
     assert_eq!(artifacts.rootfs, rootfs);
     assert!(!cache_root().unwrap().exists());
     assert!(!spec.state_root().exists());
-    assert!(crate::kubectl::binary(&spec.k3s_version, &runner).unwrap().is_file());
+    assert!(
+        crate::kubectl::binary(&spec.k3s_version, &runner)
+            .unwrap()
+            .is_file()
+    );
     assert!(
         runner.commands.lock().unwrap().iter().all(|command| {
             command == "firecracker --version"

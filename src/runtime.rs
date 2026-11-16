@@ -113,11 +113,7 @@ pub fn program(name: &str) -> Option<PathBuf> {
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
-pub fn prepare(
-    runner: &dyn CommandRunner,
-    backend: BackendKind,
-    cilium: bool,
-) -> Result<()> {
+pub fn prepare(runner: &dyn CommandRunner, backend: BackendKind, cilium: bool) -> Result<()> {
     match backend {
         BackendKind::Firecracker => return Ok(()),
         BackendKind::AppleContainer | BackendKind::Lima => {}
