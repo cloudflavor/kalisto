@@ -46,6 +46,12 @@ profile. `kalisto up` does not install the host engine or download missing start
 assets. Runtime installation, service setup and preparation are outside the
 three-node startup measurement.
 
+Fresh Apple-container nodes use containerd's OverlayFS snapshotter on the pinned
+Kata kernel, sharing immutable image layers rather than copying Cilium's full
+root filesystem for each init container. After upgrading from a native-snapshotter
+build, run `kalisto pull` again to prepare the revised node-image profile before
+creating a fresh cluster. Existing node disks are not converted in place.
+
 ## Existing services, upgrades and firewalls
 
 Kalisto reuses a compatible installed CLI and shared running service without

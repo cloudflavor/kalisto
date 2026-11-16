@@ -197,9 +197,9 @@ mkdir -p /usr/local/sbin /etc/rancher/k3s /etc/kalisto
 cat > /usr/local/sbin/kalisto-node-init <<'KALISTO_NODE_INIT'
 {node_init}KALISTO_NODE_INIT
 chmod 0755 /usr/local/sbin/kalisto-node-init
-# Apple's managed kernel need not support overlay; upstream container 1.7.1
-# LinuxNodeProvisioner likewise explicitly selects containerd's native driver.
-printf 'snapshotter: native\n' > /etc/rancher/k3s/config.yaml
+# The pinned Kata kernel enables OverlayFS. Native snapshots copy the whole
+# Cilium rootfs for every init container instead of sharing immutable layers.
+printf 'snapshotter: overlayfs\n' > /etc/rancher/k3s/config.yaml
 printf '%s\n' {version} > /etc/kalisto/k3s-version
 # Reusable OS only: never run k3s server/agent during image preparation.
 rm -f /etc/machine-id /var/lib/dbus/machine-id /var/lib/systemd/random-seed
