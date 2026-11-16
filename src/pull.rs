@@ -138,7 +138,7 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
     Ok(format!(
         "{}{}-{}-{}-{}-{components:02x}",
         match spec.backend {
-            BackendKind::AppleContainer => "apple-container-v1-",
+            BackendKind::AppleContainer => "apple-container-v2-",
             BackendKind::Firecracker => "firecracker-v1-",
             BackendKind::Lima => "",
         },
@@ -510,9 +510,9 @@ pub(crate) fn load_from_root(spec: &ClusterSpec, root: &Path) -> Result<Prepared
     if spec.backend == BackendKind::AppleContainer {
         required.extend(["apple-node-image", "apple-node-image.tar"]);
     }
-    }
     if spec.backend == BackendKind::Firecracker {
         required.push(crate::firecracker_assets::DISK_FILENAME);
+    }
     let names = manifest
         .files
         .iter()
