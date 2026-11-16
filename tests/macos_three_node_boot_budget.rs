@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -387,6 +388,15 @@ fn cold_cli_boot(backend: BackendKind) {
     let cleanup = OwnedCluster(name.clone(), evidence.clone());
     let borrowed_runtime = (backend == BackendKind::AppleContainer)
         .then(|| BorrowedAppleRuntime::capture(&evidence, "before-pull"));
+    // Reserve a test-owned API port through preparation, leaving user clusters alone.
+    let port_reservation = if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
+        spec.api_port = port.parse().expect("API port override must be a valid u16");
+        None
+    } else {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a test API port");
+        spec.api_port = listener.local_addr().unwrap().port();
+        Some(listener)
+    };
     let up_log = fs::File::create(evidence.join("up.log")).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kalisto"));
     command
@@ -409,9 +419,7 @@ fn cold_cli_boot(backend: BackendKind) {
     if backend != BackendKind::AppleContainer {
         command.args(["--backend", backend.as_str()]);
     }
-    if let Ok(port) = std::env::var("KALISTO_LIMA_K3S_API_PORT") {
-        command.args(["--api-port", &port]);
-    }
+    command.args(["--api-port", &spec.api_port.to_string()]);
 
     // Preparation may build a sanitized OS-only image, never a Kubernetes cluster.
     // Both commands run outside the checkout with a system-only PATH.
@@ -487,6 +495,7 @@ fn cold_cli_boot(backend: BackendKind) {
         .max(60);
     let started = Instant::now();
     let deadline = started + Duration::from_secs(observation_seconds);
+    drop(port_reservation);
     let mut child = command.spawn().expect("product CLI should start");
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -621,6 +630,7 @@ fn cold_cli_boot(backend: BackendKind) {
             "seconds": elapsed.as_secs_f64(),
             "fresh_vm_definitions": true,
             "backend": backend.as_str(),
+            "api_port": spec.api_port,
             "ready_nodes": 3,
             "cni": "cilium",
             "cni_rollouts_ready": true,
