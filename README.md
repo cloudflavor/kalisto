@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="kalisto.svg" alt="Kalisto logo: a moon with an orange orbital ring" width="320" height="320">
+</p>
+
 # Kalisto
 
 Local-development Kubernetes runtime using k3s on macOS and Linux.
