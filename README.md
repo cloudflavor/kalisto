@@ -20,7 +20,32 @@ support remains in progress; available binaries do not imply feature parity.
 
 ## Quick Start
 
-On Apple silicon with macOS 26 or newer, install the standalone binary and run from any directory:
+### macOS prerequisites
+
+The default Apple-container backend requires:
+
+- **Apple silicon and macOS 26 or newer.**
+- **Apple's `container` CLI installed and its system service running before
+  `kalisto pull` or `kalisto up`.** The validated version is `container` 1.7.1.
+
+For a new Homebrew installation:
+
+```bash
+brew install container
+container system start
+container --version
+container list
+```
+
+Skip installation/start if a compatible installation and service are already
+available. Do not replace or stop a shared running daemon. First-time runtime
+and kernel setup happens before the cluster startup measurement.
+See [macOS Apple-container prerequisites](docs/prerequisites-macos-apple-container.md)
+for installation, upgrades and firewall requirements.
+
+### Prepare and start
+
+After installing Apple `container` and the standalone Kalisto binary, run from any directory:
 
 ```bash
 kalisto pull --addons cni/cilium
@@ -33,15 +58,15 @@ boots; rerun `pull` when the profile changes or cache is removed. Repeating `pul
 verifies/reuses a complete cache rather than rebuilding the OS image. Bare
 `pull`/`up` do **not** select a CNI.
 
-`pull` reuses a compatible installed Apple CLI/runtime (including Homebrew) from
-`PATH`. Only when no compatible installation exists does it fetch the pinned,
-signed private runtime. It also prepares the kernel/init image, managed Crane,
-kubectl, Helm when Cilium is selected, K3s, and platform-digest-pinned OCI images including a BusyBox
-diagnostic image. A temporary ordinary container prepares the reusable Ubuntu/k3s
-node image, never starting Kubernetes or creating cluster state; the builder is
-deleted after use. Standard flow requires no checkout, manual templates, Homebrew,
-Docker, QEMU install, host sudo, or Lima. Cache lives under `artifacts/boot-v4` in
-user-scoped Kalisto data.
+With the prerequisites in place, `pull` reuses the installed Apple CLI/runtime
+from `PATH`, including Homebrew, without replacing its compatible running service.
+It prepares the kernel/init image, managed Crane, kubectl, Helm when Cilium is
+selected, K3s, and platform-digest-pinned OCI images including a BusyBox diagnostic
+image. A temporary ordinary container prepares the reusable Ubuntu/k3s node image,
+never starting Kubernetes or creating cluster state; the builder is deleted after
+use. After Apple `container` is installed, no checkout, manual templates, Docker,
+QEMU install, host sudo or Lima is needed. Cache lives under `artifacts/boot-v4`
+in user-scoped Kalisto data.
 Preparation can take several minutes and stays outside cold cluster startup timing.
 
 `up` requires a complete cache, mounts it read-only, imports local images on fresh
@@ -84,11 +109,11 @@ Kalisto owns the k3s server, agents, Cilium, readiness checks, and cluster state
 It does not use `container cluster`, `container machine`, kubeadm, kind, Docker,
 or an external registry to bootstrap prepared nodes. Lima is an explicit alternative.
 
-`pull` prefers the compatible Apple 1.7.1 release already installed on `PATH`,
-including Homebrew's CLI and already-running service. Without a compatible
-installation, it installs the pinned, signed runtime privately in Kalisto's user
-data. It prepares a kernel/init image and composes a digest-pinned Ubuntu/k3s node
-image. A temporary ordinary container installs Linux prerequisites, then is deleted;
+Apple `container` is a host prerequisite; install and start it before preparation.
+Kalisto reuses the compatible Apple 1.7.1 CLI on `PATH`, including Homebrew's CLI
+and already-running service. `pull` prepares a kernel/init image and composes a
+digest-pinned Ubuntu/k3s node image. A temporary ordinary container installs Linux
+prerequisites, then is deleted;
 no cluster identity is baked into the reusable image. The cached node OCI archive
 can restore a pruned runtime image store when `pull` is repeated. Node archives are
 served directly over temporary loopback HTTP during import, without extracting a
@@ -154,7 +179,7 @@ Apple containers are the macOS default, Firecracker is the Linux default, and
 
 | Backend | Preparation command | Backend-specific assets |
 | --- | --- | --- |
-| Apple containers (macOS default) | `kalisto pull` | Compatible Apple runtime, Linux kernel/init and Ubuntu/k3s OCI node image; no Lima VM disk or template |
+| Apple containers (macOS default) | `kalisto pull` | Linux kernel/init and Ubuntu/k3s OCI node image, using the installed Apple `container` runtime; no Lima VM disk or template |
 | Lima (optional) | `kalisto pull --backend lima` | Managed Lima runtime and VM disk/template under `artifacts/node-image`; no Apple runtime or node image |
 | Firecracker (Linux default) | `kalisto pull --backend firecracker` | Configured/discovered Firecracker kernel and rootfs; no Apple, Lima, Helm or OCI boot-profile preparation |
 
