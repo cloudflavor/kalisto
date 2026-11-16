@@ -734,4 +734,15 @@ fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kub
         }),
         "the added worker must join with a functional CNI"
     );
+    for node in nodes {
+        let node_name = node["metadata"]["name"]
+            .as_str()
+            .expect("a Kubernetes node must have a name");
+        let endpoint = format!("/api/v1/nodes/{node_name}/proxy/healthz");
+        assert_eq!(
+            kubectl(kubeconfig, &["get", "--raw", &endpoint]),
+            b"ok",
+            "the API server must authenticate every resumed and added kubelet"
+        );
+    }
 }

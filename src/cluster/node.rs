@@ -301,16 +301,43 @@ fn launch_k3s_process(
         runner,
         &node.name,
         &node.artifacts.root,
-        &launch_k3s_process_command(artifact_dir, k3s_command),
+        &launch_k3s_process_command(
+            artifact_dir,
+            k3s_command,
+            backend.kind() == crate::backend::BackendKind::AppleContainer,
+        ),
     )
 }
 
-fn launch_k3s_process_command(artifact_dir: &Path, k3s_command: &str) -> String {
+fn launch_k3s_process_command(
+    artifact_dir: &Path,
+    k3s_command: &str,
+    refresh_dynamic_address: bool,
+) -> String {
     let stdout_log_path = artifact_dir.join("k3s.stdout.log");
     let stderr_log_path = artifact_dir.join("k3s.stderr.log");
     let pid_file_path = pid_file_path(artifact_dir);
     format!(
-        "rm -f {pid_file}; nohup /bin/sh -lc {command} >{stdout_log} 2>{stderr_log} </dev/null & printf '%s\\n' $! > {pid_file}",
+        concat!(
+            "set -eu\n",
+            // Apple can assign a different guest IP when a persisted node resumes.
+            // Rotate only stale kubelet leaf certificates, before starting k3s.
+            "if {refresh_dynamic_address} && [ -s /var/lib/rancher/k3s/agent/serving-kubelet.crt ]; then\n",
+            "    command -v openssl >/dev/null\n",
+            "    set -- $(ip -4 -o route get 1.1.1.1)\n",
+            "    while [ \"$#\" -gt 0 ] && [ \"$1\" != src ]; do shift; done\n",
+            "    test \"$#\" -ge 2\n",
+            "    if ! openssl x509 -noout -checkip \"$2\" -in /var/lib/rancher/k3s/agent/serving-kubelet.crt >/dev/null; then\n",
+            "        /usr/local/bin/k3s certificate rotate --service kubelet\n",
+            "    fi\n",
+            "fi\n",
+            "rm -f {pid_file}; nohup /bin/sh -lc {command} >{stdout_log} 2>{stderr_log} </dev/null & printf '%s\\n' $! > {pid_file}"
+        ),
+        refresh_dynamic_address = if refresh_dynamic_address {
+            "true"
+        } else {
+            "false"
+        },
         pid_file = shell_escape(pid_file_path.as_os_str().to_string_lossy().as_ref()),
         command = shell_escape(k3s_command),
         stdout_log = shell_escape(stdout_log_path.as_os_str().to_string_lossy().as_ref()),
@@ -606,6 +633,7 @@ mod tests {
         let command = launch_k3s_process_command(
             Path::new("/tmp/kalisto-cp-test"),
             "/usr/local/bin/k3s server --write-kubeconfig /tmp/kalisto-cp-test/kubeconfig.yaml",
+            false,
         );
 
         assert!(command.contains("nohup /bin/sh -lc"));
