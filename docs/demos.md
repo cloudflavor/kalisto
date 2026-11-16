@@ -19,9 +19,9 @@ functional Cilium/DNS/cross-node HTTP performance acceptance test in
 | `scale.cast` | Show the original three Ready nodes, run `kalisto scale --workers 3`, require exactly four Ready nodes, increase the HTTP Deployment to three replicas, require distinct worker placements, and repeat the HTTP proof. |
 
 On Apple-container resume, guest addresses can change. Before starting a stopped
-k3s process, Kalisto checks any existing kubelet serving certificate against the
-current guest IPv4 address. Only a mismatched kubelet leaf certificate is renewed
-using `k3s certificate rotate --service kubelet`; cluster CA, datastore, and TLS
+k3s process, Kalisto verifies any existing kubelet serving certificate for the
+current guest IPv4 address against the cluster CA. A leaf that no longer validates
+is renewed using `k3s certificate rotate --service kubelet`; cluster CA, datastore, and TLS
 verification remain intact. The resume scene's real port-forward verifies this
 consumer path rather than treating Ready nodes alone as proof of recovery.
 

@@ -322,12 +322,13 @@ fn launch_k3s_process_command(
             "set -eu\n",
             // Apple can assign a different guest IP when a persisted node resumes.
             // Rotate only stale kubelet leaf certificates, before starting k3s.
+            // x509 -checkip reports mismatches without a failing exit status.
             "if {refresh_dynamic_address} && [ -s /var/lib/rancher/k3s/agent/serving-kubelet.crt ]; then\n",
             "    command -v openssl >/dev/null\n",
             "    set -- $(ip -4 -o route get 1.1.1.1)\n",
             "    while [ \"$#\" -gt 0 ] && [ \"$1\" != src ]; do shift; done\n",
             "    test \"$#\" -ge 2\n",
-            "    if ! openssl x509 -noout -checkip \"$2\" -in /var/lib/rancher/k3s/agent/serving-kubelet.crt >/dev/null; then\n",
+            "    if ! openssl verify -verify_ip \"$2\" -CAfile /var/lib/rancher/k3s/agent/server-ca.crt /var/lib/rancher/k3s/agent/serving-kubelet.crt >/dev/null 2>&1; then\n",
             "        /usr/local/bin/k3s certificate rotate --service kubelet\n",
             "    fi\n",
             "fi\n",
