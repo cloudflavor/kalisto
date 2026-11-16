@@ -15,6 +15,7 @@ use crate::cluster::spec::{ClusterSpec, ImageArch};
 use crate::error::{Error, Result};
 use crate::paths::{artifacts_root, data_root};
 use crate::process::CommandRunner;
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 const UBUNTU_RELEASE: &str = "release-20261001";
@@ -69,12 +70,14 @@ pub fn prepare(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf
     )?;
     let raw_seed = seed.with_extension(format!("{}.raw", &checksum[..16]));
     if !raw_seed.is_file() {
+        let progress = Progress::spinner("Converting Ubuntu node seed to a raw disk");
         let temporary = raw_seed.with_extension("raw.partial");
         if temporary.exists() {
             fs::remove_file(&temporary).map_err(io_error)?;
         }
         crate::qcow::to_raw(&seed, &temporary)?;
         fs::rename(&temporary, &raw_seed).map_err(io_error)?;
+        progress.finish("Ubuntu node seed converted");
     }
     let binary = crate::pull::k3s_binary(spec, runner)?;
     let builder_home = data_root()?.join("i");
@@ -101,6 +104,7 @@ pub fn prepare(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf
     .map_err(io_error)?;
     let env = [("LIMA_HOME", builder_home.as_path())];
     let result = (|| {
+        let progress = Progress::spinner("Provisioning reusable Lima node image");
         runner.run_with_env(
             "limactl",
             &[
@@ -113,11 +117,13 @@ pub fn prepare(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf
             ],
             &env,
         )?;
+        progress.set_message("Cleaning reusable Lima node image");
         // Guest root is provided by Lima; no sudo or other privileged command is run on the Mac.
         runner.run_with_env("limactl", &[
             "shell".into(), "--tty=false".into(), name.clone(), "sudo".into(), "sh".into(), "-lc".into(),
             "set -eu; test -f /etc/kalisto/node-image.env; test ! -d /var/lib/rancher/k3s/server; apt-get clean; rm -rf /var/lib/apt/lists/*; journalctl --rotate || true; journalctl --vacuum-time=1s || true; cloud-init clean --logs --seed --machine-id; rm -f /etc/netplan/50-cloud-init.yaml /etc/ssh/ssh_host_*; find /root /home -type f -name authorized_keys -delete; sync".into(),
         ], &env)?;
+        progress.set_message("Stopping Lima image builder");
         runner.run_with_env(
             "limactl",
             &["stop".into(), "--tty=false".into(), name.clone()],
@@ -127,6 +133,7 @@ pub fn prepare(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<PathBuf
         if !disk.is_file() {
             return Err(invalid("native builder did not produce a VZ disk"));
         }
+        progress.finish("Reusable Lima node disk prepared");
         compress_disk(&disk, &image)?;
         write_template(&template, &image, arch)?;
         Ok(template.clone())
@@ -195,6 +202,7 @@ pub fn pack_cached_template(spec: &ClusterSpec) -> Result<Option<PathBuf>> {
 }
 
 fn compress_disk(source: &Path, destination: &Path) -> Result<()> {
+    let progress = Progress::spinner("Compressing reusable Lima node disk");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| invalid(error.to_string()))?
@@ -224,7 +232,9 @@ fn compress_disk(source: &Path, destination: &Path) -> Result<()> {
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
-    result
+    result?;
+    progress.finish("Reusable Lima node disk compressed");
+    Ok(())
 }
 
 fn provision_script(binary: &Path, version: &str) -> String {

@@ -2,13 +2,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::backend::BackendKind;
 use crate::cluster::spec::{ClusterSpec, DEFAULT_K3S_VERSION, ImageArch};
 use crate::error::{Error, Result};
 use crate::paths::{artifacts_root, config_root};
 use crate::process::CommandRunner;
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 const LIMA_ARTIFACT_DIR: &str = "node-image";
@@ -175,7 +176,11 @@ pub(crate) fn prepare_firecracker(
     spec: &ClusterSpec,
     runner: &dyn CommandRunner,
 ) -> Result<ResolvedFirecrackerArtifacts> {
-    ArtifactManagerConfig::from_env(spec, runner, true)?.resolve_firecracker(spec, runner)
+    let progress = Progress::spinner("Preparing Firecracker kernel and rootfs");
+    let artifacts =
+        ArtifactManagerConfig::from_env(spec, runner, true)?.resolve_firecracker(spec, runner)?;
+    progress.finish("Firecracker kernel and rootfs prepared");
+    Ok(artifacts)
 }
 
 fn resolve_lima_template(
@@ -373,6 +378,7 @@ fn read_manifest_url(
 
     fs::create_dir_all(cache_root).map_err(io_error("create_dir_all"))?;
     let destination = cache_root.join(FIRECRACKER_ARTIFACT_MANIFEST_FILENAME);
+    let progress = Progress::spinner("Downloading Firecracker artifact manifest");
     runner.run(
         "curl",
         &[
@@ -386,7 +392,9 @@ fn read_manifest_url(
             manifest_url.to_owned(),
         ],
     )?;
-    fs::read_to_string(destination).map_err(io_error("read_to_string"))
+    let content = fs::read_to_string(destination).map_err(io_error("read_to_string"))?;
+    progress.finish("Firecracker artifact manifest downloaded");
+    Ok(content)
 }
 
 fn detect_firecracker_runtime_info(runner: &dyn CommandRunner) -> Result<FirecrackerRuntimeInfo> {
@@ -782,7 +790,8 @@ pub(crate) fn fetch_into_cache(
 
     let temporary = destination.with_extension("download");
     let _ = fs::remove_file(&temporary);
-    info!(artifact = label, url, destination = %destination.display(), "fetching managed artifact");
+    debug!(artifact = label, url, destination = %destination.display(), "fetching managed artifact");
+    let progress = Progress::spinner(&format!("Downloading {label}"));
     runner.run(
         "curl",
         &[
@@ -804,6 +813,7 @@ pub(crate) fn fetch_into_cache(
         return Err(error);
     }
     fs::rename(&temporary, &destination).map_err(io_error("rename"))?;
+    progress.finish(&format!("{label} downloaded"));
     Ok(destination)
 }
 
@@ -832,6 +842,7 @@ fn maybe_materialize_rootfs(
     };
 
     fs::create_dir_all(request.cache_root).map_err(io_error("create_dir_all"))?;
+    let progress = Progress::spinner("Materializing Firecracker rootfs");
     let source = if candidate.parent() == Some(request.cache_root) {
         candidate.to_path_buf()
     } else {
@@ -879,6 +890,7 @@ fn maybe_materialize_rootfs(
         return Err(error);
     }
     fs::rename(&temporary, &output).map_err(io_error("rename"))?;
+    progress.finish("Firecracker rootfs materialized");
     Ok(output)
 }
 
@@ -888,8 +900,10 @@ pub(crate) fn verify_sha256(
     expected: &str,
     label: &str,
 ) -> Result<()> {
+    let progress = Progress::spinner(&format!("Verifying {label}"));
     let actual = file_sha256(runner, path)?;
     if actual.eq_ignore_ascii_case(expected) {
+        progress.finish(&format!("{label} verified"));
         Ok(())
     } else {
         Err(Error::InvalidArgs(format!(

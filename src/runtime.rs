@@ -10,6 +10,7 @@ use crate::backend::BackendKind;
 use crate::error::{Error, Result};
 use crate::paths::artifacts_root;
 use crate::process::CommandRunner;
+use crate::progress::Progress;
 
 pub(crate) const LIMA_VERSION: &str = "2.2.1";
 const HELM_VERSION: &str = "3.19.0";
@@ -138,13 +139,21 @@ pub fn prepare(runner: &dyn CommandRunner, backend: BackendKind, cilium: bool) -
         .map_err(io_error)?;
     lock.try_lock()
         .map_err(|error| invalid(format!("another runtime preparation is active: {error}")))?;
+    let tools = Progress::bar(
+        "Preparing runtime tools",
+        1 + u64::from(backend == BackendKind::Lima) + u64::from(cilium),
+    );
     if backend == BackendKind::Lima {
         prepare_tool(runner, &root, &lima_tool()?)?;
+        tools.inc(1);
     }
     prepare_tool(runner, &root, &crane_tool()?)?;
+    tools.inc(1);
     if cilium {
         prepare_tool(runner, &root, &helm_tool()?)?;
+        tools.inc(1);
     }
+    tools.finish("Runtime tools prepared");
     Ok(())
 }
 
@@ -153,6 +162,7 @@ fn prepare_tool(runner: &dyn CommandRunner, root: &Path, tool: &Tool) -> Result<
     if destination.join(&tool.executable).is_file() {
         return Ok(());
     }
+    let progress = Progress::spinner(&format!("Installing {} {}", tool.name, tool.version));
     let downloads = root
         .join("downloads")
         .join(format!("{}-{}", tool.name, tool.version));
@@ -209,7 +219,9 @@ fn prepare_tool(runner: &dyn CommandRunner, root: &Path, tool: &Tool) -> Result<
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
-    result
+    result?;
+    progress.finish(&format!("{} {} installed", tool.name, tool.version));
+    Ok(())
 }
 
 /// # Errors

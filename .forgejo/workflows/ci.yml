@@ -37,6 +37,10 @@ jobs:
           cargo --version
       - name: Format
         run: cargo fmt --all --check
+      - name: Check terminal harness formatting
+        run: |
+          python3 scripts/ci/progress_manifest.py /tmp/kalisto-progress-fmt
+          cargo fmt --manifest-path /tmp/kalisto-progress-fmt/Cargo.toml --all --check
 
   rust-clippy:
     runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
@@ -63,6 +67,13 @@ jobs:
       - name: Compile cache stats
         if: always()
         run: sccache --show-stats
+      - name: Upload resolved dependency lock
+        uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: resolved-dependencies
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
 
   rust-test:
     runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
@@ -86,6 +97,11 @@ jobs:
           git checkout -q FETCH_HEAD
       - name: Test
         run: cargo test -- --test-threads=1
+      - name: Test native terminal progress and plain output
+        run: |
+          python3 scripts/ci/progress_manifest.py /tmp/kalisto-progress-test
+          cargo test --manifest-path /tmp/kalisto-progress-test/Cargo.toml \
+            --test terminal-progress -- --nocapture --test-threads=1
 
   build-bin:
     runs-on: ${{ vars.KALISTO_LINUX_RUNNER }}
@@ -173,6 +189,9 @@ jobs:
           esac
           cd "$KALISTO_APPLE_WORKSPACE"
           cargo test --locked --release --lib runtime::tests -- --nocapture
+          python3 scripts/ci/progress_manifest.py "$KALISTO_APPLE_WORKSPACE/progress-check"
+          cargo test --manifest-path "$KALISTO_APPLE_WORKSPACE/progress-check/Cargo.toml" \
+            --test terminal-progress -- --nocapture --test-threads=1
           cargo test --locked --release --lib \
             apple_container::image::tests::loopback_import_serves_exact_manifest_and_layer_without_extracting -- --nocapture
           cargo test --locked --release --test macos_three_node_boot_budget \

@@ -59,7 +59,7 @@ fn real_main() -> Result<()> {
         .version(kalisto::version::build_version())
         .get_matches();
     let cli = Cli::from_clap(&matches);
-    telemetry::init(cli.log_level)?;
+    telemetry::init(cli.log_level, !cli.json)?;
     match cli.command {
         Command::Create(args) => run_create(args),
         Command::Pull(args) => run_pull(args),

@@ -28,6 +28,7 @@ use crate::config::load::load_project_config;
 use crate::error::{Error, Result};
 use crate::k3s::{NodeRole, ServerMode};
 use crate::process::{CommandRunner, SystemRunner, ensure_path_exists};
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 use crate::telemetry::raw_streams_enabled;
 
@@ -151,6 +152,7 @@ pub fn create(spec: &ClusterSpec) -> Result<CreateOutcome> {
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<CreateOutcome> {
+    let progress = Progress::spinner("Resolving cluster definition and cached assets");
     debug_feedback(format!(
         "create: resolving cluster spec for `{}` ({})",
         spec.name,
@@ -181,6 +183,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         resolved_spec.backend.as_str()
     ));
     backend.check_available(runner)?;
+    progress.set_message("Preparing cluster network definition");
 
     fs::create_dir_all(&state_root).map_err(io_error("create_dir_all"))?;
     fs::create_dir_all(&runtime_root).map_err(io_error("create_dir_all"))?;
@@ -223,6 +226,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         state_root.display()
     ));
     state.save(&state_root)?;
+    progress.set_message("Finalizing cluster definition");
     if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
         warn!(
             error = %error,
@@ -232,6 +236,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
         );
     }
 
+    progress.finish("Cluster definition created; nodes not started");
     Ok(CreateOutcome { state })
 }
 
@@ -240,6 +245,7 @@ pub fn create_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Res
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<UpOutcome> {
+    let progress = Progress::spinner("Loading cluster definition and cached boot assets");
     let state_root = ClusterSpec::state_root_for(&spec.name)?;
     let state_file = ClusterState::state_file(&state_root);
     if !state_file.exists() {
@@ -260,6 +266,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let state = ClusterState::load(&state_root)?;
     if cluster_has_running_nodes(runner, &state)? {
         info!(cluster = %state.name, "resuming existing cluster bring-up");
+        progress.set_message("Resuming existing cluster; rechecking startup readiness");
     }
     let resolved_spec = resolve_up_spec(&state, spec);
     let spec = &resolved_spec;
@@ -345,6 +352,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let mut started_instances = Vec::new();
     let cluster_started = Instant::now();
 
+    progress.set_message("Booting cluster nodes from prepared assets");
     // VM boot does not depend on the server join token. Start every VM now,
     // then join the already-booted agents once the control-plane API is ready.
     if let Err(error) = start_cluster_instances(
@@ -390,6 +398,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         server_mode: spec.server_mode,
         component_toggles: spec.component_toggles,
     };
+    progress.set_message("Bootstrapping control plane");
     info!(
         node = %control_plane.name,
         mode = ?spec.server_mode,
@@ -419,6 +428,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         format!("{}:k3s", control_plane.name),
     );
     info!(node = %control_plane.name, "waiting for control-plane kubeconfig and join token");
+    progress.set_message("Waiting for control-plane kubeconfig and join token");
     debug_feedback("up: waiting for control-plane kubeconfig and join token");
     if let Err(error) = sync_control_plane_artifact(
         backend,
@@ -467,6 +477,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     let initial_ready =
         initial_readiness_command(spec.server_mode, &control_plane_guest_kubeconfig);
     info!(node = %control_plane.name, "waiting for control-plane API in guest");
+    progress.set_message("Checking authenticated control-plane API in guest");
     debug_feedback("up: waiting for control-plane API in guest");
     if let Err(error) = wait_for_stable_guest_success_with_tail(
         backend,
@@ -501,6 +512,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         .to_owned();
     let server_url = format!("https://{control_plane_host}:6443");
     if !worker_instances.is_empty() {
+        progress.set_message("Starting worker agents with control-plane join token");
         info!(
             workers = worker_instances.len(),
             "bootstrapping workers with join token"
@@ -544,6 +556,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
                 .as_ref()
         )
     );
+    progress.set_message("Checking stable authenticated control-plane API");
     if let Err(error) = wait_for_stable_guest_success_with_tail(
         backend,
         runner,
@@ -570,6 +583,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
 
     let api_check = format!("https://{api_endpoint}/livez");
     info!(url = %api_check, "waiting for control-plane API on the host");
+    progress.set_message("Checking control-plane API access from host");
     debug_feedback(format!("up: waiting for control-plane API at {api_check}"));
     if let Err(error) = wait_for_host_http_with_tail(
         runner,
@@ -595,6 +609,7 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     );
     debug_feedback(format!("up: control-plane ready in {control_plane_ready}"));
 
+    progress.set_message("Deploying network and selected add-ons");
     if let Err(error) = install_addons_and_wait_for_nodes(
         PostReadyAddonRequest {
             backend,
@@ -622,26 +637,28 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         ));
     }
 
-    if state_root.join("archive/assets/manifest.json").is_file()
-        && let Err(error) = crate::archive::wait_for_fresh_nodes(
+    if state_root.join("archive/assets/manifest.json").is_file() {
+        progress.set_message("Waiting for restored nodes and cluster connectivity");
+        if let Err(error) = crate::archive::wait_for_fresh_nodes(
             backend,
             runner,
             &control_plane,
             &nodes,
             &control_plane_guest_kubeconfig,
-        )
-    {
-        return Err(rollback_failed_up(
-            backend,
-            runner,
-            &started_instances,
-            &state_root,
-            &runtime_root,
-            spec.keep_failed_runtime,
-            error,
-        ));
+        ) {
+            return Err(rollback_failed_up(
+                backend,
+                runner,
+                &started_instances,
+                &state_root,
+                &runtime_root,
+                spec.keep_failed_runtime,
+                error,
+            ));
+        }
     }
 
+    progress.set_message("Persisting cluster access and state");
     let persisted_kubeconfig = state_root.join("kubeconfig.yaml");
     let persisted_token = state_root.join("node-token");
     persist_kubeconfig(
@@ -715,6 +732,10 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         "cluster is ready"
     );
     debug_feedback(format!("up: cluster ready in {cluster_ready}"));
+    progress.finish(&format!(
+        "Cluster {} startup complete in {cluster_ready}",
+        state.name
+    ));
 
     Ok(UpOutcome {
         state,
@@ -763,6 +784,7 @@ fn start_cluster_instances(
     instances: &mut Vec<NodeState>,
 ) -> Result<()> {
     let mut plans = Vec::with_capacity(nodes.len());
+    let progress = Progress::bar("Booting cluster nodes", nodes.len() as u64);
     for node in nodes {
         fs::create_dir_all(&node.artifacts.root).map_err(io_error("create_dir_all"))?;
         let resources = match node.role {
@@ -794,7 +816,9 @@ fn start_cluster_instances(
         }
         for plan in plans {
             start_planned_instance(backend, runner, config, &plan)?;
+            progress.inc(1);
         }
+        progress.finish("All cluster VMs started; Kubernetes checks pending");
         return Ok(());
     };
     let runtime = TokioRuntimeBuilder::new_multi_thread()
@@ -813,28 +837,37 @@ fn start_cluster_instances(
         {
             let assets = assets.clone();
             let node = node.clone();
-            joins.push(tokio::task::spawn_blocking(move || {
-                assets
-                    .prepare_cilium_manifest(&system_runner, &node)
-                    .map(|_| ())
-            }));
+            joins.push((
+                false,
+                tokio::task::spawn_blocking(move || {
+                    assets
+                        .prepare_cilium_manifest(&system_runner, &node)
+                        .map(|_| ())
+                }),
+            ));
         }
         for plan in plans {
             let config = config.clone();
-            joins.push(tokio::task::spawn_blocking(move || {
-                start_planned_instance(backend, &system_runner, &config, &plan)
-            }));
+            joins.push((
+                true,
+                tokio::task::spawn_blocking(move || {
+                    start_planned_instance(backend, &system_runner, &config, &plan)
+                }),
+            ));
         }
         let mut first_error = None;
         // Drain every task before returning: cleanup must never race a VM
         // that is still being created by a sibling task.
-        for join in joins {
+        for (is_node, join) in joins {
             let result = match join.await {
                 Ok(result) => result,
                 Err(error) => Err(Error::InvalidArgs(format!(
                     "node start task failed: {error}"
                 ))),
             };
+            if result.is_ok() && is_node {
+                progress.inc(1);
+            }
             if let Err(error) = result
                 && first_error.is_none()
             {
@@ -845,7 +878,9 @@ fn start_cluster_instances(
             Some(error) => Err(error),
             None => Ok(()),
         }
-    })
+    })?;
+    progress.finish("All cluster VMs started; Kubernetes checks pending");
+    Ok(())
 }
 
 fn install_addons_and_wait_for_nodes(
@@ -862,7 +897,9 @@ fn install_addons_and_wait_for_nodes(
     if cni == CniPlugin::Cilium
         && let Some(assets) = prepared
     {
+        let progress = Progress::spinner("Deploying cached Cilium network and checking rollouts");
         assets.install_cilium(backend, runner, control_plane, guest_kubeconfig)?;
+        progress.finish("Cached Cilium network installation and readiness checks complete");
         request.cni = CniPlugin::None;
     }
     install_post_ready_addons(request)?;
@@ -870,7 +907,9 @@ fn install_addons_and_wait_for_nodes(
     // Agents must register before CNI installation, but cannot become Ready
     // until CNI is installed. This applies to Flannel as well as Cilium.
     if cni != CniPlugin::None && server_mode != ServerMode::Agentless {
+        let progress = Progress::bar("Checking node readiness after CNI", workers.len() as u64 + 1);
         for node in std::iter::once(control_plane).chain(workers.iter()) {
+            progress.set_message(&format!("Waiting for node {} readiness", node.name));
             info!(node = %node.name, "waiting for node readiness after CNI bootstrap");
             wait_for_node_ready(
                 backend,
@@ -881,7 +920,9 @@ fn install_addons_and_wait_for_nodes(
                 &node.name,
             )?;
             info!(node = %node.name, "node is ready");
+            progress.inc(1);
         }
+        progress.finish("All nodes passed readiness checks after CNI");
     }
     Ok(())
 }
@@ -1126,6 +1167,7 @@ fn scale_at_root(
     );
     let _scale_guard = scale_span.enter();
     info!("starting cluster scale");
+    let progress = Progress::spinner("Checking cluster for worker scale-up");
 
     if workers < state.worker_count {
         return Err(Error::InvalidArgs(format!(
@@ -1135,6 +1177,7 @@ fn scale_at_root(
     }
     if workers == state.worker_count {
         info!("requested worker count already matches cluster state");
+        progress.finish("Worker count already matches; no scaling performed");
         return Ok(ScaleOutcome {
             name: state.name,
             previous_workers: state.worker_count,
@@ -1244,9 +1287,11 @@ fn scale_at_root(
         .iter()
         .map(|worker| worker.name.clone())
         .collect::<Vec<_>>();
+    progress.set_message("Preparing network for additional workers");
     cleanup_scale_target_instances(backend, runner, &new_workers);
     backend.prepare_cluster_network(runner, &base_config, &new_worker_names)?;
 
+    progress.set_message("Booting and joining additional workers");
     if let Err(error) = start_and_join_workers(
         backend,
         runner,
@@ -1273,6 +1318,7 @@ fn scale_at_root(
         .iter()
         .map(|worker| worker.name.clone())
         .collect();
+    progress.set_message("Persisting scaled cluster state");
     state.worker_count = workers;
     state.save(state_root)?;
     if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root) {
@@ -1294,6 +1340,9 @@ fn scale_at_root(
             .join(", "),
         "cluster scale completed"
     );
+    progress.finish(&format!(
+        "Scale-up complete: {previous_workers} -> {workers} workers"
+    ));
 
     Ok(ScaleOutcome {
         name: state.name,
@@ -1352,6 +1401,10 @@ fn install_addon_at_root(
         metallb_config.validate()?;
     }
     validate_addon_install_allowed(&state, addon_id)?;
+    let progress = Progress::spinner(&format!(
+        "Checking cluster for add-on {}",
+        addon_id.as_str()
+    ));
     let runtime_root = state_root.join("runtime");
     let backend = backend_for(state.backend);
     let control_plane_state = state
@@ -1387,6 +1440,7 @@ fn install_addon_at_root(
         && state.cni_plugin == CniPlugin::Flannel
         && !state.component_toggles.flannel_backend_none
     {
+        progress.finish("Built-in Flannel already configured; no installation performed");
         return Ok(AddonInstallOutcome {
             cluster: state.name,
             addon: addon_id.as_str().to_owned(),
@@ -1404,6 +1458,7 @@ fn install_addon_at_root(
         desired_state_changed = true;
     }
 
+    progress.set_message(&format!("Installing add-on {}", addon_id.as_str()));
     install_catalog_addon_with_cilium_version(
         backend,
         runner,
@@ -1431,6 +1486,10 @@ fn install_addon_at_root(
             );
         }
     }
+    progress.finish(&format!(
+        "Add-on {} installation operation complete",
+        addon_id.as_str()
+    ));
 
     Ok(AddonInstallOutcome {
         cluster: state.name,
@@ -2020,15 +2079,35 @@ fn start_and_join_workers(
     instances: &mut Vec<NodeState>,
     wait_for_ready: bool,
 ) -> Result<()> {
+    let progress = (!worker_instances.is_empty()).then(|| {
+        Progress::bar(
+            if context.prestarted_at.is_some() {
+                "Starting agents on existing worker VMs"
+            } else {
+                "Booting and starting worker agents"
+            },
+            worker_instances.len() as u64,
+        )
+    });
+    let completed_message = if wait_for_ready {
+        "All workers passed readiness checks"
+    } else {
+        "Worker agents running; node readiness not yet checked"
+    };
     if let Some(system_runner) = runner.system_runner() {
-        return start_and_join_workers_parallel(
+        start_and_join_workers_parallel(
             backend,
             system_runner,
             context,
             worker_instances,
             instances,
             wait_for_ready,
-        );
+            progress.as_ref(),
+        )?;
+        if let Some(progress) = progress {
+            progress.finish(completed_message);
+        }
+        return Ok(());
     }
 
     let started_workers = if let Some(boot_started) = context.prestarted_at {
@@ -2052,6 +2131,8 @@ fn start_and_join_workers(
 
     for started_worker in started_workers {
         let worker = started_worker.node;
+        let worker_progress =
+            Progress::spinner(&format!("Starting worker join process on {}", worker.name));
         info!(node = %worker.name, "bootstrapping worker");
         bootstrap_worker(
             backend,
@@ -2064,8 +2145,10 @@ fn start_and_join_workers(
             },
         )?;
         info!(node = %worker.name, "waiting for worker process");
+        worker_progress.set_message(&format!("Waiting for worker {} process", worker.name));
         wait_for_worker_process(backend, runner, &worker.name, &worker.artifacts.root)?;
         if wait_for_ready {
+            worker_progress.set_message(&format!("Waiting for worker {} readiness", worker.name));
             info!(node = %worker.name, "waiting for worker readiness");
             wait_for_node_ready(
                 backend,
@@ -2081,6 +2164,21 @@ fn start_and_join_workers(
                 "worker is ready"
             );
         }
+        worker_progress.finish(&format!(
+            "Worker {} {}",
+            worker.name,
+            if wait_for_ready {
+                "passed readiness checks"
+            } else {
+                "process running; node readiness not yet checked"
+            }
+        ));
+        if let Some(progress) = &progress {
+            progress.inc(1);
+        }
+    }
+    if let Some(progress) = progress {
+        progress.finish(completed_message);
     }
 
     Ok(())
@@ -2094,6 +2192,7 @@ fn start_and_join_workers_parallel(
     worker_instances: &[Instance],
     instances: &mut Vec<NodeState>,
     wait_for_ready: bool,
+    progress: Option<&Progress>,
 ) -> Result<()> {
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
@@ -2171,6 +2270,9 @@ fn start_and_join_workers_parallel(
     let control_plane_guest_kubeconfig = context.control_plane_guest_kubeconfig.to_path_buf();
     let server_url = context.server_url.to_owned();
     let server_token = context.server_token.to_owned();
+    if let Some(progress) = progress {
+        progress.set_message("Starting worker agents and checking their processes");
+    }
 
     runtime.block_on(async move {
         let mut joins = Vec::with_capacity(started_workers.len());
@@ -2182,6 +2284,8 @@ fn start_and_join_workers_parallel(
             let server_token = server_token.clone();
             joins.push(tokio::task::spawn_blocking(move || -> Result<()> {
                 let worker = started_worker.node;
+                let worker_progress =
+                    Progress::spinner(&format!("Starting worker join process on {}", worker.name));
                 info!(node = %worker.name, "bootstrapping worker");
                 bootstrap_worker(
                     backend,
@@ -2194,8 +2298,11 @@ fn start_and_join_workers_parallel(
                     },
                 )?;
                 info!(node = %worker.name, "waiting for worker process");
+                worker_progress.set_message(&format!("Waiting for worker {} process", worker.name));
                 wait_for_worker_process(backend, &runner, &worker.name, &worker.artifacts.root)?;
                 if wait_for_ready {
+                    worker_progress
+                        .set_message(&format!("Waiting for worker {} readiness", worker.name));
                     info!(node = %worker.name, "waiting for worker readiness");
                     wait_for_node_ready(
                         backend,
@@ -2211,6 +2318,15 @@ fn start_and_join_workers_parallel(
                         "worker is ready"
                     );
                 }
+                worker_progress.finish(&format!(
+                    "Worker {} {}",
+                    worker.name,
+                    if wait_for_ready {
+                        "passed readiness checks"
+                    } else {
+                        "process running; node readiness not yet checked"
+                    }
+                ));
                 Ok(())
             }));
         }
@@ -2219,6 +2335,9 @@ fn start_and_join_workers_parallel(
             join.await.map_err(|error| {
                 Error::InvalidArgs(format!("worker bootstrap task failed: {error}"))
             })??;
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
         }
         Ok::<(), Error>(())
     })

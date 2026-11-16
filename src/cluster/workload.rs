@@ -7,6 +7,7 @@ use crate::cluster::state::ClusterState;
 use crate::error::{Error, Result};
 use crate::k3s::NodeRole;
 use crate::process::CommandRunner;
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 /// Reserved heredoc delimiter used to stream the manifest to guest kubectl.
@@ -43,6 +44,7 @@ pub fn apply_manifest(
         )));
     }
 
+    let progress = Progress::spinner("Checking control plane for workload apply");
     let state_root = require_cluster_state_root(name)?;
     let state = ClusterState::load(state_root.as_path())?;
     let backend = backend_for(state.backend);
@@ -79,12 +81,14 @@ pub fn apply_manifest(
         kubeconfig = shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()),
         delimiter = MANIFEST_HEREDOC_DELIMITER,
     );
+    progress.set_message("Applying workload manifest");
     let output = backend.guest_sudo_shell(
         runner,
         &control_plane.name,
         &control_plane.artifacts.root,
         &command,
     )?;
+    progress.finish("Workload manifest applied; readiness is managed by Kubernetes");
     Ok(ManifestApplyOutcome {
         cluster: state.name,
         node: control_plane.name,
