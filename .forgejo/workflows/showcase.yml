@@ -1,0 +1,117 @@
+name: Record Kalisto showcase
+
+on:
+  workflow_dispatch:
+
+# Serialize captures without interrupting a running scene or its owned cleanup.
+concurrency:
+  group: kalisto-showcase-native
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
+    timeout-minutes: 90
+    env:
+      KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
+      KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
+    steps:
+      - name: Establish owned external workspace and checkout exact dispatched source
+        run: |
+          set -eu
+          umask 077
+          storage=$(python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          try:
+              volume = Path(os.environ["KALISTO_MACOS_VOLUME"])
+              root = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"])
+              assert volume.is_absolute() and root.is_absolute()
+              volume = volume.resolve(strict=True)
+              root = root.resolve()
+              assert volume != Path("/") and os.path.ismount(volume)
+              assert root != volume and root.is_relative_to(volume)
+              root.mkdir(parents=True, exist_ok=True)
+              assert root.stat().st_dev == volume.stat().st_dev
+              print(root)
+          except Exception:
+              print("Configured external build volume is unavailable or unsafe", file=sys.stderr)
+              sys.exit(1)
+          PY
+          )
+          workspace=$(mktemp -d "$storage/kalisto-showcase.XXXXXX")
+          printf '%s\n' "$GITHUB_RUN_ID" > "$workspace/.showcase-owner"
+          mkdir -p "$workspace/tmp" "$workspace/private" "$workspace/data/kalisto" \
+            "$workspace/config" "$workspace/cache" "$storage/cargo-home" \
+            "$storage/release-rustup" "$storage/sccache" "$storage/showcase-target"
+          printf 'KALISTO_SHOWCASE_WORKSPACE=%s\n' "$workspace" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/showcase-target\nTMPDIR=%s/tmp\n' "$storage" "$workspace" >> "$GITHUB_ENV"
+          export TMPDIR="$workspace/tmp"
+          cd "$workspace"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          # Never persist or echo the job credential, even on a fetch failure.
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          if ! git -c credential.helper= fetch -q --depth=1 "$url" "$GITHUB_SHA" 2>/dev/null; then
+            echo 'Unable to fetch dispatched source' >&2
+            exit 1
+          fi
+          unset url
+          git checkout -q --detach "${GITHUB_SHA}^{commit}" 2>/dev/null
+          echo 'Owned external workspace and exact source are ready.'
+      - name: Verify capture privacy and timing preservation
+        run: |
+          set -eu
+          cd "$KALISTO_SHOWCASE_WORKSPACE"
+          python3 -m unittest discover -s scripts/demos -p 'test_*.py' -v
+      - name: Borrow unchanged installed tools and record four real use cases
+        run: |
+          set -eu
+          cd "$KALISTO_SHOWCASE_WORKSPACE"
+          python3 scripts/demos/capture.py
+      - name: Upload only the complete successful publication candidate inventory
+        uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: kalisto-showcase-${{ github.sha }}
+          path: |
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/start.cast
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/deploy.cast
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/resume.cast
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/scale.cast
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/app.yaml
+            ${{ env.KALISTO_SHOWCASE_WORKSPACE }}/public/provenance.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean only owned demo resources; retain failed captures privately
+        if: always()
+        env:
+          SHOWCASE_JOB_STATUS: ${{ job.status }}
+        run: |
+          set -eu
+          if [ -z "${KALISTO_SHOWCASE_WORKSPACE:-}" ]; then exit 0; fi
+          cd "$KALISTO_SHOWCASE_WORKSPACE"
+          # This also handles an interrupted recorder. No global destroy or engine stop.
+          if [ -f scripts/demos/capture.py ]; then
+            python3 scripts/demos/capture.py cleanup
+          fi
+          python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+          try:
+              work = Path(os.environ["KALISTO_SHOWCASE_WORKSPACE"]).resolve(strict=True)
+              root = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
+              assert work.parent == root and work.name.startswith("kalisto-showcase.")
+              assert (work / ".showcase-owner").read_text().strip() == os.environ["GITHUB_RUN_ID"]
+              if os.environ["SHOWCASE_JOB_STATUS"] == "success" and (work / "private/publishable").is_file():
+                  shutil.rmtree(work)
+                  print("Owned runtime and capture workspace removed; shared engine remains running.")
+              else:
+                  print("Failed capture evidence retained privately on external storage; nothing raw was uploaded.")
+          except Exception:
+              print("Owned workspace cleanup requires private runner inspection", file=sys.stderr)
+              sys.exit(1)
+          PY
