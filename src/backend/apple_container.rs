@@ -1031,13 +1031,32 @@ mod tests {
     #[cfg(unix)]
     mod shared_files {
         use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use crate::process::SystemRunner;
 
         use super::*;
 
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
         struct TemporaryRoot(PathBuf);
+
+        impl TemporaryRoot {
+            fn new() -> Self {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let counter = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir().join(format!(
+                    "kalisto-shared-file-{}-{nonce}-{counter}",
+                    std::process::id()
+                ));
+                fs::create_dir(&root).unwrap();
+                Self(root)
+            }
+        }
 
         impl Drop for TemporaryRoot {
             fn drop(&mut self) {
@@ -1065,16 +1084,7 @@ mod tests {
 
         #[test]
         fn symlinked_state_transfers_preserve_manifest_and_private_mode() {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "kalisto-shared-file-{}-{nonce}",
-                std::process::id()
-            ));
-            fs::create_dir(&root).unwrap();
-            let fixture = TemporaryRoot(root);
+            let fixture = TemporaryRoot::new();
             let mounted = fixture.0.join("mounted state");
             fs::create_dir(&mounted).unwrap();
             let mounted = mounted.canonicalize().unwrap();
@@ -1095,6 +1105,29 @@ mod tests {
             BACKEND
                 .copy_file_to_guest(&runner, "kalisto-demo-cp", &alias, &source, &destination)
                 .unwrap();
+
+            assert_eq!(fs::read(&destination).unwrap(), manifest);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn shared_permissions_accept_option_like_relative_filenames() {
+            let fixture = TemporaryRoot::new();
+            let relative = Path::new("-cilium's manifest.json");
+            let destination = fixture.0.join(relative);
+            let manifest = b"{\"kind\":\"List\",\"items\":[]}";
+            fs::write(&destination, manifest).unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+            let command = format!(
+                "cd '{}' && {}",
+                fixture.0.to_string_lossy().replace('\'', "'\"'\"'"),
+                shared_file_install_command(relative, relative)
+            );
+
+            SystemRunner.run("/bin/sh", &["-c".into(), command]).unwrap();
 
             assert_eq!(fs::read(&destination).unwrap(), manifest);
             assert_eq!(
