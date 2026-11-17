@@ -15,6 +15,7 @@ jobs:
     env:
       KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
       KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
+      KALISTO_SHOWCASE_BACKEND: apple-container
     steps:
       - name: Establish owned external workspace and checkout exact dispatched source
         run: |
@@ -49,6 +50,7 @@ jobs:
           ln -s "$storage/apple-container-ci/artifacts" "$workspace/data/kalisto/artifacts"
           printf 'KALISTO_SHOWCASE_WORKSPACE=%s\n' "$workspace" >> "$GITHUB_ENV"
           printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
+          printf 'KALISTO_SHOWCASE_BUILD_ROOT=%s\n' "$storage" >> "$GITHUB_ENV"
           printf 'CARGO_TARGET_DIR=%s/showcase-target\nTMPDIR=%s/tmp\n' "$storage" "$workspace" >> "$GITHUB_ENV"
           export TMPDIR="$workspace/tmp"
           cd "$workspace"
