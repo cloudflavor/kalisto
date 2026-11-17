@@ -200,6 +200,8 @@ jobs:
           python3 scripts/demos/capture.py
       - name: Upload only sanitized successful publication inventory
         uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        env:
+          NODE_EXTRA_CA_CERTS: ${{ env.KALISTO_LINUX_CA_BUNDLE }}
         with:
           name: kalisto-showcase-firecracker-${{ github.sha }}
           path: |
