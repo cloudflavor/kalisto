@@ -1127,7 +1127,9 @@ mod tests {
                 shared_file_install_command(relative, relative)
             );
 
-            SystemRunner.run("/bin/sh", &["-c".into(), command]).unwrap();
+            SystemRunner
+                .run("/bin/sh", &["-c".into(), command])
+                .unwrap();
 
             assert_eq!(fs::read(&destination).unwrap(), manifest);
             assert_eq!(
