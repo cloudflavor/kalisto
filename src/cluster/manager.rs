@@ -1,6 +1,7 @@
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tracing::{debug, info, info_span, warn};
@@ -1313,6 +1314,18 @@ fn scale_at_root(
         &mut state.nodes,
         state.cni_plugin != CniPlugin::None,
     ) {
+        if save_scale_failure_diagnostics(
+            state_root,
+            &state,
+            runner,
+            &control_plane,
+            &control_plane_guest_kubeconfig,
+            &new_workers,
+        )
+        .is_err()
+        {
+            warn!("could not save private scale failure diagnostics");
+        }
         cleanup_scale_target_instances(backend, runner, &new_workers);
         return Err(error);
     }
@@ -1353,6 +1366,126 @@ fn scale_at_root(
         current_workers: workers,
         added_workers,
     })
+}
+
+fn save_scale_failure_diagnostics(
+    state_root: &Path,
+    state: &ClusterState,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    kubeconfig: &Path,
+    workers: &[Instance],
+) -> Result<()> {
+    let backend = backend_for(state.backend);
+    let kubectl = format!(
+        "KUBECONFIG={} /usr/local/bin/k3s kubectl --request-timeout=5s",
+        shell_escape(&kubeconfig.display().to_string())
+    );
+    let workers = workers
+        .iter()
+        .map(|worker| {
+            let name = shell_escape(&worker.name);
+            let events = shell_escape(&format!(
+                "involvedObject.kind=Node,involvedObject.name={}",
+                worker.name
+            ));
+            let pods = shell_escape(&format!("spec.nodeName={}", worker.name));
+            let control_plane_query = |command: &str| {
+                private_diagnostic_output(backend.guest_sudo_shell(
+                    runner,
+                    &control_plane.name,
+                    &control_plane.artifacts.root,
+                    command,
+                ))
+            };
+            let conditions = control_plane_query(&format!(
+                "{kubectl} get node {name} -o jsonpath='{{.status.conditions}}'"
+            ));
+            let events = control_plane_query(&format!(
+                "{kubectl} get events -A --field-selector {events} -o json"
+            ));
+            // Describe includes only this worker's Cilium pod status and events,
+            // including init-container failures that block CNI readiness.
+            let cilium = control_plane_query(&format!(
+                "set -eu\n\
+                 pods=$({kubectl} -n kube-system get pods -l k8s-app=cilium \
+                 --field-selector {pods} -o name)\n\
+                 for pod in $pods; do {kubectl} -n kube-system describe \"$pod\"; done"
+            ));
+            let logs = backend
+                .guest_artifact_root(&worker.name, &worker.artifacts.root)
+                .and_then(|root| {
+                    backend.guest_sudo_shell(
+                        runner,
+                        &worker.name,
+                        &worker.artifacts.root,
+                        &format!(
+                            "for log in k3s.stdout.log k3s.stderr.log; do \
+                             printf '\\n=== %s ===\\n' \"$log\"; \
+                             tail -n 150 -- {}/\"$log\"; done",
+                            shell_escape(&root.display().to_string())
+                        ),
+                    )
+                });
+            serde_json::json!({
+                "name": worker.name,
+                "node_conditions": conditions,
+                "node_events": events,
+                "cilium_pods": cilium,
+                "k3s_logs": private_diagnostic_output(logs),
+            })
+        })
+        .collect::<Vec<_>>();
+    write_private_scale_snapshot(
+        &state_root.join("scale-failure.json"),
+        &serde_json::json!({
+            "version": 1,
+            "cluster": state.name,
+            "workers": workers,
+        }),
+    )
+}
+
+fn private_diagnostic_output(output: Result<crate::process::Output>) -> serde_json::Value {
+    match output {
+        Ok(output) => serde_json::json!({
+            "success": true, "stdout": output.stdout, "stderr": output.stderr,
+        }),
+        Err(Error::CommandFailed {
+            code,
+            stdout,
+            stderr,
+            ..
+        }) => serde_json::json!({
+            "success": false, "exit_code": code, "stdout": stdout, "stderr": stderr,
+        }),
+        // Do not serialize failed command argv, which can include join tokens.
+        Err(_) => serde_json::json!({ "success": false, "unavailable": true }),
+    }
+}
+
+fn write_private_scale_snapshot(path: &Path, snapshot: &serde_json::Value) -> Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::InvalidArgs(error.to_string()))?
+        .as_nanos();
+    let temporary = path.with_extension(format!("{nonce}.tmp"));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(io_error("create private scale snapshot"))?;
+    let result = (|| {
+        serde_json::to_writer(&mut file, snapshot)
+            .map_err(|error| Error::InvalidArgs(error.to_string()))?;
+        file.sync_all().map_err(io_error("sync private scale snapshot"))?;
+        fs::rename(&temporary, path).map_err(io_error("publish private scale snapshot"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn collect_node_log_sections(node: &NodeState) -> Result<Vec<NodeLogSection>> {
@@ -2643,6 +2776,54 @@ fn debug_feedback(message: impl AsRef<str>) {
 
 #[cfg(test)]
 mod tests {
+    mod scale_failure_diagnostics {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::error::Error;
+
+        #[test]
+        fn snapshot_replaces_existing_file_with_private_permissions() {
+            let root = std::env::temp_dir().join(format!(
+                "kalisto-private-scale-snapshot-{}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            let path = root.join("scale-failure.json");
+            fs::write(&path, "previous snapshot").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let snapshot = serde_json::json!({
+                "version": 1, "cluster": "test", "workers": [],
+            });
+
+            super::super::write_private_scale_snapshot(&path, &snapshot).unwrap();
+
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved, snapshot);
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn failed_diagnostic_keeps_output_without_command_arguments() {
+            let output = super::super::private_diagnostic_output(Err(Error::CommandFailed {
+                program: "ssh".to_owned(),
+                args: vec!["--token".to_owned(), "private-join-token".to_owned()],
+                code: Some(1),
+                stdout: "Ready=False".to_owned(),
+                stderr: "diagnostic failure".to_owned(),
+            }));
+
+            assert_eq!(output["success"], false);
+            assert_eq!(output["exit_code"], 1);
+            assert_eq!(output["stdout"], "Ready=False");
+            assert_eq!(output["stderr"], "diagnostic failure");
+            assert!(!output.to_string().contains("private-join-token"));
+        }
+    }
+
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;

@@ -89,6 +89,9 @@ def capture_node_diagnostics(work, env, label):
         return
     name = json.loads(marker.read_text())["name"]
     require(re.fullmatch(r"showcase-[0-9a-f]{16}", name), "Invalid owned diagnostic cluster")
+    scale_failure = work / "data/kalisto/clusters" / name / "scale-failure.json"
+    if scale_failure.is_file():
+        shutil.copy2(scale_failure, work / "private" / f"{label}-scale-failure.json")
     guest = (
         "ip -4 -o address show scope global; ip -4 -o route; "
         "openssl x509 -in /var/lib/rancher/k3s/agent/serving-kubelet.crt "

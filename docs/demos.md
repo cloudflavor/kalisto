@@ -140,6 +140,12 @@ never an artifact upload input. After private diagnosis, remove only that owned
 workspace once its cleanup succeeds; retention of failed workspaces is intentional
 and requires operator disk housekeeping.
 
+Scale failures save a mode-0600 `scale-failure.json` under cluster state before
+rolling back new workers. It contains only those workers' node conditions,
+events, Cilium pod diagnostics and bounded K3s logs, without serialized command
+arguments. The recorder copies it into `private/failure-scale-failure.json`
+before destroying its owned cluster. This snapshot is never a public artifact.
+
 ## Source-level reproduction
 
 The workflow is the supported recording/reproduction entrypoint. Its scripts are:
