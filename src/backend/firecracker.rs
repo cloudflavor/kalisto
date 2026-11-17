@@ -2238,7 +2238,10 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "kalisto-fc-pty-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             fs::create_dir(&root).unwrap();
             let root = Workspace(root);
