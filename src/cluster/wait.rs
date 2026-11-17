@@ -326,7 +326,10 @@ pub fn wait_for_node_ready(
             .as_ref(),
     );
     let node_name = shell_escape(&node.name);
-    let command = if backend.kind() == BackendKind::AppleContainer {
+    let command = if matches!(
+        backend.kind(),
+        BackendKind::AppleContainer | BackendKind::Firecracker
+    ) {
         // A persisted Ready condition can predate this boot and the agent's new
         // serving certificate. Check current identity and the actual kubelet route.
         let boot = backend.guest_shell(

@@ -575,6 +575,16 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
     );
     live.cli(&["down"], "down", maintenance);
     live.cli(&["up"], "restart", maintenance);
+    for node in nodes["items"].as_array().unwrap() {
+        let node_name = node["metadata"]["name"].as_str().unwrap();
+        let endpoint = format!("/api/v1/nodes/{node_name}/proxy/healthz");
+        let health = live.kubectl(
+            &["get", "--raw", &endpoint],
+            &format!("resumed-{node_name}-kubelet-health"),
+            maintenance,
+        );
+        assert_eq!(String::from_utf8(health).unwrap().trim(), "ok");
+    }
     assert_eq!(
         live.kubectl(
             &[
