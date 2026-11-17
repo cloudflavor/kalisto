@@ -119,7 +119,8 @@ jobs:
                   output.write(f"{key}={image}\n")
           PY
           # Install solely in this run's private prefix; no system or user tool replacement.
-          cargo install asciinema --version 3.2.1 --locked --root "$KALISTO_SHOWCASE_WORKSPACE/tools" \
+          cargo install --locked --git https://github.com/asciinema/asciinema \
+            --rev 70c4af0505fe1dbc7a2170392559d258bd4af92c --root "$KALISTO_SHOWCASE_WORKSPACE/tools" \
             > "$KALISTO_SHOWCASE_WORKSPACE/private/asciinema-install.log" 2>&1
           ln -s "$KALISTO_SHOWCASE_WORKSPACE/tools/bin/asciinema" "$KALISTO_SHOWCASE_WORKSPACE/bin/asciinema"
       - name: Verify capture privacy and timing preservation
