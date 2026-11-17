@@ -1479,7 +1479,8 @@ fn write_private_scale_snapshot(path: &Path, snapshot: &serde_json::Value) -> Re
     let result = (|| {
         serde_json::to_writer(&mut file, snapshot)
             .map_err(|error| Error::InvalidArgs(error.to_string()))?;
-        file.sync_all().map_err(io_error("sync private scale snapshot"))?;
+        file.sync_all()
+            .map_err(io_error("sync private scale snapshot"))?;
         fs::rename(&temporary, path).map_err(io_error("publish private scale snapshot"))
     })();
     if result.is_err() {
@@ -2798,7 +2799,10 @@ mod tests {
 
             super::super::write_private_scale_snapshot(&path, &snapshot).unwrap();
 
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved, snapshot);
