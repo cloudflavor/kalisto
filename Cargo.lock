@@ -749,6 +749,7 @@ dependencies = [
  "age",
  "flate2",
  "indicatif",
+ "libc",
  "rpassword",
  "ruzstd",
  "serde",

@@ -91,6 +91,9 @@ owned CI workspace, without replacing system or user tools. The recorder
 fingerprints pre-existing Firecracker processes and checks that they survive
 unchanged. Cleanup destroys only its marker-owned cluster and retains shared
 prepared assets.
+Firecracker VMs, the namespace anchor and slirp helper run in independent
+sessions with null stdin, so closing a recording or ordinary terminal does not
+stop the cluster. `down` and `destroy` retain explicit lifecycle ownership.
 
 `KALISTO_LINUX_CA_BUNDLE` optionally supplies an existing runner CA bundle for
 authenticated source checkout when the forge uses a private certificate chain.
