@@ -75,7 +75,7 @@ struct K3sCommandSpec<'a> {
     node: &'a Instance,
     tls_sans: &'a [String],
     join: Option<JoinConfig<'a>>,
-    dynamic_guest_addresses: bool,
+    node_ip: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,13 +120,16 @@ pub fn bootstrap_server(
             stderr: String::new(),
         });
     }
+    let node_ip = (backend.kind() == crate::backend::BackendKind::AppleContainer)
+        .then(|| backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root))
+        .transpose()?;
     let command = build_k3s_command(&K3sCommandSpec {
         config,
         artifact_dir: &artifact_dir,
         node: control_plane,
         tls_sans,
         join: None,
-        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
+        node_ip: node_ip.as_deref(),
     })?;
     progress.set_message(&format!("Starting k3s server on {}", control_plane.name));
     let output = launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)?;
@@ -160,13 +163,16 @@ pub fn bootstrap_worker(
             stderr: String::new(),
         });
     }
+    let node_ip = (backend.kind() == crate::backend::BackendKind::AppleContainer)
+        .then(|| backend.control_plane_host(&worker.name, &worker.artifacts.root))
+        .transpose()?;
     let command = build_k3s_command(&K3sCommandSpec {
         config,
         artifact_dir: &artifact_dir,
         node: worker,
         tls_sans: &[],
         join: Some(join),
-        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
+        node_ip: node_ip.as_deref(),
     })?;
     progress.set_message(&format!("Starting worker agent {}", worker.name));
     let output = launch_k3s_process(backend, runner, worker, &artifact_dir, &command)?;
@@ -427,8 +433,8 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
     match spec.node.role {
         NodeRole::ControlPlane => {
             args.push("server".to_owned());
-            if spec.dynamic_guest_addresses {
-                // The default CCM interval leaves resumed Apple nodes advertising old IPs.
+            if spec.node_ip.is_some() {
+                // Freshness checks below must observe the CCM publishing the new guest IP.
                 args.push(
                     "--kube-cloud-controller-manager-arg=node-status-update-frequency=5s"
                         .to_owned(),
@@ -495,6 +501,12 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
             args.push("--token".to_owned());
             args.push(join.token.to_owned());
         }
+    }
+    if let Some(node_ip) = spec.node_ip {
+        // Use the address inspected after this boot for both node registration and
+        // K3s's serving-kubelet CSR; retain its CA, node password and private key.
+        args.push("--node-ip".to_owned());
+        args.push(node_ip.to_owned());
     }
     args.push("--prefer-bundled-bin".to_owned());
     args.push("--kubelet-arg".to_owned());
@@ -572,7 +584,7 @@ mod tests {
             artifact_dir: Path::new("/tmp/kalisto-w0-test"),
             node: &worker,
             tls_sans: &[],
-            dynamic_guest_addresses: false,
+            node_ip: Some("192.168.88.6"),
             join: Some(super::JoinConfig {
                 server_url: "https://cp.example.test:6443",
                 token: "secret",
@@ -585,6 +597,7 @@ mod tests {
         assert!(command.contains("secret"));
         assert!(command.contains("--kubelet-arg"));
         assert!(command.contains("resolv-conf=/etc/kalisto/kubelet-resolv.conf"));
+        assert!(command.contains("'--node-ip' '192.168.88.6'"));
     }
 
     #[test]
@@ -606,13 +619,14 @@ mod tests {
             node: &control_plane,
             tls_sans: &[],
             join: None,
-            dynamic_guest_addresses: false,
+            node_ip: Some("192.168.88.7"),
         })
         .unwrap();
 
         assert!(!command.contains("--node-taint"));
         assert!(command.contains("--kubelet-arg"));
         assert!(command.contains("resolv-conf=/etc/kalisto/kubelet-resolv.conf"));
+        assert!(command.contains("'--node-ip' '192.168.88.7'"));
     }
 
     #[test]

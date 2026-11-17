@@ -3,8 +3,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -164,10 +166,7 @@ impl ClusterBackend for FirecrackerBackend {
         child.stdout(Stdio::from(stdout_file));
         child.stderr(Stdio::from(stderr_file));
 
-        let mut child = child.spawn().map_err(|source| Error::CommandIo {
-            program: "firecracker".to_owned(),
-            source,
-        })?;
+        let mut child = spawn_background_process(&mut child, "firecracker")?;
 
         write_file(&runtime.pid, &format!("{}\n", child.id()))?;
         write_file(&runtime.guest_ip, &format!("{}\n", net.guest_ip))?;
@@ -787,16 +786,13 @@ fn ensure_rootless_cluster_network(
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&socket_path_file);
 
-    let anchor_child = Command::new("unshare")
+    let mut anchor = Command::new("unshare");
+    anchor
         .args(["--user", "--map-root-user", "--net", "--fork", "sh", "-lc"])
         .arg("trap : TERM INT; while :; do sleep 3600; done")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| Error::CommandIo {
-            program: "unshare".to_owned(),
-            source,
-        })?;
+        .stderr(Stdio::null());
+    let anchor_child = spawn_background_process(&mut anchor, "unshare")?;
     let anchor_pid = anchor_child.id();
     write_file(&anchor_path, &format!("{anchor_pid}\n"))?;
     wait_for_rootless_anchor_ready(runner, anchor_pid)?;
@@ -822,10 +818,7 @@ fn ensure_rootless_cluster_network(
         .arg(ROOTLESS_SLIRP_TAP_NAME)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file));
-    let mut slirp_child = slirp.spawn().map_err(|source| Error::CommandIo {
-        program: "slirp4netns".to_owned(),
-        source,
-    })?;
+    let mut slirp_child = spawn_background_process(&mut slirp, "slirp4netns")?;
     wait_for_slirp_ready(&mut slirp_child, &socket_path, &stderr_log)?;
     write_file(&slirp_path, &format!("{}\n", slirp_child.id()))?;
 
@@ -1212,6 +1205,23 @@ fn build_config_json(
         }],
     })
     .to_string()
+}
+
+/// Cluster processes outlive the CLI and its terminal, including recorder PTYs.
+fn spawn_background_process(command: &mut Command, program: &'static str) -> Result<Child> {
+    command.stdin(Stdio::null());
+    #[cfg(target_os = "linux")]
+    // SAFETY: setsid is async-signal-safe and the hook accesses no shared state
+    // or allocator between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map_err(io_error(program))
 }
 
 fn firecracker_command(
@@ -2138,6 +2148,179 @@ mod tests {
     }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    mod process_lifetime {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::os::unix::process::CommandExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        struct OwnedChild(Child);
+
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        struct Workspace(PathBuf);
+
+        impl Drop for Workspace {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn deadline_stream(stream: &UnixStream) {
+            let timeout = Some(Duration::from_secs(5));
+            stream.set_read_timeout(timeout).unwrap();
+            stream.set_write_timeout(timeout).unwrap();
+        }
+
+        fn launcher(socket: &Path) {
+            let mut parent = UnixStream::connect(socket).unwrap();
+            deadline_stream(&parent);
+            let (mut channel, child_channel) = UnixStream::pair().unwrap();
+            deadline_stream(&channel);
+            let descriptor = child_channel.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf ready >&3; read -r token <&3; printf survived >&3",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: these async-signal-safe calls only prepare this child's
+            // IPC descriptor and restore the default hangup disposition.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(descriptor, 3) == -1
+                        || libc::fcntl(3, libc::F_SETFD, 0) == -1
+                        || libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = OwnedChild(
+                super::super::spawn_background_process(&mut command, "/bin/sh").unwrap(),
+            );
+            drop(child_channel);
+            let mut ready = [0; 5];
+            channel.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
+            parent.write_all(&ready).unwrap();
+            let mut closed = [0; 1];
+            parent.read_exact(&mut closed).unwrap();
+            channel.write_all(b"go\n").unwrap();
+            let mut survived = [0; 8];
+            channel.read_exact(&mut survived).unwrap();
+            assert_eq!(&survived, b"survived");
+            assert!(child.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn background_process_survives_launching_pty_close() {
+            const SOCKET_ENV: &str = "KALISTO_FIRECRACKER_PTY_TEST_SOCKET";
+            if let Some(socket) = std::env::var_os(SOCKET_ENV) {
+                launcher(Path::new(&socket));
+                return;
+            }
+            let root = std::env::temp_dir().join(format!(
+                "kalisto-fc-pty-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            let root = Workspace(root);
+            let socket = root.0.join("ipc.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (mut master, mut slave) = (-1, -1);
+            // SAFETY: openpty initializes two owned descriptors on success;
+            // the optional name, termios and window-size pointers are null.
+            let result = unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: each descriptor is valid and transferred exactly once.
+            let master = unsafe { fs::File::from_raw_fd(master) };
+            // SAFETY: the slave descriptor is distinct from the master.
+            let slave = unsafe { fs::File::from_raw_fd(slave) };
+            // The launcher must not inherit another master descriptor, or the
+            // parent's close would not actually hang up the terminal.
+            for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+                // SAFETY: both descriptors are live and owned in this scope.
+                assert_ne!(
+                    unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    -1,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "backend::firecracker::tests::process_lifetime::background_process_survives_launching_pty_close",
+                    "--nocapture",
+                ])
+                .env(SOCKET_ENV, &socket)
+                .stdin(Stdio::from(slave));
+            // SAFETY: only async-signal-safe session, terminal and signal
+            // operations run after fork. The launcher ignores HUP so it can
+            // observe its child after the parent closes the PTY.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1
+                        || libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = OwnedChild(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut channel = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(child.0.try_wait().unwrap().is_none(), "launcher exited");
+                        assert!(Instant::now() < deadline, "launcher did not connect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept launcher IPC: {error}"),
+                }
+            };
+            deadline_stream(&channel);
+            let mut ready = [0; 5];
+            channel.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
+            drop(master);
+            channel.write_all(b"x").unwrap();
+            assert!(child.0.wait().unwrap().success());
+        }
+    }
 
     #[test]
     fn firecracker_config_contains_required_sections() {

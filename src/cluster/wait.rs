@@ -4,7 +4,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crate::backend::ClusterBackend;
+use crate::backend::{BackendKind, ClusterBackend};
+use crate::cluster::node::Instance;
 use crate::error::{Error, Result};
 use crate::process::{CommandRunner, Output};
 use crate::shell::shell_escape;
@@ -316,18 +317,57 @@ pub fn wait_for_node_ready(
     control_plane_name: &str,
     control_plane_runtime_root: &Path,
     control_plane_kubeconfig: &Path,
-    worker_name: &str,
+    node: &Instance,
 ) -> Result<Output> {
-    let command = format!(
-        "KUBECONFIG={} /usr/local/bin/k3s kubectl get node {} -o jsonpath='{{range .status.conditions[*]}}{{.type}}={{.status}}{{\"\\n\"}}{{end}}' | grep -Fx 'Ready=True'",
-        shell_escape(
-            control_plane_kubeconfig
-                .as_os_str()
-                .to_string_lossy()
-                .as_ref()
-        ),
-        shell_escape(worker_name),
+    let kubeconfig = shell_escape(
+        control_plane_kubeconfig
+            .as_os_str()
+            .to_string_lossy()
+            .as_ref(),
     );
+    let node_name = shell_escape(&node.name);
+    let command = if matches!(
+        backend.kind(),
+        BackendKind::AppleContainer | BackendKind::Firecracker
+    ) {
+        // A persisted Ready condition can predate this boot and the agent's new
+        // serving certificate. Check current identity and the actual kubelet route.
+        let boot = backend.guest_shell(
+            runner,
+            &node.name,
+            &node.artifacts.root,
+            "cat /proc/sys/kernel/random/boot_id",
+        )?;
+        let ip = backend.control_plane_host(&node.name, &node.artifacts.root)?;
+        let boot = shell_escape(&format!("bootID={}", boot.stdout.trim()));
+        let ip = shell_escape(&format!("InternalIP={ip}"));
+        let endpoint = shell_escape(&format!("/api/v1/nodes/{}/proxy/healthz", node.name));
+        format!(
+            concat!(
+                "set -eu\n",
+                "status=$(KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl ",
+                "--request-timeout=5s get node {node_name} -o jsonpath='",
+                "{{range .status.conditions[*]}}{{.type}}={{.status}}{{\"\\n\"}}{{end}}",
+                "bootID={{.status.nodeInfo.bootID}}{{\"\\n\"}}",
+                "{{range .status.addresses[?(@.type==\"InternalIP\")]}}",
+                "InternalIP={{.address}}{{\"\\n\"}}{{end}}')\n",
+                "printf '%s\\n' \"$status\" | grep -Fx 'Ready=True'\n",
+                "printf '%s\\n' \"$status\" | grep -Fx {boot}\n",
+                "printf '%s\\n' \"$status\" | grep -Fx {ip}\n",
+                "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl ",
+                "--request-timeout=5s get --raw={endpoint} | grep -Fx ok"
+            ),
+            kubeconfig = kubeconfig,
+            node_name = node_name,
+            boot = boot,
+            ip = ip,
+            endpoint = endpoint,
+        )
+    } else {
+        format!(
+            "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl get node {node_name} -o jsonpath='{{range .status.conditions[*]}}{{.type}}={{.status}}{{\"\\n\"}}{{end}}' | grep -Fx 'Ready=True'",
+        )
+    };
     wait_for_stable_guest_success(
         backend,
         runner,

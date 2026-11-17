@@ -110,8 +110,7 @@ def http_response():
 
 def main():
     name = os.environ["DEMO_CLUSTER"]
-    profile = ["--name", name, "--backend", "apple-container", "--workers", "2",
-               "--addons", "cni/cilium", "--api-port", os.environ["DEMO_API_PORT"]]
+    profile = json.loads(os.environ["DEMO_PROFILE_JSON"])
     scene = sys.argv[1]
     print("# Scripted execution; every command runs against this job's owned cluster.", flush=True)
     if scene == "start":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native CI-only showcase capture, ownership checks and narrow publication gate."""
+"""Native CI showcase capture, ownership checks and narrow publication gate."""
 import bisect
 import datetime
 import getpass
@@ -32,11 +32,22 @@ def require(condition, message):
         raise CaptureError(message)
 
 
+def backend():
+    selected = os.environ.get("KALISTO_SHOWCASE_BACKEND", "apple-container")
+    require(selected in ("apple-container", "firecracker"), "Unsupported showcase backend")
+    return selected
+
+
+def build_root():
+    value = os.environ.get("KALISTO_SHOWCASE_BUILD_ROOT") or os.environ["KALISTO_MACOS_BUILD_ROOT"]
+    return Path(value).resolve(strict=True)
+
+
 def workspace():
-    root = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
+    root = build_root()
     work = Path(os.environ["KALISTO_SHOWCASE_WORKSPACE"]).resolve(strict=True)
     require(work.parent == root and work.name.startswith("kalisto-showcase."),
-            "Refusing a workspace outside the owned external root")
+            "Refusing a workspace outside the owned build root")
     require((work / ".showcase-owner").read_text().strip() == os.environ["GITHUB_RUN_ID"],
             "Workspace ownership does not match this CI run")
     return work
@@ -49,12 +60,15 @@ def environment(work):
     require(cargo is not None, "The native runner's existing Rust toolchain is required")
     keys = ("HOME", "CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR", "SCCACHE_DIR")
     env = {k: os.environ[k] for k in keys if k in os.environ}
-    env.update(PATH=f"{work}/bin:{Path(cargo).parent}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    env.update(PATH=f"{work}/bin:{Path(cargo).parent}:{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                TMPDIR=str(work / "tmp"), XDG_DATA_HOME=str(work / "data"),
                XDG_CONFIG_HOME=str(work / "config"), XDG_CACHE_HOME=str(work / "cache"),
                ASCIINEMA_CONFIG_HOME=str(work / "config/asciinema"),
-               SHELL="/bin/sh", TERM="xterm-256color", LC_ALL="C", NO_COLOR="1",
-               RUST_LOG="info", DEMO_PRIVATE=str(work / "private"))
+               SHELL="/bin/sh", TERM="xterm-256color", LC_ALL="C.UTF-8" if backend() == "firecracker" else "en_US.UTF-8",
+               DEMO_PRIVATE=str(work / "private"))
+    for key in ("KALISTO_FIRECRACKER_KERNEL", "KALISTO_FIRECRACKER_ROOTFS"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     return env
 
 
@@ -75,6 +89,9 @@ def capture_node_diagnostics(work, env, label):
         return
     name = json.loads(marker.read_text())["name"]
     require(re.fullmatch(r"showcase-[0-9a-f]{16}", name), "Invalid owned diagnostic cluster")
+    scale_failure = work / "data/kalisto/clusters" / name / "scale-failure.json"
+    if scale_failure.is_file():
+        shutil.copy2(scale_failure, work / "private" / f"{label}-scale-failure.json")
     guest = (
         "ip -4 -o address show scope global; ip -4 -o route; "
         "openssl x509 -in /var/lib/rancher/k3s/agent/serving-kubelet.crt "
@@ -83,9 +100,10 @@ def capture_node_diagnostics(work, env, label):
         "find /var/lib/rancher/k3s -maxdepth 2 -type d -name 'tls-*'"
     )
     commands = [("nodes", ["kalisto", "kubectl", "--name", name, "--", "get", "nodes", "-o", "wide"])]
-    commands.extend((suffix, ["/opt/homebrew/bin/container", "exec", "--user", "root",
-                             f"kalisto-{name}-{suffix}", "/bin/sh", "-lc", guest])
-                    for suffix in ("cp", "w0", "w1"))
+    if backend() == "apple-container":
+        commands.extend((suffix, ["/opt/homebrew/bin/container", "exec", "--uid", "0", "--gid", "0",
+                                 f"kalisto-{name}-{suffix}", "/bin/sh", "-lc", guest])
+                        for suffix in ("cp", "w0", "w1"))
     for suffix, args in commands:
         target = work / "private" / f"{label}-{suffix}.log"
         try:
@@ -97,6 +115,12 @@ def capture_node_diagnostics(work, env, label):
 
 
 def engine_snapshot(env):
+    if backend() == "firecracker":
+        result = subprocess.run(["ps", "-C", "firecracker", "-o", "pid=,lstart=,args="],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        require(result.returncode in (0, 1), "Cannot inspect existing Firecracker processes")
+        processes = dict(line.strip().split(None, 1) for line in result.stdout.decode().splitlines())
+        return {"backend": "firecracker", "processes": processes}
     executable = shutil.which("container", path=env["PATH"])
     require(executable is not None, "Installed Homebrew container is required")
     executable = Path(executable).resolve(strict=True)
@@ -150,6 +174,11 @@ def engine_snapshot(env):
 
 
 def verify_borrowed(work, env, before):
+    if before.get("backend") == "firecracker":
+        after = engine_snapshot(env)["processes"]
+        require(all(after.get(pid) == identity for pid, identity in before["processes"].items()),
+                "An existing Firecracker process changed during the showcase")
+        return
     require(engine_snapshot(env) == before, "Borrowed daemon identity or configuration changed")
     selection_path = work / "data/kalisto/apple-container/selection.json"
     if selection_path.exists():
@@ -162,6 +191,10 @@ def verify_borrowed(work, env, before):
 
 def collision_check(name, env):
     prefix = "kalisto-" + name
+    if backend() == "firecracker":
+        require(prefix not in json.dumps(engine_snapshot(env)),
+                "Owned cluster name collides with an existing Firecracker process")
+        return
     for args in (["container", "list", "--all", "--format", "json"],
                  ["container", "network", "list", "--format", "json"]):
         resources = json.loads(execute(args, env))
@@ -282,8 +315,12 @@ def publish_cast(raw, target, scene, replacements, forbidden):
 
 
 def record(work, env):
-    require(platform.system() == "Darwin" and platform.machine() == "arm64",
-            "Showcase capture requires native macOS arm64 CI")
+    selected_backend = backend()
+    expected = ("Darwin", "arm64") if selected_backend == "apple-container" else ("Linux", "x86_64")
+    require((platform.system(), platform.machine()) == expected,
+            "Showcase capture requires the native host for the selected backend")
+    if selected_backend == "firecracker":
+        require(os.access("/dev/kvm", os.R_OK | os.W_OK), "The runner requires KVM access")
     require(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch",
             "Recording is allowed only in an explicitly dispatched native CI job")
     private, demo, public = (work / name for name in ("private", "demo", "public"))
@@ -300,7 +337,7 @@ def record(work, env):
         if key in os.environ:
             preparation_env[key] = os.environ[key]
     artifacts = (work / "data/kalisto/artifacts").resolve(strict=True)
-    storage = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
+    storage = build_root()
     require(artifacts.is_relative_to(storage) and artifacts.stat().st_dev == work.stat().st_dev,
             "Prepared cache must stay on configured external storage")
     before = engine_snapshot(env)
@@ -322,8 +359,15 @@ def record(work, env):
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         env["DEMO_API_PORT"] = str(reservation.getsockname()[1])
-        profile = ["--name", name, "--backend", "apple-container", "--workers", "2", "--addons", "cni/cilium",
+        profile = ["--name", name, "--backend", selected_backend, "--workers", "2", "--addons", "cni/cilium",
                    "--api-port", env["DEMO_API_PORT"]]
+        if selected_backend == "firecracker":
+            for key, flag in (("KALISTO_FIRECRACKER_KERNEL", "--firecracker-kernel"),
+                              ("KALISTO_FIRECRACKER_ROOTFS", "--firecracker-rootfs")):
+                artifact = Path(env[key]).resolve(strict=True)
+                require(artifact.is_file(), "The configured Firecracker artifact must be a file")
+                profile.extend((flag, str(artifact)))
+        env["DEMO_PROFILE_JSON"] = json.dumps(profile)
         print("Preparing images and managed tools outside recorded scenes.", flush=True)
         prepared = execute(["kalisto", "pull", *profile], preparation_env, cwd=demo, log=private / "pull.log")
         require(not (work / "data/kalisto/clusters" / name).exists(), "Preparation must not create cluster state")
@@ -352,8 +396,11 @@ def record(work, env):
     # Destruction and daemon checks are part of success, before any distributable output.
     cleanup(work, env)
     replacements = {str(work): "<demo-workspace>",
-                    str(Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve()): "<build-storage>",
+                    str(storage): "<build-storage>",
                     str(Path(env["HOME"]).resolve()): "<runner-home>"}
+    if selected_backend == "firecracker":
+        replacements.update({str(Path(env["KALISTO_FIRECRACKER_KERNEL"]).resolve()): "<firecracker-kernel>",
+                             str(Path(env["KALISTO_FIRECRACKER_ROOTFS"]).resolve()): "<firecracker-rootfs>"})
     username = getpass.getuser()
     hostname = socket.gethostname()
     # Machine identity remaining outside those exact path-prefix replacements
@@ -369,16 +416,26 @@ def record(work, env):
             recordings.append(publish_cast(private / (scene + ".cast"), public / (scene + ".cast"),
                                            scene, replacements, forbidden))
         (public / "app.yaml").write_text(fixture)
-        provenance = {"schema_version": 1, "source_commit": commit, "backend": "apple-container",
-                      "platform": "macos-arm64", "cli_version": cli_version, "asciinema_version": recorder_version,
+        provenance = {"schema_version": 1, "source_commit": commit, "backend": selected_backend,
+                      "platform": "macos-arm64" if selected_backend == "apple-container" else "linux-amd64",
+                      "cli_version": cli_version, "asciinema_version": recorder_version,
                       "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                       "preparation_included": False, "timing": "original",
                       "execution": "scripted prompts with real commands and assertions",
                       "fixture_image": image[1], "fixture_sha256": hashlib.sha256(fixture.encode()).hexdigest(),
-                      "redactions": ["Exact owned workspace prefix -> <demo-workspace>; exact external build-root prefix -> <build-storage>; exact runner HOME prefix -> <runner-home>. No other output substitutions.",
+                      "redactions": ["Exact workspace, build-root and HOME prefixes are replaced with public labels. Explicit Firecracker artifact filenames are replaced with <firecracker-kernel> and <firecracker-rootfs>.",
                                      "Header rebuilt with original version/dimensions/timestamp and fixed public title, relative command and TERM/SHELL only; incidental environment and idle-limit metadata omitted.",
                                      "All output events retained in original order with unchanged timestamps, including events emptied by a path replacement spanning PTY chunks."],
                       "recordings": recordings}
+        if selected_backend == "firecracker":
+            kernel = json.loads((private / "kernel-build.json").read_text())
+            hashes = ("source_sha256", "fragment_sha256", "kernel_sha256", "config_sha256")
+            require(all(re.fullmatch(r"[0-9a-f]{64}", kernel[field]) for field in hashes),
+                    "Kernel provenance must contain actual build hashes")
+            require(kernel["required_builtin"] == "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y",
+                    "The recorded kernel must support multi-endpoint Services")
+            provenance["kernel"] = {field: kernel[field] for field in
+                                    ("kernel_version", "required_builtin", *hashes)}
         privacy_gate(json.dumps(provenance), forbidden)
         (public / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     except BaseException:

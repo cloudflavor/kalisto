@@ -262,6 +262,81 @@ fn preserve_logs(source: &Path, destination: &Path) {
     }
 }
 
+fn prepare_multi_endpoint_scale_service(
+    live: &LiveCluster,
+    workers: &[&str],
+    image: &str,
+    deadline: Instant,
+) {
+    assert_eq!(workers.len(), 2);
+    let mut items = workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| {
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": format!("budget-scale-http-{index}"),
+                    "labels": {"app": "budget-scale-http"},
+                },
+                "spec": {
+                    "nodeName": worker,
+                    "containers": [{
+                        "name": "http", "image": image, "imagePullPolicy": "Never",
+                        "command": ["sh", "-c", "mkdir -p /www; printf 'scale-ready\\n' >/www/index.html; exec httpd -f -p 8080 -h /www"],
+                        "readinessProbe": {
+                            "httpGet": {"path": "/", "port": 8080}, "periodSeconds": 1,
+                        },
+                    }],
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    items.push(json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "budget-scale-http"},
+        "spec": {
+            "selector": {"app": "budget-scale-http"},
+            "ports": [{"port": 8080, "targetPort": 8080}],
+        },
+    }));
+    let path = live.evidence.join("scale-service.json");
+    fs::write(
+        &path,
+        json!({"apiVersion": "v1", "kind": "List", "items": items}).to_string(),
+    )
+    .unwrap();
+    live.cli(
+        &["apply", "--manifest", path.to_str().unwrap()],
+        "apply-scale-service",
+        deadline,
+    );
+    live.kubectl(
+        &[
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            "-l",
+            "app=budget-scale-http",
+            "--timeout=60s",
+        ],
+        "scale-service-pods-ready",
+        deadline,
+    );
+    // A single endpoint never exercises kube-proxy's statistic match. The
+    // additional worker must boot with a multi-endpoint Service already present.
+    live.kubectl(
+        &[
+            "wait",
+            "--for=jsonpath={.subsets[0].addresses[1].ip}",
+            "endpoints/budget-scale-http",
+            "--timeout=60s",
+        ],
+        "scale-service-two-ready-endpoints",
+        deadline,
+    );
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one cold-start deadline covers the complete CLI lifecycle scenario"
@@ -500,6 +575,16 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
     );
     live.cli(&["down"], "down", maintenance);
     live.cli(&["up"], "restart", maintenance);
+    for node in nodes["items"].as_array().unwrap() {
+        let node_name = node["metadata"]["name"].as_str().unwrap();
+        let endpoint = format!("/api/v1/nodes/{node_name}/proxy/healthz");
+        let health = live.kubectl(
+            &["get", "--raw", &endpoint],
+            &format!("resumed-{node_name}-kubelet-health"),
+            maintenance,
+        );
+        assert_eq!(String::from_utf8(health).unwrap().trim(), "ok");
+    }
     assert_eq!(
         live.kubectl(
             &[
@@ -514,6 +599,7 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
         ),
         b"persisted"
     );
+    prepare_multi_endpoint_scale_service(&live, &workers, probe_image, maintenance);
     live.cli(&["scale", "--workers", "3"], "scale", maintenance);
     live.nodes(4, "scaled-nodes", maintenance);
 }

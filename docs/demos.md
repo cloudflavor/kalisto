@@ -1,29 +1,32 @@
 # Genuine Kalisto use-case recordings
 
-These four recordings are scripted executions of the actual Kalisto CLI on native
-macOS arm64 CI, not typed interactive sessions or synthesized terminal output.
-Printed `$` prompts show the exact command arguments being executed. Preparation,
-source compilation, engine-ownership checks, and cleanup are outside the recordings.
-Read-only scene assertions keep their JSON output private but remain on the recorded clock.
-The clips demonstrate use cases; they do **not** replace the stronger cold-boot,
-functional Cilium/DNS/cross-node HTTP performance acceptance test in
-`tests/macos_three_node_boot_budget.rs`, and make no sixty-second claim.
+These eight recordings execute the actual Kalisto CLI: four scenes on native
+Apple-silicon macOS with Apple container, and four on native x86_64 Linux with
+Firecracker. They are scripted real sessions, not synthesized terminal output.
+Printed `$` prompts show the executed arguments. Interactive progress graphics
+remain enabled in the recorded PTY; `CI`, explicit logging overrides and
+`NO_COLOR` are not passed to scenes. Preparation, source compilation, ownership
+checks and cleanup are outside the recordings; genuine read-only assertions stay
+on the clock. These use cases do not replace either backend's cold-boot,
+functional Cilium/DNS/cross-node HTTP acceptance test or make a sixty-second claim.
 
 ## Scenarios
 
 | Recording | Actual behavior checked |
 | --- | --- |
-| `start.cast` | Start a fresh prepared Apple-container cluster with two workers and explicit `cni/cilium`; query authenticated `/readyz`, require exactly three Ready nodes, and wait for every rollout listed in the real preparation manifest. |
+| `start.cast` | Start a fresh prepared Apple-container or Firecracker cluster with two workers and explicit `cni/cilium`; query authenticated `/readyz`, require exactly three Ready nodes, and wait for every rollout listed in the real preparation manifest. |
 | `deploy.cast` | `kalisto apply --manifest app.yaml`; wait for two HTTP replicas on distinct workers, inspect pods and Service with managed `kalisto kubectl`, and require the exact real HTTP response through an owned loopback-only port-forward. |
 | `resume.cast` | Create `demo-state` with `value=saved-before-stop`, stop only the owned cluster with `kalisto down`, inspect that all three nodes are actually Stopped, resume with the same profile, and verify the ConfigMap's original UID and data plus the surviving HTTP workload and response. |
 | `scale.cast` | Show the original three Ready nodes, run `kalisto scale --workers 3`, require exactly four Ready nodes, increase the HTTP Deployment to three replicas, require distinct worker placements, and repeat the HTTP proof. |
 
-On Apple-container resume, guest addresses can change. Kalisto configures the
-built-in cloud controller to reconcile node addresses every five seconds rather
-than leaving persisted worker addresses stale across restart. K3s handles serving
-certificate issuance itself; Kalisto does not rotate the cluster CA or disable
-TLS verification. The resume scene's real port-forward checks recovery beyond
-Ready status alone.
+On Apple-container and Firecracker resume, Kubernetes can still report the
+previous boot's Ready condition before the current kubelet route is usable.
+Kalisto requires the current guest boot ID, current InternalIP, Ready status and
+a working authenticated API-to-kubelet health request. Apple-container startup
+also passes each freshly inspected guest IP explicitly to K3s.
+K3s completes its own serving-certificate issuance; Kalisto does not delete
+certificates or rotate the cluster CA, node credentials or keys. Each resume
+scene's real port-forward verifies the surviving workload immediately afterward.
 
 The HTTP fixture is [`scripts/demos/app.yaml`](../scripts/demos/app.yaml): a small
 BusyBox HTTP server, a content ConfigMap, and a Service. Required pod anti-affinity
@@ -42,22 +45,24 @@ Hello from Kalisto. This workload survives a cluster restart.
 
 ## Dispatch and artifacts
 
-Use Forgejo Actions → **Record Kalisto showcase** → **Run workflow**, selecting
-the reviewed source branch/revision. `.forgejo/workflows/showcase.yml` has only a
-`workflow_dispatch` trigger: pushes, pull requests, and releases do not start it.
+Dispatch **Record Kalisto showcase** (`.forgejo/workflows/showcase.yml`) for Apple
+container and **Record Kalisto Firecracker showcase**
+(`.forgejo/workflows/showcase-linux.yml`) for Linux, selecting the same reviewed
+source branch/revision. Both have only a `workflow_dispatch` trigger: pushes,
+pull requests and releases do not start captures.
 Dispatch is an explicit authorization to compile and run owned infrastructure in
 native CI; do not run the recorder locally. No new keys are required.
 
-Required existing repository variables:
+Apple-container repository variables:
 
 - `KALISTO_MACOS_RUNNER`: the native macOS arm64 runner label.
 - `KALISTO_MACOS_VOLUME`: a mounted external volume, not `/`.
 - `KALISTO_MACOS_BUILD_ROOT`: an absolute directory strictly beneath that volume.
 
-The native runner must already have its Rust toolchain and Python 3.9+, curl,
+The macOS runner must already have its Rust toolchain and Python 3.9+, curl,
 Homebrew `container` 1.7.1, its compatible **running** release daemon, and installed
-asciinema **3.2.1**. The workflow neither installs nor upgrades either tool, starts
-or restarts the service, changes its roots/properties/configuration, nor stops it.
+asciinema **3.2.1**. The macOS workflow does not install or upgrade either tool,
+restart the service, change its roots/properties/configuration, or stop it.
 An unavailable, stopped, incompatible, or differently owned daemon fails capture.
 The recorder checks the Homebrew installation, launchd API PID/start count, service
 programs/roots, properties and configuration digest before and after preparation,
@@ -75,13 +80,40 @@ job; prepared assets reuse the existing `apple-container-ci/artifacts` cache usi
 Kalisto's normal profile locking. Cleanup never removes that shared cache.
 Captures serialize without cancelling other jobs or taking ownership of their clusters.
 
-The workflow checks out `GITHUB_SHA`, builds `cargo build --locked --release --bin
-kalisto`, and invokes `python3 scripts/demos/capture.py` from the external checkout.
-The script requires an actual dispatch environment. No source build directory or
-configuration from the user's project is used for the recorded cluster.
+The Linux workflow runs on `tomis-host`, with KVM access, unprivileged user/network
+namespaces and the [Firecracker prerequisites](prerequisites-linux-firecracker.md).
+It prefers the existing user-installed Firecracker 1.18.0. Optional
+`KALISTO_LINUX_BUILD_ROOT` selects private showcase storage; otherwise it uses
+`~/.cache/kalisto-showcase-firecracker`. Optional `KALISTO_FIRECRACKER_ROOTFS`
+provides an explicit prepared root filesystem; otherwise the workflow discovers
+an existing user-cache artifact, never a live node disk. Before recording, CI
+builds Linux 6.19.9 from checksum-pinned upstream source with the repository's
+kernel fragment into its owned workspace. Existing user kernels are untouched.
+`CONFIG_NETFILTER_XT_MATCH_STATISTIC=y` is mandatory: kube-proxy needs this match
+for multi-endpoint Service rules, including the Kubernetes Service used by a
+new worker's Cilium initialization. CI runs the native cold-boot and scale
+acceptance test against that kernel before capturing the four scenes.
+Asciinema 3.2.1 is installed into the owned CI workspace, without replacing
+system or user tools. The recorder fingerprints pre-existing Firecracker
+processes and checks that they survive unchanged. Cleanup destroys only its
+marker-owned cluster and retains shared prepared assets.
+Firecracker VMs, the namespace anchor and slirp helper run in independent
+sessions with null stdin, so closing a recording or ordinary terminal does not
+stop the cluster. `down` and `destroy` retain explicit lifecycle ownership.
 
-Only a complete successful run uploads the seven-day CI artifact
-`kalisto-showcase-<full-source-commit>`, containing exactly:
+`KALISTO_LINUX_CA_BUNDLE` optionally supplies an existing runner CA bundle for
+authenticated source checkout when the forge uses a private certificate chain.
+
+Each workflow checks out `GITHUB_SHA`, builds
+`cargo build --locked --release --bin kalisto`, and invokes
+`python3 scripts/demos/capture.py` from its owned checkout. The orchestrator
+requires an actual dispatch environment. Scene commands use an isolated data
+root and `DEMO_PROFILE_JSON`, including explicit backend and Firecracker artifact
+arguments where applicable.
+
+Each successful backend run uploads a seven-day review artifact:
+`kalisto-showcase-<full-source-commit>` for Apple container and
+`kalisto-showcase-firecracker-<full-source-commit>` for Firecracker. Each contains:
 
 ```text
 start.cast
@@ -99,8 +131,12 @@ scene/subprocess failure exit codes are preserved. Partial casts never count as
 successful demos. No asciinema upload/auth/stream command, release publication, or
 website deployment is performed.
 
-Review the actual downloaded candidates before installing them into a website.
-A CI artifact is a review candidate, not automatic public publication. A failed
+Review the downloaded candidates, then upload them from the user's linked
+asciinema.org account. Do not use anonymous uploads or put `.cast` files in the
+website deployment. The website stores recording URLs, observed durations,
+checksums, source revisions and architecture-correct workload fixtures, and
+uses the official asciinema.org embed so player and recording assets are served
+by asciinema. A CI artifact is a review candidate, not automatic publication. A failed
 recording or privacy check does not upload raw casts. Failure evidence remains in
 the mode-0700 owned `kalisto-showcase.*` workspace under the configured build root,
 particularly `private/`; locate the matching `.showcase-owner` run ID on the runner
@@ -108,6 +144,12 @@ without copying its machine paths or raw output into public logs. Raw evidence i
 never an artifact upload input. After private diagnosis, remove only that owned
 workspace once its cleanup succeeds; retention of failed workspaces is intentional
 and requires operator disk housekeeping.
+
+Scale failures save a mode-0600 `scale-failure.json` under cluster state before
+rolling back new workers. It contains only those workers' node conditions,
+events, Cilium pod diagnostics and bounded K3s logs, without serialized command
+arguments. The recorder copies it into `private/failure-scale-failure.json`
+before destroying its owned cluster. This snapshot is never a public artifact.
 
 ## Source-level reproduction
 
@@ -144,23 +186,23 @@ The port-forward prompt is visible; its asynchronous diagnostics and readiness
 polls are not recorded. Extra JSON inspections are genuine hidden assertions,
 not substitutes for displayed CLI output.
 
-A fresh random `showcase-` cluster name is checked against saved state and successful
-Apple container/network listings before any mutation. Cleanup uses only its saved
-owned name, never `destroy --all`, arbitrary name discovery, engine shutdown, or a
-host-wide reset. The workflow's `always()` cleanup also handles normal failures or
+A fresh random `showcase-` cluster name is checked against saved state and the
+backend's successful runtime snapshot before mutation. Cleanup uses only its
+saved owned name, never `destroy --all`, arbitrary discovery, engine shutdown or
+a host-wide reset. The workflow's `always()` cleanup also handles normal failures or
 interruption; a hard runner/power loss may require private operator cleanup. Both
 capture and cleanup validate the owned workspace/run marker. Failed cleanup retains
 the workspace instead of deleting ownership information or concealing the failure.
 
 ## Timing, privacy, and provenance
 
-The installed asciinema records **asciicast v2**, output only, at **110×30**, with
-no idle-time cap, concatenation, speed-up, trimming, or fabricated output. Its
-config is isolated from the runner's personal asciinema settings. Playback must
-also disable idle-time shortening (for the website player, `idleTimeLimit:
-Infinity` and speed 1). All original output events remain in order at their
-original numeric timestamps. `duration_seconds` is the last output event timestamp,
-i.e. the actual cast playback duration; it is not an independent stopwatch claim.
+Asciinema records **asciicast v2**, output only, at **110×30**, with no idle cap,
+concatenation, speed-up, trimming or fabricated output. Its configuration is
+isolated from personal settings. The official hosted embed uses speed 1 and an
+idle-time limit greater than the entire recorded duration, preserving every wait.
+All output events remain in order at their original numeric timestamps.
+`duration_seconds` is the last output event timestamp, not an independent
+stopwatch claim.
 The recorder's final successful exit metadata (`x`, `0`) is validated and omitted
 from the output-only publication; unsuccessful exit metadata rejects publication.
 
@@ -169,6 +211,7 @@ The only permitted terminal-output substitutions are exact known private prefixe
 - This job's absolute workspace prefix → `<demo-workspace>`.
 - The configured absolute external build-root prefix → `<build-storage>`.
 - The actual runner HOME prefix → `<runner-home>`.
+- Explicit Firecracker kernel/rootfs filenames → `<firecracker-kernel>` / `<firecracker-rootfs>`.
 
 Longer prefixes match first. A replacement may span PTY chunks: the neutral label
 is emitted at the first matching event and the remaining matched characters are
@@ -202,6 +245,8 @@ all possible sensitive data; human publication review remains mandatory.
 platform, observed Kalisto/asciinema versions, UTC collection time, excluded
 preparation, original timing, scripted execution, exact redaction policy, actual
 fixture digest/hash, and each final cast's SHA-256, real duration, and dimensions.
+Linux provenance also records the actual kernel version and source, fragment,
+final configuration and kernel SHA-256 hashes, plus the required built-in match.
 Hashes cover the actual publication candidates after the documented path/header
 handling. There are no placeholder hashes, timings, scenes, or successful fallbacks.
 
