@@ -7,6 +7,20 @@
 Local Kubernetes with k3s: Apple containers by default on macOS, optional Lima,
 and Firecracker on Linux.
 
+## Demos
+
+Click a preview to play the full recording on asciinema.
+
+| Use case | macOS · Apple containers | Linux · Firecracker |
+| --- | --- | --- |
+| Fresh three-node Cilium startup | [![Apple-container startup](https://asciinema.org/a/9NiazaB8VfoFCw3k.svg)](https://asciinema.org/a/9NiazaB8VfoFCw3k) | [![Firecracker startup](https://asciinema.org/a/60uyxYoIpzIXhliw.svg)](https://asciinema.org/a/60uyxYoIpzIXhliw) |
+| Deploy an HTTP application | [![Apple-container application deployment](https://asciinema.org/a/0INmR0OqGcLGeNjq.svg)](https://asciinema.org/a/0INmR0OqGcLGeNjq) | [![Firecracker application deployment](https://asciinema.org/a/AWGgMs2Jo7h0DQxf.svg)](https://asciinema.org/a/AWGgMs2Jo7h0DQxf) |
+| Stop and resume with persisted state | [![Apple-container state-preserving resume](https://asciinema.org/a/eUJ9iZO0kTBWH8BD.svg)](https://asciinema.org/a/eUJ9iZO0kTBWH8BD) | [![Firecracker state-preserving resume](https://asciinema.org/a/YmlRAv2BCcgNcDcx.svg)](https://asciinema.org/a/YmlRAv2BCcgNcDcx) |
+| Add a worker and spread replicas | [![Apple-container worker scaling](https://asciinema.org/a/VstCRHViyYAFGEBr.svg)](https://asciinema.org/a/VstCRHViyYAFGEBr) | [![Firecracker worker scaling](https://asciinema.org/a/nZWS17frmHFgIEPm.svg)](https://asciinema.org/a/nZWS17frmHFgIEPm) |
+
+Recorded development revisions: Apple `93390c52e4f0` (macOS Apple silicon),
+Firecracker `4fe2abc74675` (Linux x86_64). Preparation is outside startup recordings.
+
 ## Documentation
 
 The canonical guides and reference live at
