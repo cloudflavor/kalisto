@@ -87,7 +87,9 @@ The native runner must have `cargo`, `rustc` and `rustup` on `PATH`, with the
 toolchain needed by normal CI available under the external `release-rustup` directory.
 Populate it using `RUSTUP_HOME="$KALISTO_MACOS_BUILD_ROOT/release-rustup"` and
 `CARGO_HOME="$KALISTO_MACOS_BUILD_ROOT/cargo-home"`; do not copy personal credentials
-into the shared cache. The native functional job enables
+into the shared cache. Every push to `main` runs the native functional job against
+that exact merged commit; manual CI dispatches also run it. These runs are not
+cancelled by later pushes. The job enables
 `KALISTO_LIVE_APPLE_CONTAINER_BOOT_BUDGET=1` and runs the full three-node Cilium
 test with its existing sixty-second end-to-end assertion. It borrows an already
 running Homebrew service, or starts an installed unregistered service without

@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: kalisto-ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/feat/apple-container-k3s' && github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   rust-fmt:
@@ -132,7 +132,7 @@ jobs:
 
   apple-container-live:
     needs: [rust-fmt, rust-clippy, rust-test]
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/feat/apple-container-k3s') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
     timeout-minutes: 60
     env:
