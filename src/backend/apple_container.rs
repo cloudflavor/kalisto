@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::apple_container::runtime;
-use crate::backend::runtime::{BackendConfig, BackendKind, ClusterBackend, InstanceConfig};
+use crate::backend::runtime::{
+    BackendConfig, BackendKind, ClusterBackend, InstanceConfig, shared_file_install_command,
+};
 use crate::error::{Error, Result};
 use crate::process::{CommandRunner, Output};
 
@@ -257,6 +259,23 @@ impl ClusterBackend for AppleContainerBackend {
         command: &str,
     ) -> Result<Output> {
         self.guest_shell(runner, instance_name, runtime_root, command)
+    }
+
+    fn copy_file_to_guest(
+        &self,
+        runner: &dyn CommandRunner,
+        instance_name: &str,
+        runtime_root: &Path,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        // Bind mounts expose canonical host paths, not host-side symlink aliases.
+        let source = source
+            .canonicalize()
+            .map_err(io_error("resolve shared Apple node file"))?;
+        let command = shared_file_install_command(&source, destination);
+        self.guest_sudo_shell(runner, instance_name, runtime_root, &command)?;
+        Ok(())
     }
 
     fn control_plane_host(&self, instance_name: &str, runtime_root: &Path) -> Result<String> {
@@ -1007,5 +1026,116 @@ mod tests {
             (result.rss_bytes, result.rx_bytes, result.tx_bytes),
             (Some(123_456), Some(222), Some(333))
         );
+    }
+
+    #[cfg(unix)]
+    mod shared_files {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use crate::process::SystemRunner;
+
+        use super::*;
+
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+        struct TemporaryRoot(PathBuf);
+
+        impl TemporaryRoot {
+            fn new() -> Self {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let counter = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir().join(format!(
+                    "kalisto-shared-file-{}-{nonce}-{counter}",
+                    std::process::id()
+                ));
+                fs::create_dir(&root).unwrap();
+                Self(root)
+            }
+        }
+
+        impl Drop for TemporaryRoot {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("remove owned transfer fixture");
+            }
+        }
+
+        struct FileRunner(Runner);
+
+        impl CommandRunner for FileRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+                if args.first().is_some_and(|argument| argument == "exec") {
+                    SystemRunner.run(
+                        "/bin/sh",
+                        &[
+                            "-c".into(),
+                            args.last().expect("guest shell command").clone(),
+                        ],
+                    )
+                } else {
+                    self.0.run(program, args)
+                }
+            }
+        }
+
+        #[test]
+        fn symlinked_state_transfers_preserve_manifest_and_private_mode() {
+            let fixture = TemporaryRoot::new();
+            let mounted = fixture.0.join("mounted state");
+            fs::create_dir(&mounted).unwrap();
+            let mounted = mounted.canonicalize().unwrap();
+            let alias = fixture.0.join("host state alias");
+            symlink(&mounted, &alias).unwrap();
+            let source = alias.join("cilium's manifest.json");
+            let destination = mounted.join("cilium's manifest.json");
+            let manifest = b"{\"kind\":\"List\",\"items\":[]}";
+            fs::write(&source, manifest).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut node = owned_node();
+            node["configuration"]["labels"][ROOT_LABEL] = json!(mounted);
+            let runner = FileRunner(runner(vec![
+                Ok(output(&json!([{"id": "kalisto-demo-cp"}]))),
+                Ok(output(&json!([node]))),
+            ]));
+
+            BACKEND
+                .copy_file_to_guest(&runner, "kalisto-demo-cp", &alias, &source, &destination)
+                .unwrap();
+
+            assert_eq!(fs::read(&destination).unwrap(), manifest);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn shared_permissions_accept_option_like_relative_filenames() {
+            let fixture = TemporaryRoot::new();
+            let relative = Path::new("-cilium's manifest.json");
+            let destination = fixture.0.join(relative);
+            let manifest = b"{\"kind\":\"List\",\"items\":[]}";
+            fs::write(&destination, manifest).unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+            let command = format!(
+                "cd '{}' && {}",
+                fixture.0.to_string_lossy().replace('\'', "'\"'\"'"),
+                shared_file_install_command(relative, relative)
+            );
+
+            SystemRunner
+                .run("/bin/sh", &["-c".into(), command])
+                .unwrap();
+
+            assert_eq!(fs::read(&destination).unwrap(), manifest);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

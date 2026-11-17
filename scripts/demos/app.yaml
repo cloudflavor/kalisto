@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kalisto-http-content
+data:
+  index.html: |
+    Hello from Kalisto. This workload survives a cluster restart.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kalisto-http
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kalisto-http
+  template:
+    metadata:
+      labels:
+        app: kalisto-http
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: kalisto-http
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: http
+          # capture.py pins this to the exact prepared, offline probe image digest.
+          image: docker.io/library/busybox:1.36.1
+          imagePullPolicy: Never
+          command: [httpd, -f, -p, "8080", -h, /www]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            periodSeconds: 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: content
+              mountPath: /www
+              readOnly: true
+      volumes:
+        - name: content
+          configMap:
+            name: kalisto-http-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kalisto-http
+spec:
+  selector:
+    app: kalisto-http
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -11,6 +11,7 @@ use crate::cluster::wait::{GuestWait, wait_for_stable_guest_success};
 use crate::error::{Error, Result};
 use crate::k3s::ComponentToggles;
 use crate::process::CommandRunner;
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 pub const DEFAULT_CILIUM_VERSION: &str = "1.19.1";
@@ -222,6 +223,11 @@ pub struct PostReadyAddonRequest<'a> {
 ///
 /// Returns an error when the operation cannot be completed.
 pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<()> {
+    let install_cni = request.cni == CniPlugin::Cilium
+        || (request.cni == CniPlugin::Flannel && !request.builtin_flannel);
+    let total = request.addons.len() as u64 + u64::from(install_cni);
+    let progress =
+        (total > 0).then(|| Progress::bar("Installing network and selected add-ons", total));
     if request.cni == CniPlugin::Flannel && !request.builtin_flannel {
         install_flannel(
             request.backend,
@@ -229,6 +235,9 @@ pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<(
             request.control_plane,
             request.guest_kubeconfig,
         )?;
+        if let Some(progress) = &progress {
+            progress.inc(1);
+        }
     }
 
     if request.cni == CniPlugin::Cilium {
@@ -239,11 +248,17 @@ pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<(
             request.guest_kubeconfig,
             request.cilium_version,
         )?;
+        if let Some(progress) = &progress {
+            progress.inc(1);
+        }
     }
 
     for addon in request.addons {
         let addon = AddonId::parse(addon)
             .ok_or_else(|| Error::InvalidArgs(format!("unsupported add-on `{addon}`")))?;
+        if let Some(progress) = &progress {
+            progress.set_message(&format!("Installing add-on {}", addon.as_str()));
+        }
         install_addon(
             request.backend,
             request.runner,
@@ -253,6 +268,12 @@ pub fn install_post_ready_addons(request: PostReadyAddonRequest<'_>) -> Result<(
             request.cilium_version,
             Some(request.metallb),
         )?;
+        if let Some(progress) = &progress {
+            progress.inc(1);
+        }
+    }
+    if let Some(progress) = progress {
+        progress.finish("Network and selected add-on installation steps completed");
     }
 
     Ok(())
@@ -370,6 +391,7 @@ fn install_flannel(
     control_plane: &Instance,
     guest_kubeconfig: &Path,
 ) -> Result<()> {
+    let progress = Progress::spinner("Applying Flannel network manifest");
     info!(
         node = %control_plane.name,
         addon = "flannel",
@@ -385,6 +407,7 @@ fn install_flannel(
     )?;
 
     if should_wait_for_addons() {
+        progress.set_message("Waiting for Flannel network rollout");
         let wait_command = format!(
             concat!(
                 "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl get namespace kube-flannel >/dev/null 2>&1 && ",
@@ -412,12 +435,14 @@ fn install_flannel(
             addon = "flannel",
             "post-ready add-on is ready"
         );
+        progress.finish("Flannel network rollout complete");
     } else {
         info!(
             node = %control_plane.name,
             addon = "flannel",
             "post-ready add-on manifest applied (async readiness)"
         );
+        progress.finish("Flannel manifest applied; rollout not awaited");
     }
 
     Ok(())
@@ -430,6 +455,7 @@ fn install_cilium(
     guest_kubeconfig: &Path,
     cilium_version: &str,
 ) -> Result<()> {
+    let progress = Progress::spinner("Applying Cilium network manifest");
     info!(
         node = %control_plane.name,
         addon = "cilium",
@@ -446,6 +472,7 @@ fn install_cilium(
     )?;
 
     if should_wait_for_addons() {
+        progress.set_message("Waiting for Cilium agent and operator rollouts");
         let wait_command = format!(
             concat!(
                 "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-system rollout status daemonset/cilium --timeout=30s && ",
@@ -472,6 +499,7 @@ fn install_cilium(
             version = cilium_version,
             "post-ready add-on is ready"
         );
+        progress.finish("Cilium agent and operator rollouts complete");
     } else {
         info!(
             node = %control_plane.name,
@@ -479,6 +507,7 @@ fn install_cilium(
             version = cilium_version,
             "post-ready add-on manifest applied (async readiness)"
         );
+        progress.finish("Cilium manifest applied; rollout not awaited");
     }
 
     Ok(())
@@ -490,6 +519,7 @@ fn install_traefik(
     control_plane: &Instance,
     guest_kubeconfig: &Path,
 ) -> Result<()> {
+    let progress = Progress::spinner("Applying Traefik ingress manifest");
     info!(
         node = %control_plane.name,
         addon = "traefik",
@@ -505,6 +535,7 @@ fn install_traefik(
     )?;
 
     if should_wait_for_addons() {
+        progress.set_message("Waiting for Traefik ingress rollout");
         let wait_command = format!(
             "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-system rollout status deployment/traefik --timeout=30s",
             kubeconfig = shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()),
@@ -527,12 +558,14 @@ fn install_traefik(
             addon = "traefik",
             "post-ready add-on is ready"
         );
+        progress.finish("Traefik ingress rollout complete");
     } else {
         info!(
             node = %control_plane.name,
             addon = "traefik",
             "post-ready add-on manifest applied (async readiness)"
         );
+        progress.finish("Traefik manifest applied; rollout not awaited");
     }
 
     Ok(())
@@ -544,6 +577,7 @@ fn install_kong(
     control_plane: &Instance,
     guest_kubeconfig: &Path,
 ) -> Result<()> {
+    let progress = Progress::spinner("Applying Kong ingress manifest");
     info!(
         node = %control_plane.name,
         addon = "kong",
@@ -559,6 +593,7 @@ fn install_kong(
     )?;
 
     if should_wait_for_addons() {
+        progress.set_message("Waiting for Kong ingress rollout");
         let wait_command = format!(
             "KUBECONFIG={kubeconfig} /usr/local/bin/k3s kubectl -n kube-system rollout status deployment/kong-kong --timeout=30s",
             kubeconfig = shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()),
@@ -581,12 +616,14 @@ fn install_kong(
             addon = "kong",
             "post-ready add-on is ready"
         );
+        progress.finish("Kong ingress rollout complete");
     } else {
         info!(
             node = %control_plane.name,
             addon = "kong",
             "post-ready add-on manifest applied (async readiness)"
         );
+        progress.finish("Kong manifest applied; rollout not awaited");
     }
 
     Ok(())
@@ -615,6 +652,7 @@ fn install_metallb(
     if let Some(config) = metallb
         && !config.is_empty()
     {
+        let progress = Progress::spinner("Applying MetalLB address configuration");
         config.validate()?;
         apply_metallb_config(backend, runner, control_plane, config)?;
         info!(
@@ -622,6 +660,7 @@ fn install_metallb(
             addon = AddonId::LbMetalLb.as_str(),
             "applied MetalLB address configuration"
         );
+        progress.finish("MetalLB address configuration applied");
     }
 
     Ok(())
@@ -661,14 +700,23 @@ fn install_remote_yaml_addon(
     guest_kubeconfig: &Path,
     spec: RemoteYamlAddonSpec<'_>,
 ) -> Result<()> {
+    let progress = Progress::spinner(&format!(
+        "Retrieving manifest for add-on {}",
+        spec.addon.as_str()
+    ));
     info!(node = %control_plane.name, addon = spec.addon.as_str(), url = spec.url, "installing post-ready add-on");
     let manifest = fetch_manifest(runner, spec.url)?;
     let manifest_path = format!(
         "/var/lib/rancher/k3s/server/manifests/kalisto-{}.yaml",
         spec.addon.as_str().replace('/', "-")
     );
+    progress.set_message(&format!("Applying add-on {} manifest", spec.addon.as_str()));
     apply_guest_manifest(backend, runner, control_plane, &manifest_path, &manifest)?;
     if should_wait_for_addons() {
+        progress.set_message(&format!(
+            "Waiting for add-on {} rollout",
+            spec.addon.as_str()
+        ));
         let wait_command = spec.wait_command_template.replace(
             "{kubeconfig}",
             shell_escape(guest_kubeconfig.as_os_str().to_string_lossy().as_ref()).as_str(),
@@ -686,12 +734,17 @@ fn install_remote_yaml_addon(
             addon = spec.addon.as_str(),
             "post-ready add-on is ready"
         );
+        progress.finish(&format!("Add-on {} rollout complete", spec.addon.as_str()));
     } else {
         info!(
             node = %control_plane.name,
             addon = spec.addon.as_str(),
             "post-ready add-on manifest applied (async readiness)"
         );
+        progress.finish(&format!(
+            "Add-on {} manifest applied; rollout not awaited",
+            spec.addon.as_str()
+        ));
     }
     Ok(())
 }

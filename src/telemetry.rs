@@ -1,28 +1,23 @@
 use tracing::Level;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::EnvFilter;
 
 use crate::error::{Error, Result};
 
 const DEFAULT_FILTER_DIRECTIVE: &str = "info";
 
+/// Initializes diagnostics and, when allowed, interactive terminal progress.
 /// # Errors
 ///
 /// Returns an error when the operation cannot be completed.
-pub fn init(log_level: Option<Level>) -> Result<()> {
-    let env_filter = env_filter(log_level)?;
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            fmt::layer()
-                .with_target(false)
-                .compact()
-                .with_writer(std::io::stderr),
-        )
-        .try_init()
-        .map_err(|error| {
-            Error::InvalidArgs(format!("failed to initialize tracing subscriber: {error}"))
-        })?;
-    Ok(())
+pub fn init(log_level: Option<Level>, allow_progress: bool) -> Result<()> {
+    crate::progress::init(
+        env_filter(log_level)?,
+        allow_progress,
+        log_level.is_some() || std::env::var_os("RUST_LOG").is_some(),
+    )
+    .map_err(|error| {
+        Error::InvalidArgs(format!("failed to initialize tracing subscriber: {error}"))
+    })
 }
 
 pub fn raw_streams_enabled() -> bool {

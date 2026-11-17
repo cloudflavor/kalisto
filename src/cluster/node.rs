@@ -13,6 +13,7 @@ use crate::k3s::{
     kubelet_resolv_conf_contents,
 };
 use crate::process::{CommandRunner, Output};
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ struct K3sCommandSpec<'a> {
     node: &'a Instance,
     tls_sans: &'a [String],
     join: Option<JoinConfig<'a>>,
+    dynamic_guest_addresses: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,11 +105,16 @@ pub fn bootstrap_server(
     control_plane: &Instance,
     tls_sans: &[String],
 ) -> Result<Output> {
+    let progress = Progress::spinner(&format!("Preparing control-plane {}", control_plane.name));
     let artifact_dir =
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     ensure_guest_bootstrap_prereqs(backend, runner, control_plane, &artifact_dir)?;
     if k3s_process_running(backend, runner, control_plane, &artifact_dir)? {
         sync_control_plane_runtime_artifacts(backend, runner, control_plane, &artifact_dir)?;
+        progress.finish(&format!(
+            "Reusing running control-plane {}; API checks pending",
+            control_plane.name
+        ));
         return Ok(Output {
             stdout: "k3s server already running\n".to_owned(),
             stderr: String::new(),
@@ -119,8 +126,15 @@ pub fn bootstrap_server(
         node: control_plane,
         tls_sans,
         join: None,
+        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
     })?;
-    launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)
+    progress.set_message(&format!("Starting k3s server on {}", control_plane.name));
+    let output = launch_k3s_process(backend, runner, control_plane, &artifact_dir, &command)?;
+    progress.finish(&format!(
+        "Control-plane process launched on {}; API checks pending",
+        control_plane.name
+    ));
+    Ok(output)
 }
 
 /// # Errors
@@ -133,9 +147,14 @@ pub fn bootstrap_worker(
     worker: &Instance,
     join: JoinConfig<'_>,
 ) -> Result<Output> {
+    let progress = Progress::spinner(&format!("Preparing worker agent {}", worker.name));
     let artifact_dir = backend.guest_artifact_root(&worker.name, &worker.artifacts.root)?;
     ensure_guest_bootstrap_prereqs(backend, runner, worker, &artifact_dir)?;
     if k3s_process_running(backend, runner, worker, &artifact_dir)? {
+        progress.finish(&format!(
+            "Reusing running worker agent {}; readiness checks pending",
+            worker.name
+        ));
         return Ok(Output {
             stdout: "k3s agent already running\n".to_owned(),
             stderr: String::new(),
@@ -147,8 +166,15 @@ pub fn bootstrap_worker(
         node: worker,
         tls_sans: &[],
         join: Some(join),
+        dynamic_guest_addresses: backend.kind() == crate::backend::BackendKind::AppleContainer,
     })?;
-    launch_k3s_process(backend, runner, worker, &artifact_dir, &command)
+    progress.set_message(&format!("Starting worker agent {}", worker.name));
+    let output = launch_k3s_process(backend, runner, worker, &artifact_dir, &command)?;
+    progress.finish(&format!(
+        "Worker agent launched on {}; readiness checks pending",
+        worker.name
+    ));
+    Ok(output)
 }
 
 /// # Errors
@@ -163,6 +189,7 @@ pub fn start_node_instance(
     cpus: u8,
     memory_gib: u8,
 ) -> Result<Output> {
+    let progress = Progress::spinner(&format!("Starting or resuming node {}", node.name));
     let output = backend.start_instance(
         runner,
         base_config,
@@ -175,8 +202,13 @@ pub fn start_node_instance(
         },
     )?;
     if let Some(assets) = &base_config.boot_assets_root {
+        progress.set_message(&format!("Staging cached boot assets on {}", node.name));
         assets.stage_node(backend, runner, node)?;
     }
+    progress.finish(&format!(
+        "Node {} started; Kubernetes checks pending",
+        node.name
+    ));
     Ok(output)
 }
 
@@ -395,6 +427,13 @@ fn build_k3s_command(spec: &K3sCommandSpec<'_>) -> Result<String> {
     match spec.node.role {
         NodeRole::ControlPlane => {
             args.push("server".to_owned());
+            if spec.dynamic_guest_addresses {
+                // The default CCM interval leaves resumed Apple nodes advertising old IPs.
+                args.push(
+                    "--kube-cloud-controller-manager-arg=node-status-update-frequency=5s"
+                        .to_owned(),
+                );
+            }
             if !spec.node.name.is_empty() {
                 args.push("--node-name".to_owned());
                 args.push(spec.node.name.clone());
@@ -533,6 +572,7 @@ mod tests {
             artifact_dir: Path::new("/tmp/kalisto-w0-test"),
             node: &worker,
             tls_sans: &[],
+            dynamic_guest_addresses: false,
             join: Some(super::JoinConfig {
                 server_url: "https://cp.example.test:6443",
                 token: "secret",
@@ -566,6 +606,7 @@ mod tests {
             node: &control_plane,
             tls_sans: &[],
             join: None,
+            dynamic_guest_addresses: false,
         })
         .unwrap();
 

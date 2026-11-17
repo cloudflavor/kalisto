@@ -493,6 +493,23 @@ fn cold_cli_boot(backend: BackendKind) {
                 .expect("observation timeout should be seconds")
         })
         .max(60);
+    if backend == BackendKind::AppleContainer {
+        let trace = fs::File::create(evidence.join("up.log")).unwrap();
+        let mut graphical = Command::new("/usr/bin/script");
+        graphical
+            .args(["-q", "/dev/null", "/usr/bin/time", "-l"])
+            .arg(command.get_program())
+            .args(command.get_args())
+            .env_remove("RUST_LOG")
+            .env_remove("CI")
+            .env_remove("NO_COLOR")
+            .env("TERM", "xterm-256color")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .current_dir(&workspace)
+            .stdout(Stdio::from(trace.try_clone().unwrap()))
+            .stderr(Stdio::from(trace));
+        command = graphical;
+    }
     let started = Instant::now();
     let deadline = started + Duration::from_secs(observation_seconds);
     drop(port_reservation);
@@ -510,6 +527,13 @@ fn cold_cli_boot(backend: BackendKind) {
         thread::sleep(Duration::from_millis(50));
     }
 
+    if backend == BackendKind::AppleContainer {
+        let output = fs::read_to_string(evidence.join("up.log")).unwrap();
+        assert!(
+            output.contains("\u{1b}[") && output.contains("3/3"),
+            "interactive startup must render graphical node progress; see up.log"
+        );
+    }
     let kubeconfig = manager::kubeconfig_path(&name).unwrap();
     let readyz = kubectl(&kubeconfig, &["get", "--raw=/readyz"]);
     assert_eq!(String::from_utf8_lossy(&readyz).trim(), "ok");
@@ -734,4 +758,15 @@ fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kub
         }),
         "the added worker must join with a functional CNI"
     );
+    for node in nodes {
+        let node_name = node["metadata"]["name"]
+            .as_str()
+            .expect("a Kubernetes node must have a name");
+        let endpoint = format!("/api/v1/nodes/{node_name}/proxy/healthz");
+        assert_eq!(
+            kubectl(kubeconfig, &["get", "--raw", &endpoint]),
+            b"ok",
+            "the API server must authenticate every resumed and added kubelet"
+        );
+    }
 }

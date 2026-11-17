@@ -18,6 +18,7 @@ pub mod paths;
 pub mod plugin;
 pub mod probe;
 pub mod process;
+mod progress;
 pub mod pull;
 mod qcow;
 pub mod runtime;

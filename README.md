@@ -26,5 +26,4 @@ prerequisites before preparing or starting a cluster.
 
 ## Source
 
-[GitHub](https://github.com/cloudflavor/kalisto) ·
-[Codeberg mirror](https://codeberg.org/cloudflavor/kalisto)
+[GitHub](https://github.com/cloudflavor/kalisto)

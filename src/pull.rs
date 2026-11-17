@@ -20,6 +20,7 @@ use crate::cluster::spec::{ClusterSpec, ImageArch};
 use crate::error::{Error, Result};
 use crate::paths::artifacts_root;
 use crate::process::{CommandRunner, SystemRunner};
+use crate::progress::Progress;
 use crate::shell::shell_escape;
 
 const SCHEMA: u32 = 4;
@@ -179,8 +180,12 @@ fn prepare_apple_container(
         BackendKind::AppleContainer,
         spec.cni_plugin == CniPlugin::Cilium,
     )?;
+    let runtime = Progress::spinner("Preparing Apple container runtime");
     crate::apple_container::runtime::prepare(runner)?;
+    runtime.finish("Apple container runtime prepared");
+    let kubectl = Progress::spinner("Preparing kubectl");
     crate::kubectl::binary(&spec.k3s_version, runner)?;
+    kubectl.finish("kubectl prepared");
     prepare_with_runner(spec, runner)
 }
 
@@ -191,7 +196,9 @@ fn prepare_lima(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<Prepar
         BackendKind::Lima,
         spec.cni_plugin == CniPlugin::Cilium,
     )?;
+    let kubectl = Progress::spinner("Preparing kubectl");
     crate::kubectl::binary(&spec.k3s_version, runner)?;
+    kubectl.finish("kubectl prepared");
     prepare_with_runner(spec, runner)
 }
 
@@ -206,7 +213,9 @@ fn prepare_firecracker(
         BackendKind::Firecracker,
         spec.cni_plugin == CniPlugin::Cilium,
     )?;
+    let kubectl = Progress::spinner("Preparing kubectl");
     crate::kubectl::binary(&spec.k3s_version, runner)?;
+    kubectl.finish("kubectl prepared");
     let assets = prepare_with_runner(spec, runner)?;
     Ok((artifacts, assets))
 }
@@ -238,15 +247,22 @@ pub fn prepare_with_runner(
         staging: None,
     };
     if spec.backend == BackendKind::Lima {
+        let image = Progress::spinner("Preparing Lima node image");
         let resolved = artifact::pull_cluster_spec(spec, runner)?;
         validate_lima_template(&resolved.template)?;
+        image.finish("Lima node image prepared");
     }
+    let progress = Progress::spinner("Preparing offline boot assets");
     if spec
         .state_root()
         .join("archive/assets/manifest.json")
         .is_file()
     {
         let assets = load(spec)?;
+        let verification = Progress::bar(
+            "Verifying archived offline files",
+            assets.manifest.files.len() as u64,
+        );
         for file in &assets.manifest.files {
             artifact::verify_sha256(
                 runner,
@@ -254,11 +270,18 @@ pub fn prepare_with_runner(
                 &file.sha256,
                 &file.name,
             )?;
+            verification.inc(1);
         }
+        verification.finish("Archived offline files verified");
+        progress.finish("Archived offline boot assets prepared");
         return Ok(assets);
     }
     if destination.exists() {
         let assets = load(spec).map_err(|error| invalid(format!("{error}; damaged cache at {}; stop clusters using this profile, remove only this cache directory, then rerun kalisto pull", destination.display())))?;
+        let verification = Progress::bar(
+            "Verifying cached offline files",
+            assets.manifest.files.len() as u64,
+        );
         for file in &assets.manifest.files {
             artifact::verify_sha256(
                 runner,
@@ -266,13 +289,16 @@ pub fn prepare_with_runner(
                 &file.sha256,
                 &file.name,
             )?;
+            verification.inc(1);
         }
+        verification.finish("Cached offline files verified");
         if spec.backend == BackendKind::AppleContainer {
             let image = crate::apple_container::image::prepare(spec, &assets.root, runner)?;
             if image != assets.apple_node_image()? {
                 return Err(invalid("cached Apple node image identity changed"));
             }
         }
+        progress.finish("Cached offline boot assets prepared");
         return Ok(assets);
     }
 
@@ -315,6 +341,14 @@ pub fn prepare_with_runner(
     let binary = if arch == "arm64" { "k3s-arm64" } else { "k3s" };
     let archive = format!("k3s-airgap-images-{arch}.tar.zst");
     let mut files = Vec::new();
+    let release_files = Progress::bar(
+        if spec.cni_plugin == CniPlugin::Flannel {
+            "Preparing K3s and Flannel offline release files"
+        } else {
+            "Preparing K3s offline release files"
+        },
+        2,
+    );
     for (remote, local) in [(binary, "k3s"), (archive.as_str(), "k3s-images.tar.zst")] {
         let sha256 = release_checksum(&sums, remote)?;
         let path = staging.join(local);
@@ -330,9 +364,12 @@ pub fn prepare_with_runner(
             fs::copy(&cached, &path).map_err(io_error)?;
         }
         files.push(cached_file(&path, local, sha256)?);
+        release_files.inc(1);
     }
+    release_files.finish("K3s offline release files prepared");
 
     let mut documents = if spec.cni_plugin == CniPlugin::Cilium {
+        let cni = Progress::spinner("Preparing Cilium chart");
         runner.run(
             "helm",
             &[
@@ -352,7 +389,9 @@ pub fn prepare_with_runner(
             &staging,
             &format!("cilium-{}.tgz", spec.cilium_version),
         )?);
-        render_cilium(runner, &chart, &spec.k3s_version)?
+        let documents = render_cilium(runner, &chart, &spec.k3s_version)?;
+        cni.finish("Cilium chart prepared");
+        documents
     } else {
         Vec::new()
     };
@@ -375,7 +414,9 @@ pub fn prepare_with_runner(
         collect_images(document, &mut images);
     }
     let mut pinned = BTreeMap::new();
+    let digests = Progress::bar("Resolving offline image digests", images.len() as u64);
     for image in images {
+        digests.set_message(&image);
         let output = runner.run(
             "crane",
             &[
@@ -386,7 +427,9 @@ pub fn prepare_with_runner(
             ],
         )?;
         pinned.insert(image.clone(), pin_reference(&image, output.stdout.trim())?);
+        digests.inc(1);
     }
+    digests.finish("Offline image digests resolved");
     for document in &mut documents {
         pin_images(document, &pinned)?;
     }
@@ -425,7 +468,10 @@ pub fn prepare_with_runner(
     ];
     args.extend(pinned.values().cloned().collect::<BTreeSet<_>>());
     args.push(layout.display().to_string());
+    let download = Progress::spinner("Downloading offline container images");
     runner.run("crane", &args)?;
+    download.finish("Offline container images downloaded");
+    let archive = Progress::spinner("Packing offline container images");
     canonicalize_oci_index(&layout.join("index.json"), &pinned)?;
     runner.run(
         "tar",
@@ -439,13 +485,16 @@ pub fn prepare_with_runner(
     )?;
     files.push(hash_file(runner, &staging, "images.tar")?);
     fs::remove_dir_all(layout).map_err(io_error)?;
+    archive.finish("Offline container image archive prepared");
     if spec.backend == BackendKind::Firecracker {
+        let disk = Progress::spinner("Preparing Firecracker offline asset disk");
         crate::firecracker_assets::prepare(&staging, runner)?;
         files.push(hash_file(
             runner,
             &staging,
             crate::firecracker_assets::DISK_FILENAME,
         )?);
+        disk.finish("Firecracker offline asset disk prepared");
     }
     if spec.backend == BackendKind::AppleContainer {
         let image = crate::apple_container::image::prepare(spec, &staging, runner)?;
@@ -467,7 +516,9 @@ pub fn prepare_with_runner(
     fs::write(staging.join("manifest.json"), content).map_err(io_error)?;
     fs::rename(&staging, &destination).map_err(io_error)?;
     scratch.staging = None;
-    load(spec)
+    let assets = load(spec)?;
+    progress.finish("Offline boot assets prepared");
+    Ok(assets)
 }
 
 /// # Errors
