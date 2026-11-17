@@ -920,7 +920,7 @@ fn install_addons_and_wait_for_nodes(
                 &control_plane.name,
                 &control_plane.artifacts.root,
                 guest_kubeconfig,
-                &node.name,
+                node,
             )?;
             info!(node = %node.name, "node is ready");
             progress.inc(1);
@@ -2155,7 +2155,7 @@ fn start_and_join_workers(
                 &context.control_plane.name,
                 &context.control_plane.artifacts.root,
                 context.control_plane_guest_kubeconfig,
-                &worker.name,
+                &worker,
             )?;
             info!(
                 node = %worker.name,
@@ -2309,7 +2309,7 @@ fn start_and_join_workers_parallel(
                         &control_plane.name,
                         &control_plane.artifacts.root,
                         &control_plane_guest_kubeconfig,
-                        &worker.name,
+                        &worker,
                     )?;
                     info!(
                         node = %worker.name,

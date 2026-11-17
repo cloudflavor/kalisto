@@ -729,6 +729,11 @@ fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kub
         "down must stop every Apple node"
     );
     manager::up(spec).expect("Apple cluster should resume its persisted node disks");
+    let resumed_nodes: serde_json::Value =
+        serde_json::from_slice(&kubectl(kubeconfig, &["get", "nodes", "-o", "json"])).unwrap();
+    let resumed_nodes = resumed_nodes["items"].as_array().unwrap();
+    assert_eq!(resumed_nodes.len(), 3);
+    assert_kubelet_access(kubeconfig, resumed_nodes);
     assert_eq!(
         kubectl(
             kubeconfig,
@@ -758,6 +763,10 @@ fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kub
         }),
         "the added worker must join with a functional CNI"
     );
+    assert_kubelet_access(kubeconfig, nodes);
+}
+
+fn assert_kubelet_access(kubeconfig: &Path, nodes: &[serde_json::Value]) {
     for node in nodes {
         let node_name = node["metadata"]["name"]
             .as_str()
