@@ -92,6 +92,9 @@ fingerprints pre-existing Firecracker processes and checks that they survive
 unchanged. Cleanup destroys only its marker-owned cluster and retains shared
 prepared assets.
 
+`KALISTO_LINUX_CA_BUNDLE` optionally supplies an existing runner CA bundle for
+authenticated source checkout when the forge uses a private certificate chain.
+
 Each workflow checks out `GITHUB_SHA`, builds
 `cargo build --locked --release --bin kalisto`, and invokes
 `python3 scripts/demos/capture.py` from its owned checkout. The orchestrator

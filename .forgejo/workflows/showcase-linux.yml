@@ -16,6 +16,7 @@ jobs:
       KALISTO_SHOWCASE_BUILD_ROOT: ${{ vars.KALISTO_LINUX_BUILD_ROOT }}
       KALISTO_FIRECRACKER_KERNEL: ${{ vars.KALISTO_FIRECRACKER_KERNEL }}
       KALISTO_FIRECRACKER_ROOTFS: ${{ vars.KALISTO_FIRECRACKER_ROOTFS }}
+      KALISTO_LINUX_CA_BUNDLE: ${{ vars.KALISTO_LINUX_CA_BUNDLE }}
     steps:
       - name: Establish owned Linux workspace and exact dispatched source
         run: |
@@ -61,6 +62,10 @@ jobs:
           cd "$workspace"
           git init -q .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          if [ -n "${KALISTO_LINUX_CA_BUNDLE:-}" ]; then
+            test -r "$KALISTO_LINUX_CA_BUNDLE"
+            export GIT_SSL_CAINFO="$KALISTO_LINUX_CA_BUNDLE"
+          fi
           # Never persist or echo the job credential, even on a fetch failure.
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           if ! git -c credential.helper= fetch -q --depth=1 "$url" "$GITHUB_SHA" 2>/dev/null; then
