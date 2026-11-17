@@ -148,9 +148,22 @@ impl BorrowedAppleRuntime {
         assert_eq!(status["server"]["version"], "1.7.1");
         assert_eq!(status["server"]["build"], "release");
         let app = PathBuf::from(status["paths"]["appRoot"].as_str().unwrap());
-        let install = PathBuf::from(status["paths"]["installRoot"].as_str().unwrap());
-        assert!(executable.starts_with(install.canonicalize().unwrap()));
-        let services = launchd_services(&app, &install);
+        // The PATH CLI reports its own install root, which need not be the
+        // installation that registered the compatible running service.
+        let services = launchd_services(&app);
+        let install = PathBuf::from(
+            services["com.apple.container.apiserver"]["CONTAINER_INSTALL_ROOT"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(install.is_absolute());
+        for service in services.values() {
+            assert_eq!(
+                service["CONTAINER_INSTALL_ROOT"].as_str().map(Path::new),
+                Some(install.as_path()),
+                "borrowed services must use the same installation"
+            );
+        }
         let properties: serde_json::Value = serde_json::from_slice(&runtime_output(
             &executable,
             &["system", "property", "list", "--format", "json"],
@@ -173,7 +186,8 @@ impl BorrowedAppleRuntime {
         let identity = serde_json::json!({
             "executable": executable,
             "path_executable": path_executable,
-            "paths": status["paths"],
+            "paths": {"appRoot": app, "installRoot": install},
+            "path_cli_paths": status["paths"],
             "server": status["server"],
             "services": services,
             "properties": properties
@@ -263,7 +277,7 @@ impl BorrowedAppleRuntime {
     }
 }
 
-fn launchd_services(app: &Path, install: &Path) -> serde_json::Map<String, serde_json::Value> {
+fn launchd_services(app: &Path) -> serde_json::Map<String, serde_json::Value> {
     let uid = runtime_output(Path::new("/usr/bin/id"), &["-u"]);
     let session = runtime_output(Path::new("/bin/launchctl"), &["managername"]);
     let domain = match String::from_utf8_lossy(&session).trim() {
@@ -294,11 +308,6 @@ fn launchd_services(app: &Path, install: &Path) -> serde_json::Map<String, serde
             identity["CONTAINER_APP_ROOT"].as_str().map(Path::new),
             Some(app),
             "the running service must keep its original app root"
-        );
-        assert_eq!(
-            identity["CONTAINER_INSTALL_ROOT"].as_str().map(Path::new),
-            Some(install),
-            "the running service must keep its original install root"
         );
         if label == "com.apple.container.apiserver" {
             for key in ["pid", "runs"] {
