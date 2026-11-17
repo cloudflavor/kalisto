@@ -427,6 +427,15 @@ def record(work, env):
                                      "Header rebuilt with original version/dimensions/timestamp and fixed public title, relative command and TERM/SHELL only; incidental environment and idle-limit metadata omitted.",
                                      "All output events retained in original order with unchanged timestamps, including events emptied by a path replacement spanning PTY chunks."],
                       "recordings": recordings}
+        if selected_backend == "firecracker":
+            kernel = json.loads((private / "kernel-build.json").read_text())
+            hashes = ("source_sha256", "fragment_sha256", "kernel_sha256", "config_sha256")
+            require(all(re.fullmatch(r"[0-9a-f]{64}", kernel[field]) for field in hashes),
+                    "Kernel provenance must contain actual build hashes")
+            require(kernel["required_builtin"] == "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y",
+                    "The recorded kernel must support multi-endpoint Services")
+            provenance["kernel"] = {field: kernel[field] for field in
+                                    ("kernel_version", "required_builtin", *hashes)}
         privacy_gate(json.dumps(provenance), forbidden)
         (public / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     except BaseException:

@@ -83,15 +83,19 @@ The Linux workflow runs on `tomis-host`, with KVM access, unprivileged user/netw
 namespaces and the [Firecracker prerequisites](prerequisites-linux-firecracker.md).
 It prefers the existing user-installed Firecracker 1.18.0. Optional
 `KALISTO_LINUX_BUILD_ROOT` selects private showcase storage; otherwise it uses
-`~/.cache/kalisto-showcase-firecracker`. Optional `KALISTO_FIRECRACKER_KERNEL` and
-`KALISTO_FIRECRACKER_ROOTFS` provide explicit prepared files; otherwise the
-workflow discovers existing user-cache artifacts, never a live node disk or a
-source-checkout dependency. Compatibility is established by the actual scenes,
-not inferred from a cache-directory name. Asciinema 3.2.1 is installed into the
-owned CI workspace, without replacing system or user tools. The recorder
-fingerprints pre-existing Firecracker processes and checks that they survive
-unchanged. Cleanup destroys only its marker-owned cluster and retains shared
-prepared assets.
+`~/.cache/kalisto-showcase-firecracker`. Optional `KALISTO_FIRECRACKER_ROOTFS`
+provides an explicit prepared root filesystem; otherwise the workflow discovers
+an existing user-cache artifact, never a live node disk. Before recording, CI
+builds Linux 6.19.9 from checksum-pinned upstream source with the repository's
+kernel fragment into its owned workspace. Existing user kernels are untouched.
+`CONFIG_NETFILTER_XT_MATCH_STATISTIC=y` is mandatory: kube-proxy needs this match
+for multi-endpoint Service rules, including the Kubernetes Service used by a
+new worker's Cilium initialization. CI runs the native cold-boot and scale
+acceptance test against that kernel before capturing the four scenes.
+Asciinema 3.2.1 is installed into the owned CI workspace, without replacing
+system or user tools. The recorder fingerprints pre-existing Firecracker
+processes and checks that they survive unchanged. Cleanup destroys only its
+marker-owned cluster and retains shared prepared assets.
 Firecracker VMs, the namespace anchor and slirp helper run in independent
 sessions with null stdin, so closing a recording or ordinary terminal does not
 stop the cluster. `down` and `destroy` retain explicit lifecycle ownership.
@@ -240,6 +244,8 @@ all possible sensitive data; human publication review remains mandatory.
 platform, observed Kalisto/asciinema versions, UTC collection time, excluded
 preparation, original timing, scripted execution, exact redaction policy, actual
 fixture digest/hash, and each final cast's SHA-256, real duration, and dimensions.
+Linux provenance also records the actual kernel version and source, fragment,
+final configuration and kernel SHA-256 hashes, plus the required built-in match.
 Hashes cover the actual publication candidates after the documented path/header
 handling. There are no placeholder hashes, timings, scenes, or successful fallbacks.
 

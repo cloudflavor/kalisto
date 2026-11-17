@@ -14,7 +14,6 @@ jobs:
     env:
       KALISTO_SHOWCASE_BACKEND: firecracker
       KALISTO_SHOWCASE_BUILD_ROOT: ${{ vars.KALISTO_LINUX_BUILD_ROOT }}
-      KALISTO_FIRECRACKER_KERNEL: ${{ vars.KALISTO_FIRECRACKER_KERNEL }}
       KALISTO_FIRECRACKER_ROOTFS: ${{ vars.KALISTO_FIRECRACKER_ROOTFS }}
       KALISTO_LINUX_CA_BUNDLE: ${{ vars.KALISTO_LINUX_CA_BUNDLE }}
     steps:
@@ -75,7 +74,7 @@ jobs:
           unset url
           git checkout -q --detach "${GITHUB_SHA}^{commit}" 2>/dev/null
           echo 'Owned Linux workspace and exact source are ready.'
-      - name: Select existing native tools and prepared boot artifacts
+      - name: Select existing native tools and prepared rootfs
         run: |
           set -eu
           cd "$KALISTO_SHOWCASE_WORKSPACE"
@@ -97,13 +96,13 @@ jobs:
           assert version.splitlines()[0] == "Firecracker v1.18.0", "Expected validated Firecracker v1.18.0"
           (work / "bin/firecracker").symlink_to(Path(firecracker).resolve(strict=True))
           for tool in ("debugfs", "mke2fs", "ssh", "ssh-keygen", "scp", "ip", "iptables", "sysctl",
-                       "slirp4netns", "unshare", "nsenter", "curl", "nc", "jq"):
+                       "slirp4netns", "unshare", "nsenter", "curl", "nc", "jq", "gcc", "make",
+                       "flex", "bison", "bc", "rsync", "tar", "xz", "file", "awk", "sed", "sha256sum"):
               assert shutil.which(tool, path=tools), f"Required native tool missing: {tool}"
-          # Explicit vars win. Otherwise borrow only the known prepared user cache,
-          # never artifacts from a product checkout or a live cluster's node disks.
+          # Reuse only the explicit or known prepared rootfs, never a live
+          # cluster's node disk. The matching kernel is built privately below.
           cache = Path.home() / ".local/share/kalisto/artifacts/firecracker-node"
-          filenames = {"KALISTO_FIRECRACKER_KERNEL": "kalisto-vmlinux",
-                       "KALISTO_FIRECRACKER_ROOTFS": "ubuntu-24.04-minimal-k3s-amd64-rootfs.raw"}
+          filenames = {"KALISTO_FIRECRACKER_ROOTFS": "ubuntu-24.04-minimal-k3s-amd64-rootfs.raw"}
           with open(os.environ["GITHUB_ENV"], "a") as output:
               for key, filename in filenames.items():
                   value = os.environ.get(key)
@@ -123,11 +122,77 @@ jobs:
             --rev 70c4af0505fe1dbc7a2170392559d258bd4af92c --root "$KALISTO_SHOWCASE_WORKSPACE/tools" \
             > "$KALISTO_SHOWCASE_WORKSPACE/private/asciinema-install.log" 2>&1
           ln -s "$KALISTO_SHOWCASE_WORKSPACE/tools/bin/asciinema" "$KALISTO_SHOWCASE_WORKSPACE/bin/asciinema"
+      - name: Build a source-pinned kernel with multi-endpoint Service support
+        run: |
+          set -eu
+          umask 077
+          cd "$KALISTO_SHOWCASE_WORKSPACE"
+          test "$(cat .showcase-owner)" = "$GITHUB_RUN_ID"
+          export PATH="$KALISTO_SHOWCASE_WORKSPACE/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          export KALISTO_FIRECRACKER_VERSION=v1.18.0
+          export KALISTO_FIRECRACKER_ARCH=x86_64
+          export KALISTO_FIRECRACKER_ARTIFACT_TRACK=v1.18
+          export KALISTO_FIRECRACKER_KERNEL_VERSION=6.19.9
+          export KALISTO_FIRECRACKER_KERNEL_SOURCE_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.9.tar.xz
+          export KALISTO_FIRECRACKER_KERNEL_SOURCE_SHA256=c16068a3af12e3943dee3b1eef57ca70229c069128bfa1184fb3f48b219d55bf
+          export KALISTO_FIRECRACKER_KERNEL_CONFIG_FRAGMENT="$KALISTO_SHOWCASE_WORKSPACE/scripts/linux/firecracker-k3s-x86_64.config"
+          export KALISTO_FIRECRACKER_KERNEL_FILENAME=kalisto-vmlinux
+          export KALISTO_FIRECRACKER_OUTPUT_DIR="$KALISTO_SHOWCASE_WORKSPACE/boot-artifacts"
+          export KALISTO_FIRECRACKER_KERNEL_WORK_DIR="$KALISTO_SHOWCASE_WORKSPACE/kernel-source"
+          export KALISTO_FIRECRACKER_KERNEL_TMP_DIR="$KALISTO_SHOWCASE_WORKSPACE/tmp/kernel-build"
+          export KALISTO_FIRECRACKER_KERNEL_JOBS=4
+          if ! bash scripts/linux/build_firecracker_kernel.sh > private/kernel-build.log 2>&1; then
+            echo 'Owned kernel preparation failed; diagnostics remain private.' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          work = Path(os.environ["KALISTO_SHOWCASE_WORKSPACE"])
+          kernel = work / "boot-artifacts/kalisto-vmlinux"
+          config = kernel.with_suffix(".config")
+          fragment = Path(os.environ["KALISTO_FIRECRACKER_KERNEL_CONFIG_FRAGMENT"])
+          source = work / "kernel-source/linux-6.19.9.tar.xz"
+          def digest(path):
+              result = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      result.update(block)
+              return result.hexdigest()
+          assert "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y" in config.read_text().splitlines()
+          source_hash = digest(source)
+          assert source_hash == os.environ["KALISTO_FIRECRACKER_KERNEL_SOURCE_SHA256"]
+          metadata = {
+              "version": 1, "kernel_version": "6.19.9",
+              "source_url": os.environ["KALISTO_FIRECRACKER_KERNEL_SOURCE_URL"],
+              "source_sha256": source_hash, "fragment_sha256": digest(fragment),
+              "kernel_sha256": digest(kernel), "config_sha256": digest(config),
+              "required_builtin": "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y",
+          }
+          (work / "private/kernel-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"KALISTO_FIRECRACKER_KERNEL={kernel}\n")
+          PY
+          echo 'Owned source-pinned kernel is ready; preparation stayed outside recordings.'
       - name: Verify capture privacy and timing preservation
         run: |
           set -eu
           cd "$KALISTO_SHOWCASE_WORKSPACE"
           python3 -m unittest discover -s scripts/demos -p 'test_*.py' -v
+      - name: Verify native cold boot and multi-endpoint Service scaling
+        env:
+          KALISTO_LIVE_FIRECRACKER_TESTS: "1"
+        run: |
+          set -eu
+          cd "$KALISTO_SHOWCASE_WORKSPACE"
+          export PATH="$KALISTO_SHOWCASE_WORKSPACE/bin:$HOME/.local/bin:$PATH"
+          cargo test --locked --release --test linux_firecracker_live -- --nocapture \
+            >private/native-acceptance.log 2>&1 || {
+              echo 'Native Firecracker acceptance failed; evidence retained privately.' >&2
+              exit 1
+            }
       - name: Prepare outside recordings and capture four real Firecracker use cases
         run: |
           set -eu
