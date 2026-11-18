@@ -3,6 +3,10 @@
 set -euo pipefail
 
 target=${1:?Rust target required}
+case "$target" in
+  x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|aarch64-apple-darwin) ;;
+  *) echo 'Unsupported release target' >&2; exit 1 ;;
+esac
 export PATH="$HOME/.cargo/bin:$PATH"
 toolchain=1.89.0
 commit=$(git rev-parse HEAD)
@@ -25,8 +29,6 @@ case "$target" in
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$linker"
     link_self_contained=1
     ;;
-  aarch64-apple-darwin|x86_64-apple-darwin) ;;
-  *) echo 'Unsupported release target' >&2; exit 1 ;;
 esac
 
 # Do not embed runner usernames, cache roots or checkout paths in shipped binaries.
@@ -73,11 +75,6 @@ case "$target:$(uname -m)" in
   aarch64-unknown-linux-musl:x86_64)
     actual=$(qemu-aarch64 "$binary" --version)
     qemu-aarch64 "$binary" ls
-    ;;
-  x86_64-apple-darwin:arm64|aarch64-apple-darwin:x86_64)
-    # Never auto-install Rosetta on a shared host. Packaging checked Mach-O.
-    echo 'Cross-compiled macOS archive: architecture verified, no native runtime smoke'
-    exit 0
     ;;
   *)
     actual=$("$binary" --version)

@@ -12,12 +12,11 @@ Invalid `v*` tags fail rather than publish incorrectly versioned binaries.
 
 ## Download packages
 
-On successful tagged publication, the release contains four archives and `SHA256SUMS`:
+On successful tagged publication, the release contains three archives and `SHA256SUMS`:
 
 | Package | Rust target | Build / installed-package smoke check |
 | --- | --- | --- |
 | `kalisto-TAG-macos-arm64.tar.gz` | `aarch64-apple-darwin` | macOS arm64 runner; native `--version` and `ls` |
-| `kalisto-TAG-macos-amd64.tar.gz` | `x86_64-apple-darwin` | Cross-compiled on macOS arm64; Mach-O architecture verified; no native Intel execution |
 | `kalisto-TAG-linux-amd64.tar.gz` | `x86_64-unknown-linux-musl` | Linux x86_64 runner; native `--version` and `ls` |
 | `kalisto-TAG-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | Linux cross-build; `--version` and `ls` through user-mode QEMU, not native ARM64 validation |
 
@@ -29,7 +28,7 @@ bit-for-bit reproducible binaries across different compiler/SDK installations.
 
 Linux binaries are static musl executables: users do not need QEMU or a matching
 glibc release on their native architecture. macOS binaries are unsigned and not
-notarized. CI never installs Rosetta automatically.
+notarized. macOS packages target Apple silicon only.
 
 ### Functional support and remaining release prerequisites
 
@@ -39,19 +38,17 @@ Compilation, package smoke, and functional backend validation are separate:
 | --- | --- | --- |
 | macOS Apple silicon | Native Apple-container three-node Cilium acceptance in CI, including the sixty-second startup assertion | Requires the installed Apple `container` runtime and prepared backend assets; optional Lima is not covered by this job |
 | Linux x86_64 | Native Fedora 44 / Firecracker v1.18.0 validation observed fresh three-node Cilium, authenticated API, DNS/cross-node Service HTTP, stop/resume persistence and scale-out; fresh startup plus probes took 42.95s | Requires accessible KVM, rootless networking prerequisites and explicit prepared kernel/rootfs; this is not universal platform or feature parity |
-| macOS Intel | x86_64 package cross-compilation and architecture inspection only | No native Intel macOS runner is registered; native install/runtime and Lima backend acceptance remain unverified |
 | Linux ARM64 | Static cross-build and user-mode QEMU package smoke only | Native ARM64 Firecracker/KVM lifecycle remains unverified |
 
 See [Linux prerequisites and recorded native evidence](prerequisites-linux-firecracker.md).
-The new Linux CI job also asserts shrink-back to two workers, retained node identities,
-and functional DNS/Service traffic after shrinking; that new coverage needs a passing
-native CI run before claiming an observed scale-down result.
+Native Linux CI [run 242](https://iceberg.home.arpa/cloudflavor/kalisto/actions/runs/242),
+source `3eb6dcb32e831ba38b123986d921a936db285d9c`, passed the installed-CLI
+functional startup deadline, persistence, scale-out and scale-down with retained
+node identities and DNS/Service traffic after shrinking.
 
-The registered native runners are macOS arm64 (`macos`) and Linux x86_64
-(`tomis-host`, also carrying the container-runner label `tomis-ci`). No Intel
-label or hardware is inferred from the cross-built package. Provisioning a real
-Intel macOS runner and recording native installed-package plus backend acceptance
-is an external prerequisite for claiming Intel runtime support.
+The native runners are Apple-silicon macOS (`macos`) and x86_64 Linux on
+Stratofortress (`tomis-host`, also carrying the container-runner label `tomis-ci`).
+Published binaries target only macOS ARM64, Linux ARM64 and Linux x86_64.
 
 A public stable release and default Firecracker kernel/rootfs source are separate
 publication prerequisites; neither is created by a candidate build. Until published,
@@ -76,12 +73,12 @@ independently authenticated publisher signature. Trust the configured release so
 ## Pipeline and publication safety
 
 - Builds use locked dependencies and Rust 1.89.0. Tests, Clippy, formatting and
-  release-tooling regression checks gate all four builds.
+  release-tooling regression checks gate all three builds.
 - PRs and manual `workflow_dispatch` runs build/upload CI candidates and verify
-  the combined four-target inventory. **They never create a release.**
+  the combined three-target inventory. **They never create a release.**
 - Only a pushed release tag reaches publication. The publisher validates archive
   inventory, embedded metadata, architecture and exact tag/commit provenance.
-- After all builds pass, it creates a Forgejo **draft**, uploads four archives and
+- After all builds pass, it creates a Forgejo **draft**, uploads three archives and
   checksums, downloads them to verify hashes, rechecks that the tag has not moved,
   then makes the complete release visible.
 - Failed publication leaves any created release as draft; no partial public release.
@@ -95,7 +92,7 @@ independently authenticated publisher signature. Trust the configured release so
   assets retain their external shared cache paths to avoid cold rebuilds. Cleanup
   removes only the owned workspace; shared caches and unrelated jobs are preserved.
 - Release compilation remaps checkout, Cargo/rustup cache and home-directory paths
-  to neutral prefixes in all four binaries, preserving configured compiler flags.
+  to neutral prefixes in all three binaries, preserving configured compiler flags.
 - Artifact actions are pinned to verified Forgejo-compatible commits. Release tokens
   are neither printed nor included in archives; credential-bearing asset requests
   are never redirected to a different origin.
@@ -183,13 +180,13 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked -- --test-threads=1
 ```
 
-Use a manual release workflow run to build and verify all four candidates without
+Use a manual release workflow run to build and verify all three candidates without
 publishing. Run native functional checks only on the configured CI runner; they
 create and destroy their own real cluster, not a mock.
 
 For versioned candidate preparation, set the existing release workflow's optional
 manual-dispatch input `candidate_tag` to the intended SemVer tag, such as `v0.1.0`.
-All four packages then embed that version and the exact dispatched source commit.
+All three packages then embed that version and the exact dispatched source commit.
 This does not create a tag or publish a release, and the input cannot enable the
 tag-push publication step. Leave it empty for ordinary `ci-<commit>` development
 packages.
@@ -197,7 +194,7 @@ packages.
 ## Create a release
 
 Choose a reviewed commit with green CI and a new version. Require passing native
-startup acceptance and the complete four-target candidate inventory for that exact
+startup acceptance and the complete three-target candidate inventory for that exact
 commit before creating the release tag. Example only:
 
 ```bash
@@ -219,7 +216,7 @@ by opening its PR or running a manual candidate build.
 After publishing, dispatch **Stage verified website downloads** with the published
 `tag`. Staging resolves that tag's source commit independently of the workflow
 checkout, so an older release can be staged from a newer reviewed workflow.
-It verifies the four archives, provenance, checksums and unchanged tag before
+It verifies the three archives, provenance, checksums and unchanged tag before
 exposing files. Identical existing caches are reused; different operator data
 is never overwritten. A CI candidate is not a published release and cannot pass
 this staging gate.

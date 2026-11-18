@@ -44,8 +44,9 @@ artifacts when behavior changes.
   resolution. Firecracker startup never downloads missing guest artifacts.
 - Shared read-only Firecracker boot-asset disk; per-cluster writable disks,
   SSH identities and private manifests.
-- Four-target release packaging, checksums/provenance, draft-first publication
-  and verified website staging; see [release tooling](../docs/releases.md).
+- Three-target release packaging (macOS ARM64, Linux ARM64 and Linux x86_64),
+  checksums/provenance, draft-first publication and verified website staging;
+  see [release tooling](../docs/releases.md).
 - macOS build outputs/caches/large temporaries remain on mounted external
   storage. Borrowed runtimes and unrelated clusters are not cleanup targets.
 
@@ -70,6 +71,7 @@ HTTP, all within sixty seconds after preparation.
 | --- | --- | --- |
 | Apple containers | 38.11s | Native run 4478, source `015c15f`; not a measurement of every later revision. |
 | Firecracker | 42.95s; preparation separately 40.68s | Fedora 44 x86_64, Firecracker 1.18.0; persistence and scale-out verified outside the startup clock. |
+| Firecracker CI | Full functional deadline, persistence, scale-out and scale-down passed | Native run 5028 / UI 242, source `3eb6dcb`; verified owned kernel now configured for ongoing main validation. |
 | Lima | 56.07s, 53.84s, 54.26s, 54.83s | Historical native VZ development-Mac runs, not Apple-container results. |
 
 The source acceptance tests are `tests/macos_three_node_boot_budget.rs` and
@@ -88,9 +90,6 @@ functional readiness. See the
   configured download sources; there is no public default artifact source.
 - Linux native lifecycle evidence is x86_64-specific. An ARM64 Linux package is
   not proof of a native ARM64 Firecracker cluster.
-- Intel macOS packages are cross-compiled and architecture-checked; native Intel
-  runtime validation requires an Intel Mac/runner that is not currently
-  configured. Do not install Rosetta or claim emulation is native proof.
 - macOS binaries are unsigned and not notarized.
 - Lima archive import has no completed native restored-workload acceptance
   evidence or sub-minute guarantee; archives are not supported on every backend.

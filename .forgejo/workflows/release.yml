@@ -103,10 +103,6 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
       KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
       KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
@@ -133,7 +129,7 @@ jobs:
           mkdir -p "$workspace/tmp"
           export TMPDIR="$workspace/tmp"
           printf 'CARGO_HOME=%s/cargo-home\nRUSTUP_HOME=%s/release-rustup\nSCCACHE_DIR=%s/sccache\n' "$storage" "$storage" "$storage" >> "$GITHUB_ENV"
-          printf 'CARGO_TARGET_DIR=%s/release-target/%s\nTMPDIR=%s/tmp\n' "$storage" '${{ matrix.target }}' "$workspace" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/release-target/aarch64-apple-darwin\nTMPDIR=%s/tmp\n' "$storage" "$workspace" >> "$GITHUB_ENV"
           cd "$workspace"
           git init -q .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
@@ -142,11 +138,11 @@ jobs:
           case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
           git checkout -q --detach "${GITHUB_SHA}^{commit}"
       - name: Build binary, verify architecture and native smoke where supported
-        run: cd "$KALISTO_RELEASE_WORKSPACE" && bash scripts/release/build.sh '${{ matrix.target }}'
+        run: cd "$KALISTO_RELEASE_WORKSPACE" && bash scripts/release/build.sh aarch64-apple-darwin
       - name: Upload candidate archive
         uses: https://data.forgejo.org/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
         with:
-          name: kalisto-${{ matrix.target }}
+          name: kalisto-aarch64-apple-darwin
           path: ${{ env.KALISTO_RELEASE_DIST }}/*.tar.gz
           if-no-files-found: error
           retention-days: 7
@@ -176,7 +172,7 @@ jobs:
           git fetch -q --depth=1 "$url" "$GITHUB_SHA"
           case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
           git checkout -q --detach "${GITHUB_SHA}^{commit}"
-      - name: Download all four candidates
+      - name: Download all three candidates
         uses: https://data.forgejo.org/actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
         with:
           path: /tmp/kalisto-release-candidates

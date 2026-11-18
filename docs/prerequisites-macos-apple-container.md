@@ -14,9 +14,10 @@ not required.
 - Network access for initial runtime/kernel setup and `kalisto pull` preparation.
   Complete both before measuring offline cluster startup.
 
-Intel Macs and older macOS versions must select the
-[optional Lima backend](https://cloudflavor.io/kalisto/docs/lima/) explicitly. These
-Apple-container prerequisites do not apply to Lima or Linux Firecracker.
+macOS packages are ARM64-only. Apple-silicon Macs using older macOS versions must
+select the [optional Lima backend](https://cloudflavor.io/kalisto/docs/lima/)
+explicitly. These Apple-container prerequisites do not apply to Lima or Linux
+Firecracker.
 
 ## Install and start Apple container
 

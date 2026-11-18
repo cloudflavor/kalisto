@@ -18,7 +18,6 @@ import uuid
 
 TARGETS = {
     "aarch64-apple-darwin": ("macos", "arm64"),
-    "x86_64-apple-darwin": ("macos", "amd64"),
     "x86_64-unknown-linux-musl": ("linux", "amd64"),
     "aarch64-unknown-linux-musl": ("linux", "arm64"),
 }
@@ -67,7 +66,7 @@ def verify_binary(binary, target):
             if struct.unpack_from("<I", binary, offset + size * index)[0] == 3:
                 raise ValueError("Linux release must be static (unexpected ELF interpreter)")
     else:
-        cpu = 0x0100000C if arch == "arm64" else 0x01000007
+        cpu = 0x0100000C
         if len(binary) < 32 or binary[:4] != b"\xcf\xfa\xed\xfe" or struct.unpack_from("<I", binary, 4)[0] != cpu:
             raise ValueError("binary is not the expected macOS Mach-O64 architecture")
 
@@ -117,7 +116,7 @@ def collect_artifacts(root, tag, commit):
             verify_binary(archive.extractfile(binary_entry).read(), target)
         found[path.name] = path
     if set(found) != set(expected):
-        raise ValueError("all four macOS/Linux amd64/arm64 artifacts are required")
+        raise ValueError("macOS arm64, Linux amd64 and Linux arm64 artifacts are required")
     return found
 
 
@@ -217,7 +216,7 @@ def publish(api, root, tag, commit):
         release = api.request("POST", "/releases", {
             "tag_name": tag, "target_commitish": commit, "name": tag, "draft": True,
             "prerelease": TAG.fullmatch(tag).group(4) is not None,
-            "body": f"Kalisto {tag}, source `{commit}`.\n\nmacOS and static Linux binaries for amd64 and arm64.\n"
+            "body": f"Kalisto {tag}, source `{commit}`.\n\nmacOS arm64 and static Linux amd64/arm64 binaries.\n"
                     "Verify downloads against SHA256SUMS. macOS binaries are unsigned/not notarized.\n",
         })
     if not release["draft"]:

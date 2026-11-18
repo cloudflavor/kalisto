@@ -271,8 +271,8 @@ the repository's `KALISTO_FIRECRACKER_KERNEL` Actions variable with that verifie
 prepared kernel. Until configured, regular main CI skips the native Linux job;
 the historical functional observation above remains evidence, not a continuously
 enforced native gate. See [release CI configuration](releases.md#ci-configuration)
-for storage, runner variables, installed-archive smoke checks and the unverified
-Intel macOS / Linux ARM64 boundaries.
+for storage, runner variables, installed-archive smoke checks and Linux ARM64
+runtime validation boundaries. macOS distributions are ARM64-only.
 
 ## Operational Notes
 

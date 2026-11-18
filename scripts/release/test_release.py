@@ -25,7 +25,7 @@ def binary(target):
         struct.pack_into("<I", data, 64, 1)
     else:
         data[:4] = b"\xcf\xfa\xed\xfe"
-        struct.pack_into("<I", data, 4, 0x0100000C if target.startswith("aarch64") else 0x01000007)
+        struct.pack_into("<I", data, 4, 0x0100000C)
     return bytes(data)
 
 
@@ -92,9 +92,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.build_identity("refs/tags/v1.2.3", SHA, "5"), (TAG, "1.2.3"))
         self.assertEqual(release.build_identity("refs/heads/main", SHA, "5"), ("ci-aaaaaaaaaaaa", "0.0.0-ci.5+gaaaaaaaaaaaa"))
 
-    def test_four_architectures_package_and_inventory(self):
+    def test_supported_platform_packages_and_inventory(self):
         dist = self.candidates()
-        self.assertEqual(len(release.collect_artifacts(dist, TAG, SHA)), 4)
+        self.assertEqual(set(release.collect_artifacts(dist, TAG, SHA)), {
+            f"kalisto-{TAG}-macos-arm64.tar.gz",
+            f"kalisto-{TAG}-linux-amd64.tar.gz",
+            f"kalisto-{TAG}-linux-arm64.tar.gz",
+        })
         with tarfile.open(next(dist.glob("*.tar.gz"))) as archive:
             self.assertEqual(archive.getmember("kalisto").mode, 0o755)
             self.assertEqual(archive.getmember("kalisto").mtime, 0)
@@ -112,6 +116,10 @@ class ReleaseTests(unittest.TestCase):
     def test_wrong_architecture_dynamic_linux_or_incomplete_set_is_rejected(self):
         with self.assertRaises(ValueError):
             release.verify_binary(binary("x86_64-unknown-linux-musl"), "aarch64-unknown-linux-musl")
+        macos = bytearray(binary("aarch64-apple-darwin"))
+        struct.pack_into("<I", macos, 4, 0x01000007)
+        with self.assertRaises(ValueError):
+            release.verify_binary(macos, "aarch64-apple-darwin")
         data = bytearray(binary("aarch64-unknown-linux-musl"))
         struct.pack_into("<I", data, 64, 3)
         with self.assertRaises(ValueError):
@@ -132,13 +140,18 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.collect_artifacts(dist, TAG, SHA)
 
-    def test_publish_requires_complete_set_and_reads_back_all_five_assets(self):
+    def test_publish_reads_back_the_three_packages_and_checksum_inventory(self):
         api = FakeApi()
         result = release.publish(api, self.candidates(), TAG, SHA)
         self.assertFalse(result["draft"])
         self.assertTrue(api.published)
-        self.assertEqual(len(api.assets), 5)
-        self.assertEqual(len(api.assets["SHA256SUMS"].decode().splitlines()), 4)
+        self.assertEqual(set(api.assets), {
+            f"kalisto-{TAG}-macos-arm64.tar.gz",
+            f"kalisto-{TAG}-linux-amd64.tar.gz",
+            f"kalisto-{TAG}-linux-arm64.tar.gz",
+            "SHA256SUMS",
+        })
+        self.assertEqual(len(api.assets["SHA256SUMS"].decode().splitlines()), 3)
 
     def test_upload_failure_corruption_or_moved_tag_leaves_draft(self):
         dist = self.candidates()
