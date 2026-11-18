@@ -210,6 +210,7 @@ jobs:
             ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/backend-isolation.json
             ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/runtime-*.json
             ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/up.log
+            ${{ env.CARGO_TARGET_DIR }}/kalisto/boot-budget/*/pull.log
           if-no-files-found: warn
           retention-days: 7
       - name: Clean only this job's clusters and ephemeral data

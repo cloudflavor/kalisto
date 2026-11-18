@@ -1,0 +1,42 @@
+name: Inspect retained native preparation failure
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_case:
+        description: Existing native CI evidence directory (budget-PID-TIMESTAMP)
+        required: true
+        type: string
+
+jobs:
+  inspect:
+    runs-on: ${{ vars.KALISTO_MACOS_RUNNER }}
+    timeout-minutes: 5
+    env:
+      KALISTO_MACOS_VOLUME: ${{ vars.KALISTO_MACOS_VOLUME }}
+      KALISTO_MACOS_BUILD_ROOT: ${{ vars.KALISTO_MACOS_BUILD_ROOT }}
+      BUDGET_CASE: ${{ inputs.budget_case }}
+    steps:
+      - name: Read only the retained CI preparation log
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          volume = Path(os.environ["KALISTO_MACOS_VOLUME"]).resolve(strict=True)
+          base = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
+          assert volume != Path("/") and os.path.ismount(volume), "external build volume must be mounted"
+          assert base != volume and base.is_relative_to(volume)
+          assert base.stat().st_dev == volume.stat().st_dev
+          case = os.environ["BUDGET_CASE"]
+          assert re.fullmatch(r"budget-[0-9]+-[0-9]+", case), "not a native CI evidence directory"
+          evidence = base / "apple-container-ci/target/kalisto/boot-budget" / case
+          log = evidence / "pull.log"
+          assert not evidence.is_symlink() and not log.is_symlink()
+          resolved = log.resolve(strict=True)
+          assert resolved.parent == evidence.resolve(strict=True) and resolved.is_relative_to(base)
+          assert resolved.is_file() and resolved.stat().st_uid == os.getuid()
+          print(resolved.read_text()[-16384:])
+          PY
