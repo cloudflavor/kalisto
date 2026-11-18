@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::apple_container::runtime;
 use crate::cluster::spec::{ClusterSpec, ImageArch};
 use crate::error::{Error, Result};
+use crate::k3s::KUBELET_RESOLV_CONF_NAMESERVERS;
 use crate::process::CommandRunner;
 use crate::shell::shell_escape;
 
@@ -125,7 +126,8 @@ pub(crate) fn prepare(
     let mut attempted_create = false;
     let result = (|| {
         super::registry::prepare_remote_image(runner, BASE_IMAGE)?;
-        let args = vec![
+        let mut args = Vec::with_capacity(20 + 2 * KUBELET_RESOLV_CONF_NAMESERVERS.len());
+        args.extend([
             "run".into(),
             "--name".into(),
             name.clone(),
@@ -139,6 +141,13 @@ pub(crate) fn prepare(
             runtime::kernel_path()?.display().to_string(),
             "--init-image".into(),
             runtime::init_image()?,
+        ]);
+        // Host-local resolvers need not be reachable from the preparation VM.
+        // Reuse the resolver policy already applied to Kalisto's k3s guests.
+        for nameserver in KUBELET_RESOLV_CONF_NAMESERVERS {
+            args.extend(["--dns".into(), nameserver.into()]);
+        }
+        args.extend([
             "--volume".into(),
             format!("{assets}:{assets}:ro"),
             "--entrypoint".into(),
@@ -146,7 +155,7 @@ pub(crate) fn prepare(
             BASE_IMAGE.into(),
             "-c".into(),
             preparation_script(&assets_root.join("k3s"), &spec.k3s_version),
-        ];
+        ]);
         attempted_create = true;
         runtime::run(runner, &args)?;
         let rootfs = scratch.join("rootfs.tar");
@@ -188,7 +197,12 @@ fn preparation_script(binary: &Path, version: &str) -> String {
     format!(
         r#"set -eu
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
+if ! apt-get update -o APT::Update::Error-Mode=any; then
+    printf '%s\n' 'Kalisto image preparation DNS configuration:' >&2
+    cat /etc/resolv.conf >&2
+    cat /proc/net/route >&2
+    exit 1
+fi
 apt-get install -y --no-install-recommends ca-certificates coreutils findutils gawk grep iproute2 iptables kmod mount procps socat tar tini util-linux
 install -m 0755 {binary} /usr/local/bin/k3s
 actual=$(/usr/local/bin/k3s --version | awk 'NR==1 {{print $3}}')

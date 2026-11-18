@@ -47,6 +47,12 @@ profile. `kalisto up` does not install the host engine or download missing start
 assets. Runtime installation, service setup and preparation are outside the
 three-node startup measurement.
 
+The temporary node-image preparation VM uses the same explicit public DNS
+resolver policy as Kalisto's k3s guests, rather than inheriting a host-local
+resolver that may be unreachable from the VM. Preparation stops if Ubuntu
+package indexes cannot be fetched; it does not mark a partial image as prepared.
+This changes neither the host DNS settings nor the shared runtime services.
+
 Fresh Apple-container nodes use containerd's OverlayFS snapshotter on the pinned
 Kata kernel, sharing immutable image layers rather than copying Cilium's full
 root filesystem for each init container. After upgrading from a native-snapshotter
