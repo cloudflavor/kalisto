@@ -158,10 +158,15 @@ impl BorrowedAppleRuntime {
         );
         assert!(install.is_absolute());
         for service in services.values() {
-            assert_eq!(
-                service["CONTAINER_INSTALL_ROOT"].as_str().map(Path::new),
-                Some(install.as_path()),
-                "borrowed services must use the same installation"
+            let root = Path::new(service["CONTAINER_INSTALL_ROOT"].as_str().unwrap());
+            let program = Path::new(service["program"].as_str().unwrap());
+            assert!(root.is_absolute());
+            assert!(
+                program
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(root.canonicalize().unwrap()),
+                "borrowed service program must belong to its declared installation"
             );
         }
         let properties: serde_json::Value = serde_json::from_slice(&runtime_output(

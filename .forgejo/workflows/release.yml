@@ -5,6 +5,15 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Optional SemVer tag for manual candidate packages; never publishes
+        required: false
+        default: ''
+        type: string
+
+env:
+  KALISTO_BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_tag != '' && format('refs/tags/{0}', inputs.candidate_tag) || github.ref }}
 
 # Never cancel a release halfway through publication. Different tags are isolated.
 concurrency:
@@ -33,7 +42,7 @@ jobs:
       - name: Validate release tooling and tag policy
         run: |
           python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-          python3 scripts/release/release.py identity --ref "$GITHUB_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID"
+          python3 scripts/release/release.py identity --ref "$KALISTO_BUILD_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID"
       - name: Rust checks
         run: |
           cargo fmt --all --check
@@ -173,7 +182,7 @@ jobs:
           path: /tmp/kalisto-release-candidates
       - name: Verify complete candidate inventory without publishing on PR/manual runs
         run: |
-          tag=$(python3 scripts/release/release.py identity --ref "$GITHUB_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID" | awk -F= '/^BUILD_TAG=/ {print $2}')
+          tag=$(python3 scripts/release/release.py identity --ref "$KALISTO_BUILD_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID" | awk -F= '/^BUILD_TAG=/ {print $2}')
           python3 scripts/release/release.py verify --root /tmp/kalisto-release-candidates --tag "$tag" --commit "$(git rev-parse HEAD)"
       - name: Upload and read back draft assets, then publish only on a pushed tag
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
