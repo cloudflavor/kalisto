@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
@@ -128,6 +128,7 @@ impl ClusterBackend for FirecrackerBackend {
             FirecrackerNetworkMode::Bridge => {
                 let net = NetworkConfig::for_bridge_instance(&instance.name);
                 ensure_prepared_network(&net)?;
+                write_file(&runtime.guest_ip, &format!("{}\n", net.guest_ip))?;
                 net
             }
             FirecrackerNetworkMode::RootlessSlirp => {
@@ -169,7 +170,6 @@ impl ClusterBackend for FirecrackerBackend {
         let mut child = spawn_background_process(&mut child, "firecracker")?;
 
         write_file(&runtime.pid, &format!("{}\n", child.id()))?;
-        write_file(&runtime.guest_ip, &format!("{}\n", net.guest_ip))?;
         write_file(&runtime.host_ip, &format!("{}\n", net.host_ip))?;
         write_file(&runtime.tap_name, &format!("{}\n", net.tap_name))?;
 
@@ -653,10 +653,13 @@ impl NetworkConfig {
 
     // Same intentional hash truncation as for_bridge_instance.
     #[allow(clippy::cast_possible_truncation)]
-    fn for_rootless_instance(name: &str, ssh_port: u16, api_port_forward: Option<u16>) -> Self {
+    fn for_rootless_instance(
+        name: &str,
+        guest_ip: Ipv4Addr,
+        ssh_port: u16,
+        api_port_forward: Option<u16>,
+    ) -> Self {
         let hash = stable_hash(name);
-        let host_octet = 100 + (hash % 100) as u8;
-        let guest_ip = format!("10.0.2.{host_octet}");
         let guest_mac = format!(
             "06:00:{:02x}:{:02x}:{:02x}:{:02x}",
             (hash >> 24) as u8,
@@ -672,7 +675,7 @@ impl NetworkConfig {
             bridge_name: BRIDGE_NAME.to_owned(),
             tap_name,
             host_ip: ROOTLESS_SLIRP_GATEWAY_IP.to_owned(),
-            guest_ip,
+            guest_ip: guest_ip.to_string(),
             guest_mac,
             cidr_bits: ROOTLESS_SLIRP_CIDR_BITS,
             ssh_port: Some(ssh_port),
@@ -727,9 +730,11 @@ fn prepare_rootless_network(
     runtime: &RuntimeFiles,
 ) -> Result<NetworkConfig> {
     let cluster_network = ensure_rootless_cluster_network(runner, &instance.runtime_root)?;
+    let guest_ip = reserve_rootless_guest_ip(runtime)?;
     let ssh_port = reserve_host_port()?;
     let api_port_forward = instance.host_port_forward;
-    let net = NetworkConfig::for_rootless_instance(&instance.name, ssh_port, api_port_forward);
+    let net =
+        NetworkConfig::for_rootless_instance(&instance.name, guest_ip, ssh_port, api_port_forward);
 
     ensure_rootless_tap(runner, cluster_network.anchor_pid, &net)?;
     ensure_slirp_host_forward(&cluster_network.api_socket, ssh_port, &net.guest_ip, 22)?;
@@ -747,23 +752,87 @@ fn prepare_rootless_network(
     Ok(net)
 }
 
-fn ensure_rootless_cluster_network(
-    runner: &dyn CommandRunner,
-    runtime_root: &Path,
-) -> Result<RootlessClusterNetwork> {
-    let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
-    fs::create_dir_all(&root).map_err(io_error("create_dir_all"))?;
-    // Concurrent node starts must share one fully initialized namespace.
-    let network_lock = fs::OpenOptions::new()
+fn lock_rootless_network(root: &Path) -> Result<fs::File> {
+    fs::create_dir_all(root).map_err(io_error("create_dir_all"))?;
+    let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(root.join("initialization.lock"))
         .map_err(io_error("open rootless network lock"))?;
-    network_lock
-        .lock()
-        .map_err(io_error("lock rootless network"))?;
+    lock.lock().map_err(io_error("lock rootless network"))?;
+    Ok(lock)
+}
+
+fn read_rootless_guest_ip(path: &Path) -> Result<Option<Ipv4Addr>> {
+    let Some(value) = read_trimmed(path)? else {
+        return Ok(None);
+    };
+    let address = value
+        .parse::<Ipv4Addr>()
+        .ok()
+        .filter(|address| {
+            let [a, b, c, d] = address.octets();
+            [a, b, c] == [10, 0, 2] && (100..=254).contains(&d)
+        })
+        .ok_or_else(|| {
+            Error::InvalidArgs(format!(
+                "invalid rootless Firecracker guest address in {}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(address))
+}
+
+fn reserve_rootless_guest_ip(runtime: &RuntimeFiles) -> Result<Ipv4Addr> {
+    let runtime_root = runtime.guest_ip.parent().ok_or_else(|| {
+        Error::InvalidArgs("missing Firecracker instance runtime root".to_owned())
+    })?;
+    let cluster_root = cluster_runtime_root(runtime_root)?;
+    // Reserve before boot, under the same cross-process lock as namespace setup.
+    // The persisted address stays reserved until the node runtime is removed.
+    let _lock = lock_rootless_network(&cluster_root.join(ROOTLESS_NETWORK_DIR))?;
+    let existing = read_rootless_guest_ip(&runtime.guest_ip)?;
+    let mut used = [false; 256];
+    for entry in fs::read_dir(&cluster_root).map_err(io_error("read_dir"))? {
+        let entry = entry.map_err(io_error("read_dir"))?;
+        if !entry.file_type().map_err(io_error("file_type"))?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("guest-ip");
+        if path == runtime.guest_ip {
+            continue;
+        }
+        if let Some(address) = read_rootless_guest_ip(&path)? {
+            let index = usize::from(address.octets()[3]);
+            if used[index] || existing == Some(address) {
+                return Err(Error::InvalidArgs(format!(
+                    "duplicate rootless Firecracker guest address {address}; recreate the affected cluster"
+                )));
+            }
+            used[index] = true;
+        }
+    }
+    if let Some(address) = existing {
+        return Ok(address);
+    }
+    let octet = (100_u8..=254)
+        .find(|octet| !used[usize::from(*octet)])
+        .ok_or_else(|| {
+            Error::InvalidArgs("rootless Firecracker guest address pool is exhausted".to_owned())
+        })?;
+    let address = Ipv4Addr::new(10, 0, 2, octet);
+    write_file(&runtime.guest_ip, &format!("{address}\n"))?;
+    Ok(address)
+}
+
+fn ensure_rootless_cluster_network(
+    runner: &dyn CommandRunner,
+    runtime_root: &Path,
+) -> Result<RootlessClusterNetwork> {
+    let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
+    let _network_lock = lock_rootless_network(&root)?;
 
     let anchor_path = root.join("anchor.pid");
     let slirp_path = root.join("slirp4netns.pid");
@@ -1522,6 +1591,9 @@ fn load_network_config(runtime: &RuntimeFiles, instance_name: &str) -> Result<Ne
         FirecrackerNetworkMode::Bridge => NetworkConfig::for_bridge_instance(instance_name),
         FirecrackerNetworkMode::RootlessSlirp => NetworkConfig::for_rootless_instance(
             instance_name,
+            read_rootless_guest_ip(&runtime.guest_ip)?.ok_or_else(|| {
+                Error::InvalidArgs("missing rootless Firecracker guest address".to_owned())
+            })?,
             read_trimmed(&runtime.ssh_port)?
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(22),
@@ -1530,11 +1602,14 @@ fn load_network_config(runtime: &RuntimeFiles, instance_name: &str) -> Result<Ne
     };
     let tap_name = read_trimmed(&runtime.tap_name)?.unwrap_or_else(|| default.tap_name.clone());
     let host_ip = read_trimmed(&runtime.host_ip)?.unwrap_or_else(|| default.host_ip.clone());
-    let guest_ip = read_trimmed(&runtime.guest_ip)?.unwrap_or_else(|| default.guest_ip.clone());
     let mut net = default;
     net.tap_name = tap_name;
     net.host_ip = host_ip;
-    net.guest_ip = guest_ip;
+    if network_mode == FirecrackerNetworkMode::Bridge
+        && let Some(guest_ip) = read_trimmed(&runtime.guest_ip)?
+    {
+        net.guest_ip = guest_ip;
+    }
     Ok(net)
 }
 
@@ -2140,7 +2215,7 @@ mod tests {
         BACKEND, FirecrackerNetworkMode, NetworkConfig, ROOTLESS_SLIRP_SHORT_SOCKET_DIR,
         UNIX_SOCKET_PATH_MAX, build_config_json, choose_slirp_api_socket_path, firecracker_subnet,
         load_slirp_api_socket_path, nat_postrouting_rule_args, parse_default_route_interface,
-        parse_pid_and_args_line, stable_hash,
+        parse_pid_and_args_line,
     };
     use crate::backend::InstanceConfig;
     use crate::backend::runtime::ClusterBackend;
@@ -2496,6 +2571,7 @@ mod tests {
         fs::write(&source, "manifest contents\n".repeat(20_000)).unwrap();
         fs::write(root.join("network-mode"), "slirp4netns\n").unwrap();
         fs::write(root.join("ssh-port"), "12345\n").unwrap();
+        fs::write(root.join("guest-ip"), "10.0.2.100\n").unwrap();
         let runner = RecordingRunner::default();
         BACKEND
             .copy_file_to_guest(
@@ -2543,9 +2619,103 @@ mod tests {
     }
 
     #[test]
-    fn stable_hash_is_deterministic() {
-        assert_eq!(stable_hash("kalisto-cp"), stable_hash("kalisto-cp"));
-        assert_ne!(stable_hash("kalisto-cp"), stable_hash("kalisto-w0"));
+    fn rootless_guest_addresses_survive_concurrent_start_and_resume() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-rootless-addresses-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // These real run-5194 node names previously shared 10.0.2.179.
+        let names = [
+            "kalisto-fc-budget-2101242-1795039399584806568-cp",
+            "kalisto-fc-budget-2101242-1795039399584806568-w0",
+            "kalisto-fc-budget-2101242-1795039399584806568-w1",
+        ];
+        let barrier = std::sync::Barrier::new(names.len());
+        let assigned = std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    let root = &root;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let directory = root.join(name);
+                        fs::create_dir_all(&directory).unwrap();
+                        let runtime = super::RuntimeFiles::new(&directory);
+                        barrier.wait();
+                        let address = super::reserve_rootless_guest_ip(&runtime).unwrap();
+                        fs::write(&runtime.network_mode, "slirp4netns\n").unwrap();
+                        fs::write(&runtime.ssh_port, "12345\n").unwrap();
+                        let net = NetworkConfig::for_rootless_instance(name, address, 12345, None);
+                        assert_eq!(
+                            super::load_network_config(&runtime, name).unwrap().guest_ip,
+                            net.guest_ip
+                        );
+                        assert_eq!(super::reserve_rootless_guest_ip(&runtime).unwrap(), address);
+                        net.guest_ip
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(assigned.len(), names.len());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rootless_guest_address_pool_exhaustion_and_removal() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-rootless-address-pool-{}",
+            std::process::id()
+        ));
+        for octet in 100..=254 {
+            let directory = root.join(format!("node-{octet}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("guest-ip"), format!("10.0.2.{octet}\n")).unwrap();
+        }
+        let pending = root.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let runtime = super::RuntimeFiles::new(&pending);
+        assert!(super::reserve_rootless_guest_ip(&runtime).is_err());
+        assert!(!runtime.guest_ip.exists());
+        fs::remove_dir_all(root.join("node-100")).unwrap();
+        assert_eq!(
+            super::reserve_rootless_guest_ip(&runtime)
+                .unwrap()
+                .to_string(),
+            "10.0.2.100"
+        );
+        let retained = super::RuntimeFiles::new(&root.join("node-101"));
+        assert_eq!(
+            super::reserve_rootless_guest_ip(&retained)
+                .unwrap()
+                .to_string(),
+            "10.0.2.101"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rootless_duplicate_persisted_addresses_are_not_renumbered() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-rootless-duplicate-addresses-{}",
+            std::process::id()
+        ));
+        for name in ["cp", "w0"] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("guest-ip"), "10.0.2.179\n").unwrap();
+        }
+        let runtime = super::RuntimeFiles::new(&root.join("cp"));
+        assert!(super::reserve_rootless_guest_ip(&runtime).is_err());
+        assert_eq!(fs::read_to_string(&runtime.guest_ip).unwrap(), "10.0.2.179\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

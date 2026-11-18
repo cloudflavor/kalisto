@@ -205,6 +205,12 @@ Kalisto currently has two Linux Firecracker networking modes:
 
 `slirp4netns` is now the default Firecracker mode on Linux.
 
+Guest addresses are allocated from `10.0.2.100`–`10.0.2.254` under a per-cluster
+file lock before boot. Each node keeps its persisted address across stop/resume;
+removing the node releases it. Allocation fails explicitly when the pool is full.
+Older clusters with duplicate persisted addresses must be backed up and recreated;
+Kalisto does not silently renumber running guests or their existing rootfs.
+
 Use `--network bridge` only when you explicitly want host bridge/TAP networking
 and have the required host privileges (sudo).
 
