@@ -76,10 +76,27 @@ jobs:
               return result
 
           def field(text, key, separator="="):
-              matches = re.findall(r"^\s*" + re.escape(key) + r"\s*" + re.escape(separator)
-                                   + r"\s*(.*?)\s*$", text, re.MULTILINE)
-              require(len(matches) == 1, "unknown launchd service schema")
-              return matches[0]
+              program_rows = list(re.finditer(r"^([ \t]*)program[ \t]*=[ \t]*(.*?)[ \t]*$",
+                                              text, re.MULTILINE))
+              require(bool(program_rows), "launchd program field is absent")
+              root_depth = min(len(row[1].expandtabs()) for row in program_rows)
+              if separator == "=>":
+                  headers = [row for row in re.finditer(
+                      r"^([ \t]*)environment[ \t]*=[ \t]*\{[ \t]*$", text, re.MULTILINE)
+                      if len(row[1].expandtabs()) == root_depth]
+                  require(len(headers) == 1, "unknown explicit launchd environment schema")
+                  header = headers[0]
+                  closing = re.search(r"^" + re.escape(header[1]) + r"\}[ \t]*$",
+                                      text[header.end():], re.MULTILINE)
+                  require(closing is not None, "unterminated launchd environment")
+                  text = text[header.end():header.end() + closing.start()]
+              rows = list(re.finditer(r"^([ \t]*)" + re.escape(key) + r"[ \t]*"
+                                     + re.escape(separator) + r"[ \t]*(.*?)[ \t]*$",
+                                     text, re.MULTILINE))
+              if separator == "=":
+                  rows = [row for row in rows if len(row[1].expandtabs()) == root_depth]
+              require(len(rows) == 1, "unknown launchd field schema: " + key)
+              return rows[0][2]
 
           def service_live(label, captured):
               text = run(["/bin/launchctl", "print", domain + "/" + label])
