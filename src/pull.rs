@@ -139,7 +139,7 @@ fn profile(spec: &ClusterSpec) -> Result<String> {
     Ok(format!(
         "{}{}-{}-{}-{}-{components:02x}",
         match spec.backend {
-            BackendKind::AppleContainer => "apple-container-v2-",
+            BackendKind::AppleContainer => "apple-container-v3-",
             BackendKind::Firecracker => "firecracker-v1-",
             BackendKind::Lima => "",
         },
