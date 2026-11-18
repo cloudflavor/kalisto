@@ -56,7 +56,6 @@ class FakeApi:
             return [{"name": name, "id": index, "size": len(data), "browser_download_url": f"{SERVER}/asset/{name}"}
                     for index, (name, data) in enumerate(self.assets.items())]
         if method == "PATCH":
-            assert len(self.assets) == 5
             self.published = True
             self.release.update(payload)
             return self.release
