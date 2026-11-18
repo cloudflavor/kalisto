@@ -291,6 +291,12 @@ not enter the shared cache.
 that persisted profile. `destroy` removes the named cluster but leaves the
 prepared boot cache available for future fresh clusters.
 
+Graceful stop requests an orderly guest reboot (Firecracker exits on CPU reset),
+then waits for the Firecracker process to exit, not merely for SSH to disconnect.
+If shutdown does not finish within 30 seconds, Kalisto returns an error and
+retains the VM's PID and network ownership rather than killing a guest that may
+still be flushing its disks.
+
 ## Inspection Script
 
 The repository includes a helper script to inspect a Linux host for Firecracker prerequisites:

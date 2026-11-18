@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tracing::debug;
@@ -1796,39 +1796,52 @@ fn ssh_connection_args<'a>(
     Ok((args, host))
 }
 
+fn wait_for_process_exit(runner: &dyn CommandRunner, pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_exists(runner, pid) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+}
+
 fn stop_process(
     runner: &dyn CommandRunner,
     runtime: &RuntimeFiles,
     net: &NetworkConfig,
     force: bool,
 ) -> Result<()> {
-    if !force {
-        let _ = run_ssh_command(
-            runner,
-            &runtime.ssh_key,
-            net,
-            "sudo shutdown -h now || sudo poweroff || true",
-        );
-        for _ in 0..30 {
-            if run_ssh_command(runner, &runtime.ssh_key, net, "true").is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    }
-
     if let Some(pid) = read_pid(&runtime.pid)?
         && process_exists(runner, pid)
     {
-        let _ = signal(runner, "-TERM", pid);
-        for _ in 0..20 {
-            if !process_exists(runner, pid) {
-                break;
+        if force {
+            let _ = signal(runner, "-TERM", pid);
+            if !wait_for_process_exit(runner, pid, Duration::from_secs(5)) {
+                let _ = signal(runner, "-KILL", pid);
             }
-            thread::sleep(Duration::from_millis(250));
-        }
-        if process_exists(runner, pid) {
-            let _ = signal(runner, "-KILL", pid);
+        } else {
+            let shutdown = run_ssh_command(
+                runner,
+                &runtime.ssh_key,
+                net,
+                "sudo shutdown -r now || sudo reboot",
+            );
+            // Firecracker exits on CPU reset, not guest halt. sshd stops before
+            // disks are flushed, so wait for VMM exit instead of SSH loss.
+            if !wait_for_process_exit(runner, pid, Duration::from_secs(30)) {
+                let detail = shutdown
+                    .err()
+                    .map(|error| format!("; shutdown request: {error}"))
+                    .unwrap_or_default();
+                return Err(Error::InvalidArgs(format!(
+                    "guest shutdown did not finish within 30s; refusing to terminate Firecracker process {pid} with unflushed disks{detail}"
+                )));
+            }
         }
     }
 
@@ -2615,6 +2628,56 @@ mod tests {
                 .unwrap()
                 .starts_with("rm -f -- ")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graceful_stop_waits_for_vm_exit_after_ssh_disconnects() {
+        #[derive(Default)]
+        struct ShutdownRunner(Mutex<u8>);
+
+        impl CommandRunner for ShutdownRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+                let mut state = self.0.lock().unwrap();
+                if program == "ssh" {
+                    if args.last().is_some_and(|arg| arg == "true") {
+                        return Err(crate::error::Error::InvalidArgs(
+                            "ssh disconnected".to_owned(),
+                        ));
+                    }
+                    *state = 1;
+                } else if program == "kill" && args.first().is_some_and(|arg| arg == "-0") {
+                    match *state {
+                        0 => {}
+                        1 => *state = 2,
+                        _ => {
+                            *state = 3;
+                            return Err(crate::error::Error::InvalidArgs("VM exited".to_owned()));
+                        }
+                    }
+                } else {
+                    panic!("must not terminate the VMM during guest shutdown: {program} {args:?}");
+                }
+                Ok(Output {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-graceful-stop-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let runtime = super::RuntimeFiles::new(&root);
+        fs::write(&runtime.pid, "12345\n").unwrap();
+        let runner = ShutdownRunner::default();
+        let net = NetworkConfig::for_bridge_instance("vm");
+        super::stop_process(&runner, &runtime, &net, false).unwrap();
+        assert_eq!(*runner.0.lock().unwrap(), 3);
+        assert!(!runtime.pid.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
