@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package verified binaries and publish complete, immutable Forgejo releases."""
+"""Package verified binaries and publish complete, immutable GitHub releases."""
 
 import argparse
 import gzip
@@ -10,11 +10,12 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
 import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
+import base64
 
 TARGETS = {
     "aarch64-apple-darwin": ("macos", "arm64"),
@@ -123,96 +124,230 @@ def collect_artifacts(root, tag, commit):
 class ApiError(RuntimeError):
     def __init__(self, code):
         self.code = code
-        super().__init__(f"Forgejo release API returned HTTP {code}")
+        super().__init__(f"GitHub release API returned HTTP {code}")
 
 
-class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
-    def __init__(self, origin):
+def github_url(url, host):
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != "https" or parsed.netloc != host or parsed.username
+            or parsed.password or parsed.fragment):
+        raise ValueError("refusing an untrusted GitHub URL")
+    return parsed
+
+
+class GitHubRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, asset=False):
         super().__init__()
-        self.origin = origin
+        self.asset = asset
 
     def redirect_request(self, request, response, code, message, headers, newurl):
         parsed = urllib.parse.urlsplit(newurl)
-        if f"{parsed.scheme}://{parsed.netloc}" != self.origin or parsed.username or parsed.password:
-            raise ValueError("refusing to forward release credentials to another origin")
-        return super().redirect_request(request, response, code, message, headers, newurl)
+        origin = urllib.parse.urlsplit(request.full_url)
+        # These are GitHub's release-asset storage endpoints, not a wildcard
+        # allowance for user-controlled githubusercontent.com content.
+        storage = {"release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.fragment or parsed.netloc != parsed.hostname):
+            raise ValueError("refusing an untrusted GitHub redirect")
+        same_origin = parsed.netloc == origin.netloc
+        if not same_origin and not (self.asset and parsed.netloc in storage and parsed.query):
+            raise ValueError("refusing a redirect outside GitHub asset storage")
+        redirected = super().redirect_request(request, response, code, message, headers, newurl)
+        if redirected is not None and not same_origin:
+            redirected.remove_header("Authorization")
+        return redirected
 
 
-class Forgejo:
-    def __init__(self, token, server, repository):
-        parsed = urllib.parse.urlsplit(server)
-        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
-                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
-            raise ValueError("release server must be an explicitly configured HTTPS origin")
+class GitHub:
+    def __init__(self, token, repository):
         if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
                 or any(part in (".", "..") for part in repository.split("/"))):
-            raise ValueError("release repository must be explicitly configured as owner/name")
+            raise ValueError("KALISTO_GITHUB_REPOSITORY must be explicitly configured as owner/name")
         if not token:
-            raise ValueError("release token is missing")
-        self.origin = f"{parsed.scheme}://{parsed.netloc}"
-        self.base = f"{self.origin}/api/v1/repos/{repository}"
+            raise ValueError("KALISTO_GITHUB_TOKEN is missing")
+        self.repository = repository
+        self.base = f"https://api.github.com/repos/{repository}"
         self.token = token
 
-    def request(self, method, path, payload=None, content_type="application/json", raw=False):
+    def headers(self, accept="application/vnd.github+json"):
+        return {"Authorization": f"Bearer {self.token}", "Accept": accept,
+                "X-GitHub-Api-Version": "2022-11-28"}
+
+    def request(self, method, path, payload=None):
+        return self.send(method, self.base + path, payload)
+
+    def send(self, method, url, payload=None, content_type="application/json"):
+        host = urllib.parse.urlsplit(url).hostname
+        if host not in ("api.github.com", "uploads.github.com"):
+            raise ValueError("refusing to send GitHub credentials outside its API endpoints")
+        github_url(url, host)
         data = json.dumps(payload).encode() if isinstance(payload, dict) else payload
-        request = urllib.request.Request(self.base + path, data=data, method=method,
-            headers={"Authorization": f"token {self.token}", "Content-Type": content_type})
+        request = urllib.request.Request(url, data=data, method=method,
+            headers=dict(self.headers(), **{"Content-Type": content_type}))
         try:
-            with urllib.request.build_opener(SameOriginRedirect(self.origin)).open(request, timeout=120) as response:
+            with urllib.request.build_opener(GitHubRedirect()).open(request, timeout=120) as response:
                 content = response.read()
         except urllib.error.HTTPError as error:
             raise ApiError(error.code) from None
-        return content if raw else json.loads(content)
+        return json.loads(content)
 
-    def upload(self, release_id, name, content):
-        boundary = f"kalisto-{uuid.uuid4().hex}"
-        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"{name}\"\r\n"
-                f"Content-Type: application/octet-stream\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
-        return self.request("POST", f"/releases/{release_id}/assets?name={urllib.parse.quote(name)}", body,
-                            f"multipart/form-data; boundary={boundary}")
+    def upload(self, published, name, content):
+        url = published["upload_url"].split("{", 1)[0]
+        parsed = github_url(url, "uploads.github.com")
+        if parsed.path != f"/repos/{self.repository}/releases/{published['id']}/assets" or parsed.query:
+            raise ValueError("unexpected GitHub release upload endpoint")
+        return self.send("POST", url + "?name=" + urllib.parse.quote(name, safe=""),
+                         content, "application/octet-stream")
 
     def download(self, asset):
-        url = asset["browser_download_url"]
-        parsed = urllib.parse.urlsplit(url)
-        if f"{parsed.scheme}://{parsed.netloc}" != self.origin or parsed.username or parsed.password:
-            raise ValueError("release asset URL is outside the configured Forgejo origin")
-        if not 0 <= asset["size"] <= 256 * 1024 * 1024:
+        url = asset["url"]
+        parsed = github_url(url, "api.github.com")
+        if not re.fullmatch(re.escape(f"/repos/{self.repository}/releases/assets/") + r"[0-9]+", parsed.path) or parsed.query:
+            raise ValueError("unexpected GitHub asset API endpoint")
+        if not isinstance(asset["size"], int) or not 0 <= asset["size"] <= 256 * 1024 * 1024:
             raise ValueError("release asset size exceeds limit")
-        request = urllib.request.Request(url, headers={"Authorization": f"token {self.token}"})
-        with urllib.request.build_opener(SameOriginRedirect(self.origin)).open(request, timeout=120) as response:
+        request = urllib.request.Request(url, headers=self.headers("application/octet-stream"))
+        with urllib.request.build_opener(GitHubRedirect(asset=True)).open(request, timeout=120) as response:
             data = response.read(asset["size"] + 1)
         if len(data) != asset["size"]:
             raise ValueError("release asset size mismatch")
         return data
 
+    def tag_object(self, tag):
+        ref = self.request("GET", f"/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+        if ref["ref"] != f"refs/tags/{tag}":
+            raise ValueError("GitHub returned a different release tag")
+        return {key: ref["object"][key] for key in ("type", "sha")}
+
     def tag_commit(self, tag):
-        refs = self.request("GET", f"/git/refs/tags/{urllib.parse.quote(tag, safe='')}")
-        matching = [ref for ref in refs if ref["ref"] == f"refs/tags/{tag}"]
-        if len(matching) != 1:
-            raise ValueError("release tag is missing or ambiguous")
-        obj = matching[0]["object"]
+        obj = self.tag_object(tag)
         for _ in range(8):
-            if obj["type"] == "commit":
+            if obj["type"] == "commit" and COMMIT.fullmatch(obj["sha"]):
                 return obj["sha"]
-            if obj["type"] != "tag":
+            if obj["type"] != "tag" or not COMMIT.fullmatch(obj["sha"]):
                 break
             obj = self.request("GET", f"/git/tags/{obj['sha']}")["object"]
         raise ValueError("tag does not resolve to a commit")
 
+    def verify_source(self, tag, commit, expected_tag):
+        if self.tag_object(tag) != expected_tag or self.tag_commit(tag) != commit:
+            raise ValueError("GitHub tag moved or points to a different source commit")
+        source = self.request("GET", f"/commits/{commit}")
+        comparison = self.request("GET", f"/compare/{commit}...main")
+        if source["sha"] != commit or comparison["status"] not in ("ahead", "identical"):
+            raise ValueError("GitHub release source is not on main ancestry")
 
-def publish(api, root, tag, commit):
+
+class SourceRepository:
+    """Synchronize only reviewed source with ordinary, protection-aware Git pushes."""
+    def git(self, *args, env=None):
+        result = subprocess.run(["git", *args], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        if result.returncode:
+            # Git diagnostics can include credentials; never relay them to CI logs.
+            raise ValueError("source Git operation failed; check ancestry, permissions and branch protections")
+        return result.stdout.strip()
+
+    def verify_source_refs(self, tag, expected):
+        source = os.environ.get("GITHUB_SERVER_URL", "")
+        repository = os.environ.get("GITHUB_REPOSITORY", "")
+        token = os.environ.get("GITHUB_TOKEN", "")
+        parsed = urllib.parse.urlsplit(source)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.path not in ("", "/") or parsed.query
+                or parsed.fragment or not token or parsed.hostname == "github.com"
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or any(part in (".", "..") for part in repository.split("/"))):
+            raise ValueError("source checkout credentials and HTTPS repository must be explicit")
+        credentials = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="3",
+                   GIT_CONFIG_KEY_0=f"http.{origin}/.extraheader",
+                   GIT_CONFIG_VALUE_0=f"Authorization: Basic {credentials}",
+                   GIT_CONFIG_KEY_1="credential.helper", GIT_CONFIG_VALUE_1="",
+                   GIT_CONFIG_KEY_2="http.followRedirects", GIT_CONFIG_VALUE_2="false")
+        refs = self.git("ls-remote", "--refs", f"{origin}/{repository}.git",
+                        f"refs/tags/{tag}", "refs/heads/main", env=env)
+        refs = dict(line.split()[::-1] for line in refs.splitlines())
+        if refs.get(f"refs/tags/{tag}") != expected["sha"]:
+            raise ValueError("source release tag changed or disappeared")
+        if refs.get("refs/heads/main") != self.git("rev-parse", "refs/remotes/origin/main"):
+            raise ValueError("source main changed; rerun against a fresh reviewed source snapshot")
+
+    def verify(self, api, tag, commit, expected):
+        self.verify_source_refs(tag, expected)
+        api.verify_source(tag, commit, expected)
+
+    def prepare(self, api, tag, commit):
+        if not COMMIT.fullmatch(commit):
+            raise ValueError("invalid source commit")
+        tag_ref = f"refs/tags/{tag}"
+        if self.git("rev-parse", "HEAD") != commit or self.git("rev-parse", f"{tag_ref}^{{commit}}") != commit:
+            raise ValueError("local release tag does not match the built source")
+        main = self.git("rev-parse", "refs/remotes/origin/main")
+        self.git("merge-base", "--is-ancestor", commit, main)
+        tag_sha = self.git("rev-parse", tag_ref)
+        tag_type = self.git("cat-file", "-t", tag_sha)
+        expected = {"type": tag_type, "sha": tag_sha}
+        self.verify_source_refs(tag, expected)
+        credentials = base64.b64encode(f"x-access-token:{api.token}".encode()).decode()
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="3",
+                   GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                   GIT_CONFIG_VALUE_0=f"Authorization: Basic {credentials}",
+                   GIT_CONFIG_KEY_1="credential.helper", GIT_CONFIG_VALUE_1="",
+                   GIT_CONFIG_KEY_2="http.followRedirects", GIT_CONFIG_VALUE_2="false")
+        remote = f"https://github.com/{api.repository}.git"
+        refs = {}
+        for line in self.git("ls-remote", "--refs", remote, "refs/heads/main", tag_ref, env=env).splitlines():
+            sha, ref = line.split()
+            refs[ref] = sha
+        if tag_ref in refs and refs[tag_ref] != tag_sha:
+            raise ValueError("GitHub already has a different tag; refusing to overwrite it")
+        update_main = "refs/heads/main" not in refs
+        if not update_main:
+            self.git("fetch", "--no-tags", remote, "refs/heads/main:refs/remotes/github/main", env=env)
+            github_main = refs["refs/heads/main"]
+            common = self.git("merge-base", github_main, commit)
+            if common not in (github_main, commit):
+                raise ValueError("GitHub main diverged; refusing to overwrite it")
+            update_main = common == github_main and github_main != commit
+        updates = []
+        if update_main:
+            # Do not publish source changes merged after this release was tagged.
+            updates.append(f"{commit}:refs/heads/main")
+        if tag_ref not in refs:
+            updates.append(f"{tag_sha}:{tag_ref}")
+        if updates:
+            # Atomic and non-force: a racing divergent main/tag or protection
+            # rejection fails without partially publishing source refs.
+            self.git("push", "--atomic", remote, *updates, env=env)
+        self.verify(api, tag, commit, expected)
+        return expected
+
+
+def publish(api, root, tag, commit, source):
     release_version(tag)
     files = collect_artifacts(root, tag, commit)
-    if api.tag_commit(tag) != commit:
-        raise ValueError("tag moved or points to a different source commit")
+    expected_tag = source.prepare(api, tag, commit)
     payloads = {name: path.read_bytes() for name, path in sorted(files.items())}
     payloads["SHA256SUMS"] = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n"
         for name, data in payloads.items()).encode()
-    try:
-        release = api.request("GET", f"/releases/tags/{urllib.parse.quote(tag, safe='')}")
-    except ApiError as error:
-        if error.code != 404:
-            raise
+    # The tag lookup is for published releases. Authenticated list requests also
+    # expose drafts, including resumable drafts beyond the first page.
+    release = None
+    page = 1
+    while True:
+        releases = api.request("GET", f"/releases?per_page=100&page={page}")
+        matching = [item for item in releases if item["tag_name"] == tag]
+        if len(matching) > 1:
+            raise ValueError("ambiguous GitHub release tag")
+        if matching:
+            release = matching[0]
+            break
+        if len(releases) < 100:
+            break
+        page += 1
+    if release is None:
         release = api.request("POST", "/releases", {
             "tag_name": tag, "target_commitish": commit, "name": tag, "draft": True,
             "prerelease": TAG.fullmatch(tag).group(4) is not None,
@@ -221,10 +356,13 @@ def publish(api, root, tag, commit):
         })
     if not release["draft"]:
         raise ValueError("release is already published; refusing to replace published assets")
-    if release["target_commitish"] != commit:
-        raise ValueError("existing draft targets a different source; refusing to modify it")
+    if release["tag_name"] != tag or release["target_commitish"] != commit:
+        raise ValueError("existing draft targets a different source or tag; refusing to modify it")
     release_id = release["id"]
-    existing = {item["name"]: item for item in api.request("GET", f"/releases/{release_id}/assets")}
+    assets = api.request("GET", f"/releases/{release_id}/assets?per_page=100")
+    existing = {item["name"]: item for item in assets}
+    if len(existing) != len(assets):
+        raise ValueError("draft has duplicate assets; refusing to publish")
     if set(existing) - set(payloads):
         raise ValueError("draft contains unexpected assets; refusing to publish")
     for name, data in payloads.items():
@@ -233,16 +371,15 @@ def publish(api, root, tag, commit):
             if hashlib.sha256(remote).digest() != hashlib.sha256(data).digest():
                 raise ValueError("draft asset differs; refusing to overwrite it")
         else:
-            api.upload(release_id, name, data)
-    uploaded = api.request("GET", f"/releases/{release_id}/assets")
+            api.upload(release, name, data)
+    uploaded = api.request("GET", f"/releases/{release_id}/assets?per_page=100")
     if len(uploaded) != len(payloads) or {item["name"] for item in uploaded} != set(payloads):
         raise ValueError("release asset inventory is incomplete")
     for asset in uploaded:
         if hashlib.sha256(api.download(asset)).digest() != hashlib.sha256(payloads[asset["name"]]).digest():
             raise ValueError("uploaded release asset failed SHA-256 readback; release left draft")
-    # Recheck immediately before publication to catch force-moved tags.
-    if api.tag_commit(tag) != commit:
-        raise ValueError("tag moved during upload; release left draft")
+    # Recheck source refs and exact GitHub tag object immediately before publication.
+    source.verify(api, tag, commit, expected_tag)
     return api.request("PATCH", f"/releases/{release_id}", {"draft": False})
 
 
@@ -271,9 +408,9 @@ def main():
     else:
         if os.environ.get("GITHUB_EVENT_NAME") != "push" or os.environ.get("GITHUB_REF") != f"refs/tags/{args.tag}":
             raise ValueError("publication is allowed only for a pushed release tag")
-        api = Forgejo(os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_SERVER_URL", ""),
-                      os.environ.get("GITHUB_REPOSITORY", ""))
-        print(publish(api, args.root, args.tag, args.commit)["html_url"])
+        api = GitHub(os.environ.get("KALISTO_GITHUB_TOKEN"),
+                     os.environ.get("KALISTO_GITHUB_REPOSITORY", ""))
+        print(publish(api, args.root, args.tag, args.commit, SourceRepository())["html_url"])
 
 
 if __name__ == "__main__":

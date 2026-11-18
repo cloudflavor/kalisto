@@ -1,16 +1,21 @@
 # Tagged binary releases
 
 Development, PRs, builds, tests and release validation run on
-[Iceberg](https://iceberg.home.arpa/cloudflavor/kalisto). GitHub receives validated
-changes afterward; do not execute workflows there.
+[Iceberg](https://iceberg.home.arpa/cloudflavor/kalisto). GitHub receives reviewed
+source and release artifacts; it does not run builds or native validation.
 
 Pushed SemVer tags (`vMAJOR.MINOR.PATCH`, with optional prerelease/build suffixes)
-trigger `.forgejo/workflows/release.yml`, which publishes to the Forgejo instance
-and repository supplied by the workflow environment. There is no hardcoded release
-server or repository, and this document does not assert that a release is available.
+on reviewed `main` ancestry trigger `.forgejo/workflows/release.yml`. Publication
+uses GitHub Releases in the explicitly configured `KALISTO_GITHUB_REPOSITORY`.
+The public delivery entry point is [GitHub Releases](https://github.com/cloudflavor/kalisto/releases);
+this document does not assert that any particular release is available.
 Invalid `v*` tags fail rather than publish incorrectly versioned binaries.
 
 ## Download packages
+
+The website links to GitHub Releases without pinning a current version. Product
+releases require neither a website commit nor a website build. Release binaries
+are never staged for the website or uploaded to Bunny; Bunny hosts the website only.
 
 On successful tagged publication, the release contains three archives and `SHA256SUMS`:
 
@@ -77,11 +82,22 @@ independently authenticated publisher signature. Trust the configured release so
   release-tooling regression checks gate all three builds.
 - PRs and manual `workflow_dispatch` runs build/upload CI candidates and verify
   the combined three-target inventory. **They never create a release.**
-- Only a pushed release tag reaches publication. The publisher validates archive
-  inventory, embedded metadata, architecture and exact tag/commit provenance.
-- After all builds pass, it creates a Forgejo **draft**, uploads three archives and
-  checksums, downloads them to verify hashes, rechecks that the tag has not moved,
-  then makes the complete release visible.
+- Only a pushed release tag on reviewed `main` ancestry reaches publication.
+  The publisher validates archive inventory, embedded metadata, architecture and
+  exact tag/commit provenance before mutating GitHub.
+- It non-force synchronizes the tagged source commit and exact lightweight or
+  annotated tag to GitHub with an atomic Git push when needed. It never pushes
+  later source-main changes as part of an older release. GitHub main may already
+  contain the tagged commit; in that case it is preserved. Divergent main,
+  different existing tags and protection rejections fail closed; protections are
+  never bypassed. Existing identical refs are reused.
+- GitHub must resolve the exact tag object to the built source commit, contain
+  that commit, and confirm it is an ancestor of GitHub `main` before release
+  creation. Source refs and GitHub provenance are rechecked before publication;
+  a changed annotation is rejected even if it resolves to the same commit.
+- After all builds pass, it creates a GitHub **draft**, uploads three archives and
+  checksums using GitHub's binary upload endpoint, downloads assets through the
+  authenticated asset API to verify sizes/hashes, then publishes the complete release.
 - Failed publication leaves any created release as draft; no partial public release.
 - Existing published releases are never overwritten. Matching partial draft uploads
   can resume. A differing asset, unexpected attachment, changed tag or different
@@ -94,9 +110,13 @@ independently authenticated publisher signature. Trust the configured release so
   removes only the owned workspace; shared caches and unrelated jobs are preserved.
 - Release compilation remaps checkout, Cargo/rustup cache and home-directory paths
   to neutral prefixes in all three binaries, preserving configured compiler flags.
-- Artifact actions are pinned to verified Forgejo-compatible commits. Release tokens
-  are neither printed nor included in archives; credential-bearing asset requests
-  are never redirected to a different origin.
+- Artifact actions are pinned to verified Forgejo-compatible commits. The
+  automatic Forgejo token is only for source checkout/readback and CI artifacts.
+  GitHub publication uses a separate scoped credential, never a token/server fallback.
+- Credentialed API redirects cannot cross origins. Asset downloads alone may
+  follow HTTPS signed redirects to `release-assets.githubusercontent.com` or
+  `objects.githubusercontent.com`, with authorization removed before leaving the
+  API origin. Other hosts, HTTP, URL credentials and unexpected endpoints fail closed.
 
 ## CI configuration
 
@@ -114,15 +134,20 @@ default in Git. Do not put actual host paths or private image names in the workf
 | `KALISTO_LINUX_BUILD_ROOT` | Optional absolute, user-owned mode-0700 storage directory for the native Linux job; defaults to `~/.cache/kalisto-firecracker-ci`. It reuses `firecracker-ci/target` and creates an owned temporary checkout, without changing host services or networking configuration. |
 | `KALISTO_FIRECRACKER_KERNEL` | Optional prepared absolute kernel path on `tomis-host`. Setting it enables native Linux acceptance on main pushes. The sibling `.config` and `.manifest` must match kernel/config SHA256 values and include built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y`. Ordinary runs never rebuild or replace it. |
 | `KALISTO_FIRECRACKER_ROOTFS` | Optional prepared absolute raw ext4 rootfs path on `tomis-host`. If omitted, native CI searches the existing versioned Firecracker artifact cache as described in the Linux guide. |
-| `KALISTO_LINUX_CA_BUNDLE` | Optional existing CA bundle for native Linux source checkout and website download staging against the configured Forgejo origin. |
+| `KALISTO_LINUX_CA_BUNDLE` | Optional existing CA bundle for native Linux source checkout against the configured Forgejo origin. |
+| `KALISTO_GITHUB_REPOSITORY` | Required explicit GitHub publication repository, configured as `cloudflavor/kalisto` for public delivery. No destination is inferred from Forgejo variables. |
 
-Set the repository Actions secret `KALISTO_RELEASE_TOKEN` to a token with
-`write:repository` scope restricted to this repository. Only tagged publication
-and published-asset staging use it; checkout and candidate builds retain the
-automatic workflow token. Forgejo's automatic token can upload draft attachments
-but returns 404 for their private web download URLs, so it cannot perform the
-required readback verification. Do not use a broad personal/admin token or fall
-back to publishing without verifying downloaded bytes.
+Set the Forgejo repository Actions secret `KALISTO_GITHUB_TOKEN` to a GitHub
+fine-grained token restricted to that GitHub repository with **Contents: read and
+write** (and its automatically granted Metadata read permission). The credential
+must be allowed by repository policies to perform ordinary fast-forward source
+and tag pushes and create/read/update releases and assets. It does not need
+administration, visibility changes, protection bypass or any Bunny permission.
+If source synchronization is rejected by protections, synchronize through the
+normal reviewed/protected process first and rerun; do not weaken protections.
+Only the pushed-tag publication step receives this secret. PR/manual candidates
+have no GitHub credential and do not mutate GitHub. Remove the obsolete
+`KALISTO_RELEASE_TOKEN` secret once no other operator-owned use depends on it.
 
 The native runner must have `cargo`, `rustc` and `rustup` on `PATH`, with the
 toolchain needed by normal CI available under the external `release-rustup` directory.
@@ -170,11 +195,12 @@ The workflow removes only its own checkout.
 
 Forgejo supplies `GITHUB_SERVER_URL` (HTTPS origin), `GITHUB_REPOSITORY`
 (`owner/name`), `GITHUB_TOKEN`, `GITHUB_EVENT_NAME`, `GITHUB_REF`, `GITHUB_SHA`,
-`GITHUB_RUN_ID` and `GITHUB_ENV`. Publication and staging bind
-`KALISTO_RELEASE_TOKEN` as `GITHUB_TOKEN` only for their asset-operation step.
-It must read tags and read/write releases and attachments in this repository.
-No other destination is inferred. HTTPS asset downloads and redirects remain
-restricted to that configured origin. Candidates need the instance's artifact service.
+`GITHUB_RUN_ID` and `GITHUB_ENV` for source checkout and the Forgejo artifact service.
+They never select GitHub's publication repository or credential.
+`KALISTO_GITHUB_REPOSITORY` and `KALISTO_GITHUB_TOKEN` are bound only on pushed-tag
+publication; GitHub API/upload origins are fixed to `api.github.com` and
+`uploads.github.com`. Source credentials remain separate and are never used as
+a GitHub fallback. Source/GitHub Git synchronization refuses redirects.
 
 `.gitlab-ci.yml` uses public Rust, Ubuntu and Debian images and standard GitLab
 environment variables; it has no private runner label or registry dependency.
@@ -214,21 +240,28 @@ git tag -s v0.1.0 COMMIT
 git push origin v0.1.0
 ```
 
-`origin` must point to the configured Forgejo repository. The pipeline resolves lightweight and annotated tags,
-checks out their exact commit and embeds the tag version (including prerelease
-suffixes). Tags with prerelease suffixes create prereleases. Do not force-move release
-tags; create a new version instead. A publication rerun against an already published
-release stops safely without changing it.
+`origin` must point to the configured Forgejo repository, and the tagged commit
+must be on its reviewed `main` ancestry. The pipeline resolves lightweight and
+annotated tags, checks out their exact commit and embeds the tag version
+(including prerelease suffixes). Tags with prerelease suffixes create prereleases.
+Do not force-move release tags; create a new version instead. A publication rerun
+against an already published release stops safely without changing its assets.
 
 The workflow itself does not create version tags. No tag or release is created merely
 by opening its PR or running a manual candidate build.
 
-## Stage published website downloads
+## Delivery and evidence
 
-After publishing, dispatch **Stage verified website downloads** with the published
-`tag`. Staging resolves that tag's source commit independently of the workflow
-checkout, so an older release can be staged from a newer reviewed workflow.
-It verifies the three archives, provenance, checksums and unchanged tag before
-exposing files. Identical existing caches are reused; different operator data
-is never overwritten. A CI candidate is not a published release and cannot pass
-this staging gate.
+Use [GitHub Releases](https://github.com/cloudflavor/kalisto/releases) for release
+archives and checksums. There is no website staging workflow, artifact cache or
+second publication backend. Historical asciinema recordings and measured source
+revisions remain immutable evidence; they are not relabeled or refreshed for
+each product release.
+
+Release-tooling CI covers the three-target inventory, provenance/architecture,
+draft-first complete publication, refusal to replace published/different assets,
+GitHub API/upload/download semantics, signed-redirect credential isolation,
+annotated-tag identity, source ancestry and non-force synchronization failures.
+Candidate builds are not evidence of live GitHub publication. Successful GitHub
+publication must be observed separately after configuring the dedicated secret
+and repository variable and pushing an eligible reviewed-main tag.

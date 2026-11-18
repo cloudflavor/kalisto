@@ -81,9 +81,11 @@ The canonical guides and reference live at
 
 ## Downloads
 
-[Download Kalisto and verify its checksums](https://cloudflavor.io/kalisto/#download).
-Available development packages are not stable releases. Read the platform
-prerequisites before preparing or starting a cluster.
+[Download Kalisto from GitHub Releases](https://github.com/cloudflavor/kalisto/releases)
+and verify the accompanying `SHA256SUMS`. Packages target macOS ARM64, Linux
+ARM64 and Linux x86_64 only. Read the platform prerequisites before preparing or
+starting a cluster; prereleases are not stable releases. Product releases do not
+require a website update.
 
 ## Source
 

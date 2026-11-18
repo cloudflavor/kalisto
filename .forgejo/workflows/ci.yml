@@ -107,8 +107,8 @@ jobs:
             sleep 10
           done
           git checkout -q FETCH_HEAD
-      - name: Test website release staging
-        run: python3 -m unittest discover -s scripts/release -p 'test_stage.py' -v
+      - name: Test release API, inventory and provenance safety
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
       - name: Test worker removal and interrupted lifecycle recovery
         run: cargo test --locked --lib cluster::manager::tests::worker_scale_down -- --test-threads=1
       - name: Test
