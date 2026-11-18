@@ -41,10 +41,11 @@ Compilation, package smoke, and functional backend validation are separate:
 | Linux ARM64 | Static cross-build and user-mode QEMU package smoke only | Native ARM64 Firecracker/KVM lifecycle remains unverified |
 
 See [Linux prerequisites and recorded native evidence](prerequisites-linux-firecracker.md).
-Native Linux CI [run 242](https://iceberg.home.arpa/cloudflavor/kalisto/actions/runs/242),
-source `3eb6dcb32e831ba38b123986d921a936db285d9c`, passed the installed-CLI
+Native macOS and Linux CI [run 263](https://iceberg.home.arpa/cloudflavor/kalisto/actions/runs/263),
+source `2a01283628e81b5ece7ae8d07c70d26ef8dc301a`, passed the installed-CLI
 functional startup deadline, persistence, scale-out and scale-down with retained
-node identities and DNS/Service traffic after shrinking.
+node identities and DNS/Service traffic after shrinking. The native macOS
+startup/probe clock measured 56.124672667 seconds.
 
 The native runners are Apple-silicon macOS (`macos`) and x86_64 Linux on
 Stratofortress (`tomis-host`, also carrying the container-runner label `tomis-ci`).
@@ -115,6 +116,14 @@ default in Git. Do not put actual host paths or private image names in the workf
 | `KALISTO_FIRECRACKER_ROOTFS` | Optional prepared absolute raw ext4 rootfs path on `tomis-host`. If omitted, native CI searches the existing versioned Firecracker artifact cache as described in the Linux guide. |
 | `KALISTO_LINUX_CA_BUNDLE` | Optional existing CA bundle for native Linux source checkout and website download staging against the configured Forgejo origin. |
 
+Set the repository Actions secret `KALISTO_RELEASE_TOKEN` to a token with
+`write:repository` scope restricted to this repository. Only tagged publication
+and published-asset staging use it; checkout and candidate builds retain the
+automatic workflow token. Forgejo's automatic token can upload draft attachments
+but returns 404 for their private web download URLs, so it cannot perform the
+required readback verification. Do not use a broad personal/admin token or fall
+back to publishing without verifying downloaded bytes.
+
 The native runner must have `cargo`, `rustc` and `rustup` on `PATH`, with the
 toolchain needed by normal CI available under the external `release-rustup` directory.
 Populate it using `RUSTUP_HOME="$KALISTO_MACOS_BUILD_ROOT/release-rustup"` and
@@ -161,10 +170,11 @@ The workflow removes only its own checkout.
 
 Forgejo supplies `GITHUB_SERVER_URL` (HTTPS origin), `GITHUB_REPOSITORY`
 (`owner/name`), `GITHUB_TOKEN`, `GITHUB_EVENT_NAME`, `GITHUB_REF`, `GITHUB_SHA`,
-`GITHUB_RUN_ID` and `GITHUB_ENV`. Publication requires the workflow token to read
-tags and read/write releases and attachments in that repository. No other
-destination is inferred. HTTPS asset downloads and redirects remain restricted
-to that configured origin. Candidates need the instance's artifact service.
+`GITHUB_RUN_ID` and `GITHUB_ENV`. Publication and staging bind
+`KALISTO_RELEASE_TOKEN` as `GITHUB_TOKEN` only for their asset-operation step.
+It must read tags and read/write releases and attachments in this repository.
+No other destination is inferred. HTTPS asset downloads and redirects remain
+restricted to that configured origin. Candidates need the instance's artifact service.
 
 `.gitlab-ci.yml` uses public Rust, Ubuntu and Debian images and standard GitLab
 environment variables; it has no private runner label or registry dependency.
