@@ -859,7 +859,13 @@ fn prove_persistent_restart_and_worker_scale(
     let state = kalisto::cluster::state::ClusterState::load(&spec.state_root()).unwrap();
     assert_eq!(state.worker_count, 2);
     assert_eq!(state.nodes.len(), 3);
-    assert!(!spec.state_root().join("runtime").join(removed_name).exists());
+    assert!(
+        !spec
+            .state_root()
+            .join("runtime")
+            .join(removed_name)
+            .exists()
+    );
 }
 
 fn assert_kubelet_access(kubeconfig: &Path, nodes: &[serde_json::Value]) {

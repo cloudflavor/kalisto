@@ -1525,8 +1525,8 @@ fn validate_scale_down_ownership(state_root: &Path, state: &ClusterState) -> Res
     }
     // Reject redirected paths for retained nodes too: a symlink could alias a
     // worker disk even when the textual control-plane path looks unrelated.
-    for directory in std::iter::once(&runtime_root)
-        .chain(state.nodes.iter().map(|node| &node.artifacts_root))
+    for directory in
+        std::iter::once(&runtime_root).chain(state.nodes.iter().map(|node| &node.artifacts_root))
     {
         match fs::symlink_metadata(directory) {
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
@@ -1562,8 +1562,9 @@ fn scale_down_node_uid(
     if output.stdout.trim().is_empty() {
         return Ok(None);
     }
-    let node: serde_json::Value = serde_json::from_str(&output.stdout)
-        .map_err(|error| Error::InvalidArgs(format!("invalid Kubernetes Node response: {error}")))?;
+    let node: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
+        Error::InvalidArgs(format!("invalid Kubernetes Node response: {error}"))
+    })?;
     let metadata = &node["metadata"];
     let labels = &metadata["labels"];
     if metadata["name"].as_str() != Some(name)
@@ -3169,13 +3170,14 @@ mod tests {
                 );
                 let mut state = ClusterState::load(&state_root).unwrap();
                 for node in &mut state.nodes {
-                    node.artifacts_root = state_root.join("runtime").join(
-                        if node.role == NodeRole::ControlPlane {
-                            "control-plane"
-                        } else {
-                            &node.name
-                        },
-                    );
+                    node.artifacts_root =
+                        state_root
+                            .join("runtime")
+                            .join(if node.role == NodeRole::ControlPlane {
+                                "control-plane"
+                            } else {
+                                &node.name
+                            });
                     fs::create_dir_all(&node.artifacts_root).unwrap();
                     fs::write(node.artifacts_root.join("disk"), node.name.as_bytes()).unwrap();
                 }
@@ -3269,6 +3271,12 @@ mod tests {
                 let output = self.inner.run(program, args)?;
                 let command = args.last().map_or("", String::as_str);
                 if *self.recovering.lock().unwrap() {
+                    if program == "curl" {
+                        return Ok(Output {
+                            stdout: "200".to_owned(),
+                            stderr: String::new(),
+                        });
+                    }
                     if program == "limactl" && args.first().is_some_and(|arg| arg == "list") {
                         let stdout = if args.iter().any(|arg| arg == "--json") {
                             serde_json::json!({"status": "Stopped", "config": {"mounts": []}})
@@ -3306,7 +3314,9 @@ mod tests {
                 }
                 if command.contains(" get node ") {
                     let nodes = self.nodes.lock().unwrap();
-                    let node = nodes.iter().find(|(name, _)| command.contains(name.as_str()));
+                    let node = nodes
+                        .iter()
+                        .find(|(name, _)| command.contains(name.as_str()));
                     return Ok(Output {
                         stdout: node.map_or_else(String::new, |(_, node)| node.to_string()),
                         stderr: String::new(),
@@ -3321,8 +3331,8 @@ mod tests {
                         assert!(!command.contains("--force"));
                         assert!(!command.contains("--delete-emptydir-data"));
                         assert!(!command.contains("--disable-eviction"));
-                        self.nodes.lock().unwrap().get_mut(&name).unwrap()["spec"]
-                            ["unschedulable"] = serde_json::json!(true);
+                        self.nodes.lock().unwrap().get_mut(&name).unwrap()["spec"]["unschedulable"] =
+                            serde_json::json!(true);
                         self.action("drain", &name)?;
                     } else {
                         let mut nodes = self.nodes.lock().unwrap();
@@ -3353,7 +3363,10 @@ mod tests {
             assert_eq!(outcome.previous_workers, 3);
             assert_eq!(outcome.current_workers, 1);
             assert!(outcome.added_workers.is_empty());
-            assert_eq!(outcome.removed_workers, ["kalisto-dev-w2", "kalisto-dev-w1"]);
+            assert_eq!(
+                outcome.removed_workers,
+                ["kalisto-dev-w2", "kalisto-dev-w1"]
+            );
             let state = fixture.state();
             assert_eq!(state.worker_count, 1);
             assert_eq!(
@@ -3398,7 +3411,12 @@ mod tests {
             assert_eq!(fixture.state().worker_count, 2);
             assert_eq!(fixture.state().nodes.len(), 3);
             assert!(!fixture.state_root.join("runtime/kalisto-dev-w2").exists());
-            assert!(fixture.state_root.join("runtime/kalisto-dev-w1/disk").exists());
+            assert!(
+                fixture
+                    .state_root
+                    .join("runtime/kalisto-dev-w1/disk")
+                    .exists()
+            );
             assert_eq!(
                 fixture.runner.nodes.lock().unwrap()["kalisto-dev-w1"]["spec"]["unschedulable"],
                 true
@@ -3430,7 +3448,10 @@ mod tests {
             let outcome = fixture.scale(0).unwrap();
             assert_eq!(outcome.previous_workers, 2);
             assert_eq!(outcome.current_workers, 0);
-            assert_eq!(outcome.removed_workers, ["kalisto-dev-w1", "kalisto-dev-w0"]);
+            assert_eq!(
+                outcome.removed_workers,
+                ["kalisto-dev-w1", "kalisto-dev-w0"]
+            );
             assert_eq!(fixture.state().nodes.len(), 1);
             assert!(!fixture.state_root.join("scale-down.json").exists());
         }
@@ -3443,9 +3464,19 @@ mod tests {
                 assert!(fixture.scale(2).is_err());
                 assert_eq!(fixture.state().worker_count, 3);
                 assert_eq!(fixture.state().nodes.len(), 4);
-                assert!(fixture.state_root.join("runtime/kalisto-dev-w2/disk").exists());
+                assert!(
+                    fixture
+                        .state_root
+                        .join("runtime/kalisto-dev-w2/disk")
+                        .exists()
+                );
                 assert_eq!(
-                    fixture.runner.nodes.lock().unwrap().contains_key("kalisto-dev-w2"),
+                    fixture
+                        .runner
+                        .nodes
+                        .lock()
+                        .unwrap()
+                        .contains_key("kalisto-dev-w2"),
                     action != "instance"
                 );
                 *fixture.runner.failure.lock().unwrap() = None;
@@ -3474,7 +3505,14 @@ mod tests {
             *fixture.runner.block_runtime_cleanup.lock().unwrap() = Some(runtime.clone());
             assert!(fixture.scale(2).is_err());
             assert_eq!(fixture.state().worker_count, 3);
-            assert!(!fixture.runner.nodes.lock().unwrap().contains_key("kalisto-dev-w2"));
+            assert!(
+                !fixture
+                    .runner
+                    .nodes
+                    .lock()
+                    .unwrap()
+                    .contains_key("kalisto-dev-w2")
+            );
             fs::remove_file(&runtime).unwrap();
             fs::create_dir(&runtime).unwrap();
             fixture.scale(2).unwrap();
@@ -3574,18 +3612,35 @@ mod tests {
             let error = scale_at_root(&fixture.state_root, "dev", 2, &runner).unwrap_err();
             assert!(error.to_string().contains("is not running"));
             assert_eq!(fixture.state().worker_count, 3);
-            assert!(fixture.state_root.join("runtime/kalisto-dev-w2/disk").exists());
+            assert!(
+                fixture
+                    .state_root
+                    .join("runtime/kalisto-dev-w2/disk")
+                    .exists()
+            );
         }
 
         #[test]
         fn scale_down_interrupted_removal_can_recover_through_down_up_and_retry() {
+            struct RestoreEnvironment {
+                data_home: Option<std::ffi::OsString>,
+                cache_home: Option<std::ffi::OsString>,
+            }
+            impl Drop for RestoreEnvironment {
+                fn drop(&mut self) {
+                    super::restore_env("XDG_DATA_HOME", self.data_home.take());
+                    super::restore_env("XDG_CACHE_HOME", self.cache_home.take());
+                }
+            }
             let _guard = crate::test_support::env_lock();
             for action in ["drain", "instance"] {
                 let mut fixture = Fixture::new(&format!("restart-{action}"));
                 fixture.fail(action, "kalisto-dev-w2");
                 assert!(fixture.scale(2).is_err());
-                let original_data_home = std::env::var_os("XDG_DATA_HOME");
-                let original_cache_home = std::env::var_os("XDG_CACHE_HOME");
+                let _environment = RestoreEnvironment {
+                    data_home: std::env::var_os("XDG_DATA_HOME"),
+                    cache_home: std::env::var_os("XDG_CACHE_HOME"),
+                };
                 unsafe {
                     std::env::set_var("XDG_DATA_HOME", fixture.root.join("recovery-data"));
                     std::env::set_var("XDG_CACHE_HOME", fixture.root.join("recovery-cache"));
@@ -3629,7 +3684,11 @@ mod tests {
                 *fixture.runner.recovering.lock().unwrap() = true;
                 fixture.runner.actions.lock().unwrap().clear();
                 let error = super::super::up_with_runner(&spec, &fixture.runner).unwrap_err();
-                assert!(error.to_string().contains("cluster nodes resumed"));
+                assert!(matches!(error, Error::InvalidArgs(_)), "{error}");
+                assert_eq!(
+                    fs::read_to_string(fixture.state_root.join("node-token")).unwrap(),
+                    "recovered-token\n"
+                );
                 let started = fixture.runner.started.lock().unwrap().clone();
                 assert!(started.iter().any(|name| name == "kalisto-dev-cp"));
                 assert!(started.iter().any(|name| name == "kalisto-dev-w0"));
@@ -3642,8 +3701,6 @@ mod tests {
                 assert_eq!(fixture.state().worker_count, 3);
                 fixture.scale(2).unwrap();
                 assert_eq!(fixture.state().worker_count, 2);
-                super::restore_env("XDG_DATA_HOME", original_data_home);
-                super::restore_env("XDG_CACHE_HOME", original_cache_home);
             }
         }
     }

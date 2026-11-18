@@ -144,7 +144,7 @@ jobs:
     needs: [rust-fmt, rust-clippy, rust-test]
     # No fork code on the shared KVM host. Main gating is enabled only once a
     # compatible prepared kernel is configured; manual dispatch can discover it.
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.firecracker_live == true) || (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.KALISTO_FIRECRACKER_KERNEL != '') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.firecracker_live == 'true') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.KALISTO_FIRECRACKER_KERNEL != '') }}
     runs-on: tomis-host
     timeout-minutes: 60
     env:
