@@ -1,6 +1,8 @@
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import release
 import stage
@@ -26,6 +28,14 @@ class StageTests(unittest.TestCase):
         for name, data in self.api.assets.items():
             self.assertEqual((self.cache / name).read_bytes(), data)
         stage.stage(self.api, self.cache, TAG, SHA)
+        self.assertEqual(set(release.collect_artifacts(self.cache, TAG, SHA)),
+                         set(self.api.assets) - {"SHA256SUMS"})
+
+    def test_cli_stages_a_published_tag_independent_of_workflow_checkout(self):
+        with patch("sys.argv", ["stage.py", "--root", str(self.cache), "--tag", TAG]), \
+                patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}), \
+                patch("stage.Forgejo", return_value=self.api), patch("builtins.print"):
+            stage.main()
         self.assertEqual(set(release.collect_artifacts(self.cache, TAG, SHA)),
                          set(self.api.assets) - {"SHA256SUMS"})
 

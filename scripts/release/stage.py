@@ -59,12 +59,14 @@ def stage(api, root, tag, commit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for argument in ("root", "tag", "commit"):
+    for argument in ("root", "tag"):
         parser.add_argument(f"--{argument}", required=True)
+    parser.add_argument("--commit", help="Expected release source commit; defaults to resolving the tag")
     args = parser.parse_args()
     api = Forgejo(os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_SERVER_URL", ""),
                   os.environ.get("GITHUB_REPOSITORY", ""))
-    print(stage(api, args.root, args.tag, args.commit))
+    commit = args.commit or api.tag_commit(args.tag)
+    print(stage(api, args.root, args.tag, commit))
 
 
 if __name__ == "__main__":

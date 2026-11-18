@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      firecracker_live:
+        description: Run native Firecracker acceptance using prepared host artifacts
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: kalisto-ci-${{ github.ref }}
@@ -96,6 +102,8 @@ jobs:
             sleep 10
           done
           git checkout -q FETCH_HEAD
+      - name: Test website release staging
+        run: python3 -m unittest discover -s scripts/release -p 'test_stage.py' -v
       - name: Test
         run: cargo test -- --test-threads=1
       - name: Test native terminal progress and plain output
@@ -129,6 +137,114 @@ jobs:
         run: cargo build --release --bin kalisto
       - name: Smoke run
         run: '"$CARGO_TARGET_DIR/release/kalisto" ls'
+
+  firecracker-live:
+    needs: [rust-fmt, rust-clippy, rust-test]
+    # No fork code on the shared KVM host. Main gating is enabled only once a
+    # compatible prepared kernel is configured; manual dispatch can discover it.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.firecracker_live == true) || (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.KALISTO_FIRECRACKER_KERNEL != '') }}
+    runs-on: tomis-host
+    timeout-minutes: 60
+    env:
+      KALISTO_LINUX_BUILD_ROOT: ${{ vars.KALISTO_LINUX_BUILD_ROOT }}
+      KALISTO_LINUX_CA_BUNDLE: ${{ vars.KALISTO_LINUX_CA_BUNDLE }}
+      KALISTO_FIRECRACKER_KERNEL: ${{ vars.KALISTO_FIRECRACKER_KERNEL }}
+      KALISTO_FIRECRACKER_ROOTFS: ${{ vars.KALISTO_FIRECRACKER_ROOTFS }}
+      KALISTO_LIVE_FIRECRACKER_TESTS: "1"
+    steps:
+      - name: Reuse native tools and verified prepared artifacts without provisioning
+        run: |
+          set -eu
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import platform
+          import shutil
+          import stat
+          import subprocess
+          from pathlib import Path
+          assert platform.system() == "Linux" and platform.machine() == "x86_64"
+          assert os.access("/dev/kvm", os.R_OK | os.W_OK), "KVM must be accessible"
+          subprocess.run(["unshare", "--user", "--map-root-user", "--net", "true"], check=True)
+          for tool in ("firecracker", "debugfs", "mke2fs", "ssh", "ssh-keygen", "scp",
+                       "ip", "iptables", "sysctl", "slirp4netns", "unshare", "nsenter", "curl"):
+              assert shutil.which(tool), f"Required existing native tool missing: {tool}"
+          version = subprocess.check_output(["firecracker", "--version"], text=True)
+          assert version.splitlines()[0] == "Firecracker v1.18.0", "Use validated Firecracker v1.18.0"
+          root = Path(os.environ.get("KALISTO_LINUX_BUILD_ROOT") or Path.home() / ".cache/kalisto-firecracker-ci")
+          assert root.is_absolute() and not root.is_symlink()
+          root = root.resolve()
+          assert root not in (Path("/"), Path.home().resolve())
+          assert "\n" not in str(root) and "\r" not in str(root)
+          root.mkdir(parents=True, exist_ok=True, mode=0o700)
+          assert root.stat().st_uid == os.getuid() and not stat.S_IMODE(root.stat().st_mode) & 0o077
+          cache = Path.home() / ".local/share/kalisto/artifacts/firecracker-node"
+          images = {}
+          for key, filename in (
+              ("KALISTO_FIRECRACKER_KERNEL", "kalisto-vmlinux"),
+              ("KALISTO_FIRECRACKER_ROOTFS", "ubuntu-24.04-minimal-k3s-amd64-rootfs.raw"),
+          ):
+              configured = os.environ.get(key)
+              candidates = [Path(configured)] if configured else [
+                  cache / track / "x86_64" / filename for track in ("v1.18", "v1.13")
+              ]
+              image = next((path for path in candidates if path.is_file()), None)
+              assert image is not None and image.is_absolute(), f"Configure {key} with a prepared absolute image path"
+              image = image.resolve(strict=True)
+              assert image.stat().st_size > 0 and os.access(image, os.R_OK)
+              assert "\n" not in str(image) and "\r" not in str(image)
+              images[key] = image
+          kernel = images["KALISTO_FIRECRACKER_KERNEL"]
+          config = Path(str(kernel) + ".config")
+          manifest = dict(line.split("=", 1) for line in Path(str(kernel) + ".manifest").read_text().splitlines())
+          assert "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y" in config.read_text().splitlines(), "Prepare a kernel supporting multi-endpoint Services"
+          def digest(path):
+              result = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      result.update(block)
+              return result.hexdigest()
+          assert digest(kernel) == manifest["KERNEL_SHA256"], "Prepared kernel checksum mismatch"
+          assert digest(config) == manifest["KERNEL_CONFIG_SHA256"], "Prepared kernel config checksum mismatch"
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"KALISTO_LINUX_BUILD_ROOT={root}\n")
+              for key, image in images.items():
+                  output.write(f"{key}={image}\n")
+          PY
+      - name: Check out exact source into an owned native workspace
+        run: |
+          set -eu
+          umask 077
+          workspace=$(mktemp -d "$KALISTO_LINUX_BUILD_ROOT/kalisto-native.XXXXXX")
+          mkdir -p "$workspace/tmp" "$KALISTO_LINUX_BUILD_ROOT/firecracker-ci/target"
+          printf 'KALISTO_FIRECRACKER_WORKSPACE=%s\nCARGO_TARGET_DIR=%s/firecracker-ci/target\nTMPDIR=%s/tmp\n' \
+            "$workspace" "$KALISTO_LINUX_BUILD_ROOT" "$workspace" >> "$GITHUB_ENV"
+          cd "$workspace"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          if [ -n "${KALISTO_LINUX_CA_BUNDLE:-}" ]; then export GIT_SSL_CAINFO="$KALISTO_LINUX_CA_BUNDLE"; fi
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          if ! git -c credential.helper= fetch -q --depth=1 "$url" "$GITHUB_SHA" 2>/dev/null; then
+            echo 'Unable to fetch exact native test source' >&2
+            exit 1
+          fi
+          unset url
+          git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Prove installed CLI cold boot, persistence and worker scaling natively
+        run: |
+          set -eu
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$KALISTO_FIRECRACKER_WORKSPACE"
+          cargo test --locked --release --test linux_firecracker_live -- --nocapture
+      - name: Remove only the owned checkout
+        if: ${{ always() && env.KALISTO_FIRECRACKER_WORKSPACE != '' }}
+        run: |
+          set -eu
+          case "$KALISTO_FIRECRACKER_WORKSPACE" in
+            "$KALISTO_LINUX_BUILD_ROOT"/kalisto-native.*) rm -rf -- "$KALISTO_FIRECRACKER_WORKSPACE" ;;
+            *) echo 'Refusing cleanup outside owned workspace' >&2; exit 1 ;;
+          esac
 
   apple-container-live:
     needs: [rust-fmt, rust-clippy, rust-test]

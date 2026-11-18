@@ -14,12 +14,12 @@ Invalid `v*` tags fail rather than publish incorrectly versioned binaries.
 
 On successful tagged publication, the release contains four archives and `SHA256SUMS`:
 
-| Package | Rust target | Build / smoke check |
+| Package | Rust target | Build / installed-package smoke check |
 | --- | --- | --- |
-| `kalisto-TAG-macos-arm64.tar.gz` | `aarch64-apple-darwin` | macOS runner; native `--version` |
-| `kalisto-TAG-macos-amd64.tar.gz` | `x86_64-apple-darwin` | Cross-compiled on macOS arm64; Mach-O architecture verified |
-| `kalisto-TAG-linux-amd64.tar.gz` | `x86_64-unknown-linux-musl` | Linux runner; native `--version` |
-| `kalisto-TAG-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | Linux cross-build; `--version` through user-mode QEMU |
+| `kalisto-TAG-macos-arm64.tar.gz` | `aarch64-apple-darwin` | macOS arm64 runner; native `--version` and `ls` |
+| `kalisto-TAG-macos-amd64.tar.gz` | `x86_64-apple-darwin` | Cross-compiled on macOS arm64; Mach-O architecture verified; no native Intel execution |
+| `kalisto-TAG-linux-amd64.tar.gz` | `x86_64-unknown-linux-musl` | Linux x86_64 runner; native `--version` and `ls` |
+| `kalisto-TAG-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | Linux cross-build; `--version` and `ls` through user-mode QEMU, not native ARM64 validation |
 
 `TAG` includes the `v` prefix, for example `v0.1.0`. `amd64` also means x86_64;
 `arm64` also means aarch64. Each archive contains `kalisto` (mode 0755) and
@@ -28,10 +28,38 @@ Packaging normalizes archive timestamps/ownership; this is not a guarantee of
 bit-for-bit reproducible binaries across different compiler/SDK installations.
 
 Linux binaries are static musl executables: users do not need QEMU or a matching
-glibc release on their native architecture. Linux backend functionality remains
-in progress; compilation/smoke checks do not prove full Firecracker feature parity.
-macOS binaries are unsigned and not notarized. Intel output is architecture-checked,
-not runtime-tested on Intel hardware; CI never installs Rosetta automatically.
+glibc release on their native architecture. macOS binaries are unsigned and not
+notarized. CI never installs Rosetta automatically.
+
+### Functional support and remaining release prerequisites
+
+Compilation, package smoke, and functional backend validation are separate:
+
+| Host | Functional evidence | Limitation |
+| --- | --- | --- |
+| macOS Apple silicon | Native Apple-container three-node Cilium acceptance in CI, including the sixty-second startup assertion | Requires the installed Apple `container` runtime and prepared backend assets; optional Lima is not covered by this job |
+| Linux x86_64 | Native Fedora 44 / Firecracker v1.18.0 validation observed fresh three-node Cilium, authenticated API, DNS/cross-node Service HTTP, stop/resume persistence and scale-out; fresh startup plus probes took 42.95s | Requires accessible KVM, rootless networking prerequisites and explicit prepared kernel/rootfs; this is not universal platform or feature parity |
+| macOS Intel | x86_64 package cross-compilation and architecture inspection only | No native Intel macOS runner is registered; native install/runtime and Lima backend acceptance remain unverified |
+| Linux ARM64 | Static cross-build and user-mode QEMU package smoke only | Native ARM64 Firecracker/KVM lifecycle remains unverified |
+
+See [Linux prerequisites and recorded native evidence](prerequisites-linux-firecracker.md).
+The new Linux CI job also asserts shrink-back to two workers, retained node identities,
+and functional DNS/Service traffic after shrinking; that new coverage needs a passing
+native CI run before claiming an observed scale-down result.
+
+The registered native runners are macOS arm64 (`macos`) and Linux x86_64
+(`tomis-host`, also carrying the container-runner label `tomis-ci`). No Intel
+label or hardware is inferred from the cross-built package. Provisioning a real
+Intel macOS runner and recording native installed-package plus backend acceptance
+is an external prerequisite for claiming Intel runtime support.
+
+A public stable release and default Firecracker kernel/rootfs source are separate
+publication prerequisites; neither is created by a candidate build. Until published,
+Linux users must supply local artifacts or an explicitly configured artifact source.
+The release builder extracts each archive into a temporary install prefix and runs
+supported smoke commands from an empty directory with isolated XDG roots. The
+native Linux functional test likewise executes an installed copy, not the checkout
+binary, from an empty working directory.
 
 Download the correct archive and `SHA256SUMS`, then verify before installation:
 
@@ -85,6 +113,10 @@ default in Git. Do not put actual host paths or private image names in the workf
 | `KALISTO_MACOS_RUNNER` | Label of a trusted native macOS runner with Xcode command-line tools, Git, Bash, Python 3.9+, Rust/rustup, Node.js and the Homebrew Apple `container` runtime. Never assign an untrusted/fork job to this shared host. |
 | `KALISTO_MACOS_VOLUME` | Absolute path to an already-mounted external volume, not `/`. |
 | `KALISTO_MACOS_BUILD_ROOT` | Writable directory strictly beneath that volume, on the same filesystem. Workspaces and shared `cargo-home`, `release-rustup`, `sccache`, `apple-container-ci/target`, `apple-container-ci/artifacts` and per-target `release-target` caches live here. |
+| `KALISTO_LINUX_BUILD_ROOT` | Optional absolute, user-owned mode-0700 storage directory for the native Linux job; defaults to `~/.cache/kalisto-firecracker-ci`. It reuses `firecracker-ci/target` and creates an owned temporary checkout, without changing host services or networking configuration. |
+| `KALISTO_FIRECRACKER_KERNEL` | Optional prepared absolute kernel path on `tomis-host`. Setting it enables native Linux acceptance on main pushes. The sibling `.config` and `.manifest` must match kernel/config SHA256 values and include built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y`. No kernel is rebuilt by this job. |
+| `KALISTO_FIRECRACKER_ROOTFS` | Optional prepared absolute raw ext4 rootfs path on `tomis-host`. If omitted, native CI searches the existing versioned Firecracker artifact cache as described in the Linux guide. |
+| `KALISTO_LINUX_CA_BUNDLE` | Optional existing CA bundle for native Linux source checkout and website download staging against the configured Forgejo origin. |
 
 The native runner must have `cargo`, `rustc` and `rustup` on `PATH`, with the
 toolchain needed by normal CI available under the external `release-rustup` directory.
@@ -99,6 +131,26 @@ running Homebrew service, or starts an installed unregistered service without
 replacing a daemon, installing a kernel, changing daemon roots or stopping it.
 Per-job `XDG_DATA_HOME`/`XDG_CONFIG_HOME` isolate cluster ownership; cleanup never
 targets users' cluster state.
+
+Native Linux acceptance is independent of showcase recordings. Dispatch **CI**
+with `firecracker_live=true` to run `firecracker-live` on the existing `tomis-host`.
+It reuses Firecracker v1.18.0, KVM and prepared host images; it does not install
+tools, rebuild kernels, record demos, or publish artifacts. When explicit image
+variables are absent, a manual run searches
+`~/.local/share/kalisto/artifacts/firecracker-node/{v1.18,v1.13}/x86_64/` for
+`kalisto-vmlinux` and `ubuntu-24.04-minimal-k3s-amd64-rootfs.raw`.
+Kernel/config sidecar hashes and the multi-endpoint Service kernel option are
+checked before compilation. Missing or incompatible prerequisites fail explicitly.
+Setting `KALISTO_FIRECRACKER_KERNEL` opts main pushes into this native gate;
+without it, the job is skipped on ordinary pushes, not reported as native success.
+The variable is not configured in the current deployment, so default main CI
+does not yet establish ongoing native Linux acceptance. Configure the verified
+kernel after a successful manual run to activate that gate.
+
+Private Linux evidence stays in
+`$CARGO_TARGET_DIR/kalisto/firecracker-budget/<unique-cluster>/`; no guest logs,
+credentials or cluster state are uploaded. The test destroys only its unique
+cluster, and the workflow removes only its own checkout.
 
 Forgejo supplies `GITHUB_SERVER_URL` (HTTPS origin), `GITHUB_REPOSITORY`
 (`owner/name`), `GITHUB_TOKEN`, `GITHUB_EVENT_NAME`, `GITHUB_REF`, `GITHUB_SHA`,
@@ -153,3 +205,13 @@ release stops safely without changing it.
 
 The workflow itself does not create version tags. No tag or release is created merely
 by opening its PR or running a manual candidate build.
+
+## Stage published website downloads
+
+After publishing, dispatch **Stage verified website downloads** with the published
+`tag`. Staging resolves that tag's source commit independently of the workflow
+checkout, so an older release can be staged from a newer reviewed workflow.
+It verifies the four archives, provenance, checksums and unchanged tag before
+exposing files. Identical existing caches are reused; different operator data
+is never overwritten. A CI candidate is not a published release and cannot pass
+this staging gate.

@@ -58,18 +58,31 @@ PY
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
 cargo +"$toolchain" build --locked --release --bin kalisto --target "$target"
 binary="$CARGO_TARGET_DIR/$target/release/kalisto"
+archive=$(python3 scripts/release/release.py package --binary "$binary" \
+  --output "$KALISTO_RELEASE_DIST" --tag "$BUILD_TAG" \
+  --version "$KALISTO_BUILD_VERSION" --commit "$commit" --target "$target")
+install=$(mktemp -d "${TMPDIR:-/tmp}/kalisto-install.XXXXXX")
+trap 'rm -rf -- "$install"' EXIT
+mkdir "$install/bin" "$install/empty-cwd" "$install/data" "$install/config"
+tar -xzf "$archive" -C "$install/bin"
+binary="$install/bin/kalisto"
+# Smoke the shipped executable from an empty directory, never the build tree.
+cd "$install/empty-cwd"
+export XDG_DATA_HOME="$install/data" XDG_CONFIG_HOME="$install/config"
 case "$target:$(uname -m)" in
   aarch64-unknown-linux-musl:x86_64)
     actual=$(qemu-aarch64 "$binary" --version)
+    qemu-aarch64 "$binary" ls
     ;;
   x86_64-apple-darwin:arm64|aarch64-apple-darwin:x86_64)
-    # Never auto-install Rosetta on a shared host. Mach-O is inspected below.
-    actual="kalisto $KALISTO_BUILD_VERSION"
-    echo 'Cross-compiled macOS binary: architecture verified, no non-native runtime smoke'
+    # Never auto-install Rosetta on a shared host. Packaging checked Mach-O.
+    echo 'Cross-compiled macOS archive: architecture verified, no native runtime smoke'
+    exit 0
     ;;
-  *) actual=$("$binary" --version) ;;
+  *)
+    actual=$("$binary" --version)
+    "$binary" ls
+    ;;
 esac
 test "$actual" = "kalisto $KALISTO_BUILD_VERSION"
-python3 scripts/release/release.py package --binary "$binary" \
-  --output "$KALISTO_RELEASE_DIST" --tag "$BUILD_TAG" \
-  --version "$KALISTO_BUILD_VERSION" --commit "$commit" --target "$target"
+printf 'Verified installed archive: %s\n' "$archive"

@@ -15,6 +15,10 @@ These prerequisites are for:
 
 This is separate from the default macOS Apple-container path and optional Lima path.
 
+Native functional evidence currently covers Linux `x86_64`, not ARM64.
+The Linux ARM64 release archive is cross-built and smoke-tested through user-mode
+QEMU; that does not validate native ARM64 KVM or Firecracker backend behavior.
+
 ## Host Requirements
 
 The Linux host must provide:
@@ -203,14 +207,19 @@ and have the required host privileges (sudo).
 
 ## Live Functional Boot Test
 
-The opt-in Linux test runs the real CLI from an empty working directory using a
-dedicated XDG cache and fresh unique cluster state. `pull` is outside the clock.
-The strict 60-second deadline includes three fresh VMs, three Ready nodes,
-authenticated host API, every rendered Cilium rollout, and DNS plus cross-node
-Service HTTP probes from both workers using cached images with pull policy
-`Never`. Afterward it checks stop/resume ConfigMap persistence and scale-out to
-four Ready nodes, outside that clock. Evidence is retained under
-`target/kalisto/firecracker-budget/`; only the test-owned cluster is destroyed.
+The opt-in Linux test installs a copy of the real CLI into a private `install/bin`
+prefix and runs it from an empty working directory, without executing the checkout
+binary. Each run has dedicated XDG data/config roots and fresh unique cluster
+state. `pull` is outside the clock. The strict 60-second deadline includes three
+fresh VMs, three Ready nodes, authenticated host API, every rendered Cilium rollout,
+and DNS plus cross-node Service HTTP probes from both workers using cached images
+with pull policy `Never`. Afterward it checks stop/resume ConfigMap persistence,
+scale-out to four Ready nodes with a multi-endpoint Service already present, then
+scale-down to three Ready nodes. Shrinking must remove worker index 2, retain the
+original control-plane/worker node UIDs, and preserve DNS/Service HTTP from both
+remaining workers. These maintenance checks are outside the startup clock.
+Evidence is retained under `target/kalisto/firecracker-budget/`; only the
+test-owned cluster is destroyed.
 
 Native validation on the environment above measured:
 
@@ -222,12 +231,42 @@ Native validation on the environment above measured:
 Stop/resume preserved the ConfigMap, and scale-out reached four Ready nodes
 afterward. These are observed timings, not a universal hardware guarantee.
 
+These recorded results predate the newly added scale-down assertions; passing
+those assertions still requires a new native CI run. Package compilation or
+user-mode emulation must not be substituted for that result.
+
 ```bash
 KALISTO_LIVE_FIRECRACKER_TESTS=1 \
 KALISTO_FIRECRACKER_KERNEL=/path/to/kalisto-vmlinux \
 KALISTO_FIRECRACKER_ROOTFS=/path/to/rootfs.raw \
   cargo test --release --locked --test linux_firecracker_live -- --nocapture
 ```
+
+Run this command only on the configured native CI host. Dispatch
+`.forgejo/workflows/ci.yml` with `firecracker_live=true` for the dedicated
+`firecracker-live` job on the existing `tomis-host` runner. It does not depend on
+showcase recording and never builds a kernel or changes the Firecracker service.
+The job uses configured `KALISTO_FIRECRACKER_KERNEL` /
+`KALISTO_FIRECRACKER_ROOTFS`, or discovers the existing versioned host artifact
+cache for a manual run. Missing prerequisites fail rather than skip the live test.
+
+Prepare a compatible kernel ahead of time using the existing
+[`build_firecracker_kernel.sh`](../scripts/linux/build_firecracker_kernel.sh)
+artifact procedure on an appropriate builder, not on every test invocation.
+The native job requires `kalisto-vmlinux.config` and `kalisto-vmlinux.manifest`
+beside the image, matching `KERNEL_SHA256` / `KERNEL_CONFIG_SHA256` values,
+and built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y` for multi-endpoint
+kube-proxy Services. A checksum-valid older kernel without this option is not
+sufficient. Provide a prepared raw ext4 rootfs separately; the CI job does not
+create or publish guest artifacts.
+
+To enable this job on every main push after a successful manual run, configure
+the repository's `KALISTO_FIRECRACKER_KERNEL` Actions variable with that verified
+prepared kernel. Until configured, regular main CI skips the native Linux job;
+the historical functional observation above remains evidence, not a continuously
+enforced native gate. See [release CI configuration](releases.md#ci-configuration)
+for storage, runner variables, installed-archive smoke checks and the unverified
+Intel macOS / Linux ARM64 boundaries.
 
 ## Operational Notes
 

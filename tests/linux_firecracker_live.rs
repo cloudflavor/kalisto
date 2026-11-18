@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 struct LiveCluster {
     name: String,
+    binary: PathBuf,
     evidence: PathBuf,
     data: PathBuf,
     workspace: PathBuf,
@@ -35,7 +36,7 @@ impl Drop for Running {
 
 impl LiveCluster {
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kalisto"));
+        let mut command = Command::new(&self.binary);
         command
             .current_dir(&self.workspace)
             .env("XDG_DATA_HOME", &self.data)
@@ -371,8 +372,6 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
     };
     fs::create_dir_all(&target).unwrap();
     let target = target.canonicalize().unwrap();
-    let data = target.join("kalisto/firecracker-live-data");
-    fs::create_dir_all(&data).unwrap();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -382,8 +381,15 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
     let workspace = evidence.join("empty-cwd");
     fs::create_dir_all(&workspace).unwrap();
     let evidence = evidence.canonicalize().unwrap();
+    let install = evidence.join("install/bin");
+    fs::create_dir_all(&install).unwrap();
+    let binary = install.join("kalisto");
+    fs::copy(env!("CARGO_BIN_EXE_kalisto"), &binary).unwrap();
+    let data = evidence.join("data");
+    fs::create_dir_all(&data).unwrap();
     let live = LiveCluster {
         name,
+        binary,
         workspace: workspace.canonicalize().unwrap(),
         evidence,
         data,
@@ -601,5 +607,47 @@ fn fresh_cli_three_node_cilium_host_api_dns_and_service_under_sixty_seconds() {
     );
     prepare_multi_endpoint_scale_service(&live, &workers, probe_image, maintenance);
     live.cli(&["scale", "--workers", "3"], "scale", maintenance);
-    live.nodes(4, "scaled-nodes", maintenance);
+    let expanded = live.nodes(4, "scaled-nodes", maintenance);
+    let removed_worker = format!("kalisto-{}-w2", live.name);
+    assert!(
+        expanded["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["metadata"]["name"] == removed_worker)
+    );
+    let shrink_deadline = Instant::now() + Duration::from_secs(180);
+    live.cli(&["scale", "--workers", "2"], "scale-down", shrink_deadline);
+    let retained = live.nodes(3, "scaled-down-nodes", shrink_deadline);
+    for original in nodes["items"].as_array().unwrap() {
+        let current = retained["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["metadata"]["name"] == original["metadata"]["name"])
+            .expect("scale-down must retain the control plane and original workers");
+        assert_eq!(current["metadata"]["uid"], original["metadata"]["uid"]);
+    }
+    assert!(
+        retained["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["metadata"]["name"] != removed_worker)
+    );
+    for index in 0..workers.len() {
+        let output = live.kubectl(
+            &[
+                "exec",
+                &format!("budget-scale-http-{index}"),
+                "--",
+                "sh",
+                "-ec",
+                "nslookup kubernetes.default.svc.cluster.local >/dev/null; wget -q -T 5 -O - http://budget-scale-http.default.svc.cluster.local:8080/",
+            ],
+            &format!("scaled-down-worker-{index}-dns-and-http"),
+            shrink_deadline,
+        );
+        assert_eq!(String::from_utf8(output).unwrap().trim(), "scale-ready");
+    }
 }

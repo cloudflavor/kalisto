@@ -39,5 +39,5 @@ jobs:
             export SSL_CERT_FILE="$KALISTO_LINUX_CA_BUNDLE"
           fi
           python3 scripts/release/stage.py \
-            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
             --root "$HOME/.local/share/cloudflavor/distributions/kalisto/$RELEASE_TAG"
