@@ -694,7 +694,9 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     )?;
 
     if let Some(removal) = pending_removal {
-        if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
+        if let Err(error) =
+            handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root)
+        {
             warn!(error = %error, "failed to hand off resumed cluster files to invoking user");
         }
         return Err(Error::InvalidArgs(format!(
@@ -1276,7 +1278,9 @@ fn scale_at_root(
             &control_plane_guest_kubeconfig,
             pending_removal,
         );
-        if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root) {
+        if let Err(error) =
+            handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root)
+        {
             warn!(error = %error, "failed to hand off scaled cluster files to invoking user");
         }
         let outcome = outcome?;
@@ -3286,6 +3290,32 @@ mod tests {
                 }
                 Ok(())
             }
+
+            fn bridge_command(&self, program: &str, args: &[String]) -> Option<Result<Output>> {
+                let mut taps = self.bridge_taps.lock().unwrap();
+                let taps = taps.as_mut()?;
+                match program {
+                    "ssh" if args.last().is_some_and(|arg| arg == "true") => {
+                        Some(Err(Error::InvalidArgs("guest is stopped".to_owned())))
+                    }
+                    "kill" => Some(Ok(Output {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })),
+                    "ip" => {
+                        if args.first().is_some_and(|arg| arg == "link")
+                            && args.get(1).is_some_and(|arg| arg == "del")
+                        {
+                            taps.remove(args.last().unwrap());
+                        }
+                        Some(Ok(Output {
+                            stdout: taps.iter().cloned().collect::<Vec<_>>().join("\n"),
+                            stderr: String::new(),
+                        }))
+                    }
+                    _ => None,
+                }
+            }
         }
 
         impl CommandRunner for RemovalRunner {
@@ -3295,27 +3325,8 @@ mod tests {
                 {
                     return crate::process::SystemRunner.run(program, args);
                 }
-                if let Some(taps) = self.bridge_taps.lock().unwrap().as_mut() {
-                    if program == "ssh" && args.last().is_some_and(|arg| arg == "true") {
-                        return Err(Error::InvalidArgs("guest is stopped".to_owned()));
-                    }
-                    if program == "kill" {
-                        return Ok(Output {
-                            stdout: String::new(),
-                            stderr: String::new(),
-                        });
-                    }
-                    if program == "ip" {
-                        if args.first().is_some_and(|arg| arg == "link")
-                            && args.get(1).is_some_and(|arg| arg == "del")
-                        {
-                            taps.remove(args.last().unwrap());
-                        }
-                        return Ok(Output {
-                            stdout: taps.iter().cloned().collect::<Vec<_>>().join("\n"),
-                            stderr: String::new(),
-                        });
-                    }
+                if let Some(output) = self.bridge_command(program, args) {
+                    return output;
                 }
                 let output = self.inner.run(program, args)?;
                 let command = args.last().map_or("", String::as_str);
@@ -3451,11 +3462,18 @@ mod tests {
                     .env("SUDO_GID", "65534")
                     .status()
                     .unwrap();
-                assert!(status.success(), "isolated sudo ownership regression failed");
+                assert!(
+                    status.success(),
+                    "isolated sudo ownership regression failed"
+                );
                 return;
             }
             for blocked in [false, true] {
-                let fixture = Fixture::new(if blocked { "sudo-blocked" } else { "sudo-success" });
+                let fixture = Fixture::new(if blocked {
+                    "sudo-blocked"
+                } else {
+                    "sudo-success"
+                });
                 if blocked {
                     fixture.fail("drain", "kalisto-dev-w1");
                 }
