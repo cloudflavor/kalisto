@@ -1,110 +1,104 @@
-# Kalisto Implementation Tracker
+# Kalisto implementation tracker
 
-This document is the live implementation tracker for the project. Update it as work lands so the current product shape, completed work, and next steps stay explicit.
+This tracker describes the product and its evidence boundaries, not the original
+Lima probe prototype. Keep it aligned with the CLI, native tests and release
+artifacts when behavior changes.
 
-## Current Goal
+## Current product
 
-Turn the macOS Lima validation harness into a usable local-development CLI with:
+- Standalone local Kubernetes CLI using K3s.
+- macOS default: Apple containers on Apple silicon and macOS 26+, reusing a
+  compatible installed/running Apple `container` service.
+- Optional macOS backend: Lima with native VZ.
+- Linux default: Firecracker with rootless `slirp4netns`; privileged bridge
+  networking is an explicit alternative.
+- `kalisto pull` prepares versioned images, managed tools and matching startup
+  assets. `kalisto up` consumes that cache without startup downloads.
+- CNI is explicit: no CNI by default, or selected `cni/cilium`. Do not substitute
+  Flannel to meet a startup budget.
+- Cluster state/configuration use the user's data/configuration directories;
+  installed execution does not require a source checkout.
 
-- `kalisto up`
-- `kalisto down`
-- `kalisto status`
-- `kalisto kubeconfig`
+## Delivered
 
-The current supported runtime is:
+### Lifecycle and development workflows
 
-- macOS backend: Lima
-- Linux backend: Firecracker
-- Kubernetes distro: `k3s`
-- Image pipeline: shared Ubuntu guest provisioning with backend-specific artifacts
+- Backend-neutral cluster orchestration and persisted backend/profile identity.
+- Create, start/resume, stop, inspect, list and destroy named clusters.
+- Managed kubeconfig/kubectl, workload application, add-ons, logs, benchmarks,
+  CLI progress and MCP/AI-agent integration.
+- Scale-out joins additional workers and checks their current-boot readiness.
+- Scale-down drains highest-index workers using Kubernetes eviction, protects
+  Node identity with UID checks, and persists each completed removal. Interrupted
+  removal can recover through `up` and a repeated `scale` command without
+  recreating deleted workers; removed VM disks/local data are not retained.
+- Stop/resume preserves cluster disks and state; readiness verifies current boot
+  identity, node address and authenticated API-to-kubelet connectivity.
+- Lima cold export/import with native age encryption; see
+  [archive limitations](../docs/cluster-archives.md).
 
-## Completed
+### Images and distribution
 
-### Core runtime
+- Prepared Apple-container, Lima and Firecracker artifact paths.
+- Linux kernel/rootfs builders and managed explicit-path/cache/manifest
+  resolution. Firecracker startup never downloads missing guest artifacts.
+- Shared read-only Firecracker boot-asset disk; per-cluster writable disks,
+  SSH identities and private manifests.
+- Four-target release packaging, checksums/provenance, draft-first publication
+  and verified website staging; see [release tooling](../docs/releases.md).
+- macOS build outputs/caches/large temporaries remain on mounted external
+  storage. Borrowed runtimes and unrelated clusters are not cleanup targets.
 
-- Lima-only macOS scope
-- extracted Lima `k3s` runtime modules under `src/lima_k3s/`
-- `structopt`-based CLI parsing
-- `tracing` + `tracing_subscriber` lifecycle logging with default `info` stage output
-- first-pass product commands:
-  - `kalisto up`
-  - `kalisto down`
-  - `kalisto ls`
-  - `kalisto remove`
-  - `kalisto status`
-  - `kalisto kubeconfig`
-  - `kalisto bench`
-- global cluster state now lives under `~/.local/share/kalisto/clusters/<name>/`
-- default Kalisto config root reserved under `~/.config/kalisto`
-- live Lima substrate probe
-- live Lima `k3s` control-plane and worker-join probe
+### Public showcase and entry points
 
-### Image pipeline
+- [Documentation](https://cloudflavor.io/kalisto/docs/getting-started/) and
+  [downloads](https://cloudflavor.io/kalisto/#download) are reachable.
+- Eight real CLI recordings are hosted on asciinema.org: startup, HTTP
+  deployment, state-preserving resume and scale-out on each native backend.
+  [Recording URLs and provenance](../docs/demos.md) identify their source
+  revisions; website deployment must not contain the casts.
+- The public download candidate is explicitly a development snapshot, not a
+  stable release. Its source revision must not be confused with current main.
 
-- CI pipeline for:
-  - `fmt`
-  - `clippy`
-  - `test`
-  - release binary build
-  - Lima seed image build
-- Firecracker rootfs build job
-- Firecracker kernel build job
-- Firecracker combined artifact publish job
-- Ubuntu 24.04 minimal ARM seed image build
-- Ubuntu 24.04 minimal AMD64 Firecracker rootfs build
-- Kalisto-owned AMD64 Firecracker kernel build for `k3s`
-- cached `k3s` asset reuse
-- macOS finalization pass for warmed Lima image artifacts
-- shared guest provisioning script for Lima and Firecracker image builds
-- repo-scoped pipeline runtime configuration for larger Apple `container` job VMs
+## Functional evidence
 
-### Benchmarks observed so far
+The acceptance scenario includes fresh three-node creation, authenticated host
+API, every selected Cilium rollout, DNS from both workers and cross-node Service
+HTTP, all within sixty seconds after preparation.
 
-- finalized image control-plane host API ready: about `39.7s`
-- finalized image `1cp + 1worker` cluster ready: about `74.1s`
+| Backend | Observed functional result | Evidence boundary |
+| --- | --- | --- |
+| Apple containers | 38.11s | Native run 4478, source `015c15f`; not a measurement of every later revision. |
+| Firecracker | 42.95s; preparation separately 40.68s | Fedora 44 x86_64, Firecracker 1.18.0; persistence and scale-out verified outside the startup clock. |
+| Lima | 56.07s, 53.84s, 54.26s, 54.83s | Historical native VZ development-Mac runs, not Apple-container results. |
 
-## In Progress
+The source acceptance tests are `tests/macos_three_node_boot_budget.rs` and
+`tests/linux_firecracker_live.rs`. Keep same-revision CI evidence with candidate
+packages. Lifecycle timings or cross-compilation alone do not establish full
+functional readiness. See the
+[published performance boundaries](https://cloudflavor.io/kalisto/docs/performance/).
 
-### CLI productization
+## Remaining work and explicit limits
 
-- separate backend lifecycle from bootstrap orchestration
-- move the current `up` path off probe-oriented helpers where it still reuses them indirectly
-  - worker startup and shared runtime helpers now use the real Lima backend module
-- cluster product lifecycle now routes through an explicit backend interface
-- backend identity is now persisted in cluster spec/state
-- product bootstrap and wait helpers now live under `src/cluster/` instead of `src/lima_k3s/`
-- documented Linux Firecracker host and artifact prerequisites under `docs/`
-- host-default backend selection now maps Linux to Firecracker and macOS to Lima
-- Firecracker kernel/rootfs inputs now exist in CLI/spec/state plumbing
-- Firecracker artifact manager now resolves kernel/rootfs from explicit paths, local workspace artifacts, a managed local cache, or configured fetch URLs
-- Firecracker artifact manager now understands a published manifest that can supply filenames, checksums, URLs, and the managed `k3s` version
-- Firecracker kernel resolution no longer falls back to the upstream Firecracker CI bucket; the managed kernel is now expected to come from Kalisto-built artifacts or an explicit manifest/URL
-- Firecracker backend now writes NoCloud seed artifacts, launches a microVM process, exposes guest SSH exec, tracks pid-based status, and cleans up runtime networking
-- Firecracker control-plane bootstrap now runs through the shared cluster bootstrap path with backend-derived guest artifact roots
-- control-plane artifact persistence now works across both mounted-artifact and SSH copy-out backends
-- control-plane API endpoint and TLS SAN handling now derive from the selected backend instead of assuming Lima localhost forwarding
-- Firecracker runtime networking now uses a shared Linux bridge so the host and workers can reach the control plane
-- live Firecracker cluster bring-up now reaches VM boot, cloud-init, SSH, k3s startup, and control-plane artifact extraction on a real host
-- the current live Firecracker blocker is kernel support for the `k3s` networking requirements, which is why the managed kernel pipeline is being moved to a Kalisto-built artifact
-- make lifecycle progress visible during `up/down/bench` so the CLI is not silent while Lima boots
+- Native scale-down acceptance must pass on the candidate source; host-safe
+  regression coverage alone is not a native lifecycle measurement.
+- A stable version still requires a reviewed version/tag and successful release
+  publication. Do not relabel a CI snapshot as stable.
+- Firecracker still requires explicit compatible kernel/rootfs artifacts or
+  configured download sources; there is no public default artifact source.
+- Linux native lifecycle evidence is x86_64-specific. An ARM64 Linux package is
+  not proof of a native ARM64 Firecracker cluster.
+- Intel macOS packages are cross-compiled and architecture-checked; native Intel
+  runtime validation requires an Intel Mac/runner that is not currently
+  configured. Do not install Rosetta or claim emulation is native proof.
+- macOS binaries are unsigned and not notarized.
+- Lima archive import has no completed native restored-workload acceptance
+  evidence or sub-minute guarantee; archives are not supported on every backend.
 
-## Next
+## Verification policy
 
-1. Build and publish the Kalisto-owned Firecracker kernel artifact, then retry live Firecracker bring-up with that kernel
-
-2. Point the artifact manager at a real published Firecracker manifest URL by default once the publication location is finalized
-
-3. Make `up` use the finalized image path by default in real Lima runs and benchmark it again
-
-4. Add mount/workspace fields to the cluster spec and state model
-
-5. Record repeated real `kalisto bench` samples against the finalized image path
-
-6. Reduce duplication between probe-oriented Lima helpers and product backend helpers
-
-7. Move the Lima probe path onto the shared backend-neutral cluster bootstrap/wait surface where it fits cleanly
-
-## Follow-up
-
-- plugin/add-on install surface after cluster boot
-- workspace mount and dev workflow integration
+Use targeted CI checks first and authorized native tests for real lifecycle
+proof. No local builds, tests, formatters or benchmarks without explicit local
+authorization. Recordings are actual terminal sessions, never fabricated output;
+review privacy and successful commands before uploading to the user's linked
+asciinema.org account.

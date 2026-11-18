@@ -10,6 +10,22 @@ checks and cleanup are outside the recordings; genuine read-only assertions stay
 on the clock. These use cases do not replace either backend's cold-boot,
 functional Cilium/DNS/cross-node HTTP acceptance test or make a sixty-second claim.
 
+## Published recordings
+
+These recordings are already hosted on asciinema.org; the website links to or
+embeds its player and does not serve the casts.
+
+| Use case | macOS Apple containers | Linux Firecracker |
+| --- | --- | --- |
+| Fresh three-node Cilium cluster | [Watch](https://asciinema.org/a/9NiazaB8VfoFCw3k) | [Watch](https://asciinema.org/a/60uyxYoIpzIXhliw) |
+| Deploy and reach HTTP | [Watch](https://asciinema.org/a/0INmR0OqGcLGeNjq) | [Watch](https://asciinema.org/a/AWGgMs2Jo7h0DQxf) |
+| Stop/resume with persisted state | [Watch](https://asciinema.org/a/eUJ9iZO0kTBWH8BD) | [Watch](https://asciinema.org/a/YmlRAv2BCcgNcDcx) |
+| Scale out and spread replicas | [Watch](https://asciinema.org/a/VstCRHViyYAFGEBr) | [Watch](https://asciinema.org/a/nZWS17frmHFgIEPm) |
+
+The captured revisions are `93390c52e4f031d112c794fd1972fda09d2c5aad`
+(Apple containers) and `4fe2abc746758efcce04f30eede577e6f9857957`
+(Firecracker), not an assertion that every later revision was recorded.
+
 ## Scenarios
 
 | Recording | Actual behavior checked |
@@ -42,6 +58,39 @@ The public response is:
 ```text
 Hello from Kalisto. This workload survives a cluster restart.
 ```
+
+## Record a direct terminal session
+
+Recording does not require a CI job or a source build. On an authorized native
+host with the installed Kalisto CLI, supported runtime and asciinema 3.2.1,
+prepare the selected profile with `kalisto pull` before starting the recorder.
+Use a new cluster name and an available API port; never reuse someone else's
+cluster for a demonstration.
+
+```sh
+asciinema rec --output-format asciicast-v2 --window-size 110x30 \
+  --capture-env TERM,SHELL --return \
+  --command '/bin/bash --noprofile --norc' showcase.cast
+```
+
+This opens a real shell. Execute the selected workflow against the owned cluster,
+check actual node/workload readiness and HTTP responses, then `exit` to finish.
+Keep original timing: do not shorten waits, fabricate output or claim that
+preparation was included. Do not print credentials or private infrastructure.
+
+Review the full recording privately with `asciinema play showcase.cast`. Only
+after command success and privacy review, upload using the user's already-linked
+asciinema.org account:
+
+```sh
+asciinema upload showcase.cast
+```
+
+Do not accept an anonymous upload as account-linked publication. Save the actual
+returned URL and source version; link to it from documentation instead of copying
+the cast into the website. Destroy only the demonstration's named cluster after
+recording. The automated recorder below is an optional CI reproduction path, not
+a prerequisite for recording a terminal session.
 
 ## Dispatch and artifacts
 
@@ -153,7 +202,7 @@ before destroying its owned cluster. This snapshot is never a public artifact.
 
 ## Source-level reproduction
 
-The workflow is the supported recording/reproduction entrypoint. Its scripts are:
+The workflows reproduce the automated captures. Their scripts are:
 
 - `capture.py`: dispatch/storage ownership, compilation, daemon fingerprinting,
   collision checks, actual `pull`, scene capture, cleanup, and publication metadata.
