@@ -43,6 +43,14 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
           python3 scripts/release/release.py identity --ref "$KALISTO_BUILD_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID"
+      - name: Require tagged source on reviewed main
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -eu
+          url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --unshallow "$url" refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$(git rev-parse HEAD)" refs/remotes/origin/main
+          test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "$(git rev-parse HEAD)"
       - name: Rust checks
         run: |
           cargo fmt --all --check
@@ -164,13 +172,14 @@ jobs:
     container:
       image: ${{ vars.KALISTO_CI_IMAGE }}
     steps:
-      - name: Checkout exact source
+      - name: Checkout exact source, tag and reviewed main ancestry
         run: |
           set -eu
           git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           url="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth=1 "$url" "$GITHUB_SHA"
-          case "$GITHUB_REF" in refs/tags/*) git fetch -q --depth=1 "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
+          git fetch -q "$url" "$GITHUB_SHA" refs/heads/main:refs/remotes/origin/main
+          case "$GITHUB_REF" in refs/tags/*) git fetch -q "$url" "$GITHUB_REF:$GITHUB_REF" ;; esac
           git checkout -q --detach "${GITHUB_SHA}^{commit}"
       - name: Download all three candidates
         uses: https://data.forgejo.org/actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
@@ -180,10 +189,11 @@ jobs:
         run: |
           tag=$(python3 scripts/release/release.py identity --ref "$KALISTO_BUILD_REF" --commit "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID" | awk -F= '/^BUILD_TAG=/ {print $2}')
           python3 scripts/release/release.py verify --root /tmp/kalisto-release-candidates --tag "$tag" --commit "$(git rev-parse HEAD)"
-      - name: Upload and read back draft assets, then publish only on a pushed tag
+      - name: Synchronize reviewed source and verify GitHub draft assets before publication
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         env:
-          GITHUB_TOKEN: ${{ secrets.KALISTO_RELEASE_TOKEN }}
+          KALISTO_GITHUB_TOKEN: ${{ secrets.KALISTO_GITHUB_TOKEN }}
+          KALISTO_GITHUB_REPOSITORY: ${{ vars.KALISTO_GITHUB_REPOSITORY }}
         run: |
           python3 scripts/release/release.py publish --root /tmp/kalisto-release-candidates \
             --tag "${GITHUB_REF#refs/tags/}" --commit "$(git rev-parse HEAD)"

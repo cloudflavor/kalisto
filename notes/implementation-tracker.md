@@ -45,7 +45,8 @@ artifacts when behavior changes.
 - Shared read-only Firecracker boot-asset disk; per-cluster writable disks,
   SSH identities and private manifests.
 - Three-target release packaging (macOS ARM64, Linux ARM64 and Linux x86_64),
-  checksums/provenance, draft-first publication and verified website staging;
+  checksums/provenance and draft-first GitHub Releases publication from reviewed
+  main tags, without website staging or Bunny artifact uploads;
   see [release tooling](../docs/releases.md).
 - macOS build outputs/caches/large temporaries remain on mounted external
   storage. Borrowed runtimes and unrelated clusters are not cleanup targets.
@@ -58,8 +59,9 @@ artifacts when behavior changes.
   deployment, state-preserving resume and scale-out on each native backend.
   [Recording URLs and provenance](../docs/demos.md) identify their source
   revisions; website deployment must not contain the casts.
-- The public download candidate is explicitly a development snapshot, not a
-  stable release. Its source revision must not be confused with current main.
+- Downloads link to GitHub Releases without a pinned current version or a
+  per-release website update. Historical recording revisions remain immutable
+  evidence, not a claim about the latest release or current main.
 
 ## Functional evidence
 
