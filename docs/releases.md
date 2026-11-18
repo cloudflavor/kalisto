@@ -124,20 +124,45 @@ Use a manual release workflow run to build and verify all four candidates withou
 publishing. Run native functional checks only on the configured CI runner; they
 create and destroy their own real cluster, not a mock.
 
-## Create a release
+For versioned GitHub release preparation, set the optional manual-dispatch input
+`candidate_tag` to the intended SemVer tag, such as `v0.1.0`. All four packages
+then embed that version and the exact dispatched source commit. This does not
+create a tag or publish a release, and the input cannot enable the tag-push
+publication step. Leave it empty for ordinary `ci-<commit>` development packages.
 
-Choose a reviewed commit with green CI and a new version. Example only:
+## Publish verified candidates on GitHub
+
+GitHub is the canonical release destination. First require green native startup
+acceptance and the complete four-target candidate inventory for the exact source.
+For example, after building candidates with `candidate_tag=v0.1.0`:
 
 ```bash
 git tag -s v0.1.0 COMMIT
-git push origin v0.1.0
+git push https://github.com/cloudflavor/kalisto.git v0.1.0
+gh release create v0.1.0 --repo cloudflavor/kalisto --verify-tag --draft \
+  --title v0.1.0 --notes "Kalisto v0.1.0; verify assets against SHA256SUMS." \
+  kalisto-v0.1.0-*.tar.gz SHA256SUMS
 ```
 
-`origin` must point to the configured Forgejo repository. The pipeline resolves lightweight and annotated tags,
-checks out their exact commit and embeds the tag version (including prerelease
-suffixes). Tags with prerelease suffixes create prereleases. Do not force-move release
-tags; create a new version instead. A publication rerun against an already published
-release stops safely without changing it.
+Before removing the draft flag, download every uploaded asset and verify its
+SHA-256 against the reviewed local inventory, its embedded tag/version/source,
+and that the GitHub tag still resolves to the reviewed commit. Publish only after
+all readbacks pass:
 
-The workflow itself does not create version tags. No tag or release is created merely
-by opening its PR or running a manual candidate build.
+```bash
+gh release edit v0.1.0 --repo cloudflavor/kalisto --draft=false
+```
+
+Keep native compilation on the configured CI runners. Do not copy GitHub account
+credentials into the private build environment or retag development binaries.
+macOS binaries remain unsigned and not notarized; cross-build success is not
+native runtime validation on Intel Macs or Linux ARM64.
+
+## Optional CI-hosted publication
+
+The existing tag-push publisher targets the configured Forgejo repository, not
+GitHub. Use it only when intentionally publishing there; GitHub release
+preparation does not require pushing a tag to that execution mirror.
+The workflow resolves lightweight and annotated tags, verifies exact source,
+uploads to a draft and reads back all assets before publication.
+Do not force-move release tags or overwrite an already published release.

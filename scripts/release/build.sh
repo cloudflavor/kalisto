@@ -6,7 +6,7 @@ target=${1:?Rust target required}
 export PATH="$HOME/.cargo/bin:$PATH"
 toolchain=1.89.0
 commit=$(git rev-parse HEAD)
-identity=$(python3 scripts/release/release.py identity --ref "$GITHUB_REF" --commit "$commit" --run-id "$GITHUB_RUN_ID")
+identity=$(python3 scripts/release/release.py identity --ref "${KALISTO_BUILD_REF:-$GITHUB_REF}" --commit "$commit" --run-id "$GITHUB_RUN_ID")
 first=${identity%%$'\n'*}
 export BUILD_TAG=${first#BUILD_TAG=}
 export KALISTO_BUILD_VERSION=${identity##*KALISTO_BUILD_VERSION=}
