@@ -30,6 +30,9 @@ The Linux host must provide:
 - `debugfs` available for NoCloud seed injection into the Firecracker rootfs
 - `mke2fs` available to build the shared read-only boot-asset disk during `pull`
 - OpenSSH `ssh`, `ssh-keygen` and `scp` for guest bootstrap and per-cluster file transfer
+- optionally, a running SSH agent (`SSH_AUTH_SOCK`) to forward host credentials into
+  guests; when set, Kalisto adds `-o ForwardAgent=yes` to every guest connection, so
+  guest-side `git`/`ssh` can authenticate with the host agent's keys
 - `ip` available for Linux networking setup
 - `iptables` and `sysctl` available; the current host availability check requires
   both even for rootless networking, while bridge mode uses them for host rules

@@ -1675,6 +1675,10 @@ fn run_ssh_command(
     runner.run("ssh", &args)
 }
 
+/// Host SSH agent keys are forwarded to guests when an agent is available.
+///
+/// Kalisto's own guest key stays the primary identity; forwarded host keys act
+/// as fallbacks so guest-side git/ssh operations can use the host agent.
 fn ssh_connection_args<'a>(
     ssh_key: &Path,
     net: &'a NetworkConfig,
@@ -1702,9 +1706,18 @@ fn ssh_connection_args<'a>(
         "LogLevel=ERROR".into(),
         "-o".into(),
         "ConnectTimeout=5".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
         "-i".into(),
         ssh_key.display().to_string(),
     ];
+    if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        args.extend(
+            ["-o".to_owned(), "ForwardAgent=yes".to_owned()]
+                .into_iter()
+                .map(Into::into),
+        );
+    }
     if let Some(port) = port {
         args.push(port_flag.into());
         args.push(port.to_string());
@@ -2412,6 +2425,49 @@ mod tests {
                 },
                 stderr: String::new(),
             })
+        }
+    }
+
+    #[test]
+    fn ssh_connection_args_forwards_host_agent_when_present() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let net = NetworkConfig::for_bridge_instance("vm");
+        let previous = std::env::var_os("SSH_AUTH_SOCK");
+
+        // SAFETY: TEST_LOCK serialises this test against other tests that read
+        // or mutate the process environment.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", "/tmp/kalisto-agent-test.sock") };
+        let (forwarded, _) = super::ssh_connection_args(Path::new("/k/id_ed25519"), &net, "-p")
+            .expect("bridge ssh args");
+        // SAFETY: TEST_LOCK is still held while restoring the environment.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("SSH_AUTH_SOCK", value),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
+            }
+        };
+        let (plain, _) = super::ssh_connection_args(Path::new("/k/id_ed25519"), &net, "-p")
+            .expect("bridge ssh args");
+
+        assert!(
+            forwarded
+                .windows(2)
+                .any(|pair| pair == ["-o", "ForwardAgent=yes"])
+        );
+        assert!(
+            !plain
+                .windows(2)
+                .any(|pair| pair == ["-o", "ForwardAgent=yes"])
+        );
+        for args in [&forwarded, &plain] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-o", "IdentitiesOnly=yes"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-i", "/k/id_ed25519"])
+            );
         }
     }
 
