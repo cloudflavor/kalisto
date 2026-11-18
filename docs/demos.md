@@ -15,6 +15,30 @@ functional Cilium/DNS/cross-node HTTP acceptance test or make a sixty-second cla
 These recordings are already hosted on asciinema.org; the website links to or
 embeds its player and does not serve the casts.
 
+The README uses checked-in animated GIFs under `images/demos/` because GitHub's
+image proxy cannot fetch the hosted previews reliably. These render the complete
+recordings at original speed, without trimming idle time, capped at 15 frames per
+second with a three-second final-frame hold before looping. Click a GIF for the
+hosted player with playback controls and selectable text.
+
+When replacing a recording, regenerate its matching GIF with
+[`agg` 1.9.0](https://github.com/asciinema/agg/releases/tag/v1.9.0) and
+[DejaVu fonts 2.37](https://github.com/dejavu-fonts/dejavu-fonts/releases/tag/version_2_37):
+
+```sh
+curl -fL "https://asciinema.org/a/<recording-id>.cast" -o recording.cast
+agg --font-dir /path/to/dejavu-fonts-ttf-2.37/ttf \
+  --text-font-family "DejaVu Sans Mono" --font-size 14 --line-height 1.333333 \
+  --theme asciinema --speed 1 --idle-time-limit 3600 --fps-cap 15 \
+  --last-frame-duration 3 recording.cast images/demos/<backend>-<scene>.gif
+```
+
+Use an idle-time limit longer than the complete recording. Update the recording
+links in both the README and this table, then verify the GIF plays through and its
+duration matches the recording plus the final-frame hold (within GIF timing
+precision). Only the GIFs are checked in; source casts and the interactive player
+remain hosted on asciinema.org.
+
 | Use case | macOS Apple containers | Linux Firecracker |
 | --- | --- | --- |
 | Fresh three-node Cilium cluster | [Watch](https://asciinema.org/a/9NiazaB8VfoFCw3k) | [Watch](https://asciinema.org/a/60uyxYoIpzIXhliw) |
