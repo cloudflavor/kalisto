@@ -74,6 +74,12 @@ Kalisto validates that helper independently; it does not re-register it or rewri
 its installation root. Managed services and the API daemon still require their
 selected installation identity.
 
+Upgrading the CLI or API daemon does not prove that an already-running image
+helper was upgraded. An older helper, such as 0.10.0 beside a 1.7.1 API daemon,
+is rejected with its version before newer-installation files are inspected.
+Align shared services separately only after checking active workloads and
+image-store compatibility; Kalisto never performs that shared-service upgrade.
+
 Application firewalls such as LuLu may require explicit allow rules for
 Homebrew's `container-core-images` and `container-runtime-linux` helpers after an
 upgrade. Approve only the required helpers; do not disable the firewall.

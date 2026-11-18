@@ -367,8 +367,8 @@ fn verify_borrowed_helper(
         app_root: selected.app_root.clone(),
     };
     helper_installation.validate()?;
-    validate_installation(&helper_installation)?;
-    verify_cli(runner, &helper_installation)
+    verify_cli(runner, &helper_installation)?;
+    validate_installation(&helper_installation)
 }
 
 fn verify_selected_services(
@@ -1524,16 +1524,23 @@ mod reuse_tests {
     }
 
     #[test]
-    fn incompatible_helper_installation_is_not_adopted_or_replaced() {
+    fn incompatible_helper_reports_version_before_missing_newer_files() {
         let fixture = Fixture::new("cli");
         let mut helper = Fixture::new("bin");
         helper
             .selected
             .app_root
             .clone_from(&fixture.selected.app_root);
+        fs::remove_file(
+            helper
+                .selected
+                .install_root
+                .join("libexec/container/plugins/machine-apiserver/bin/machine-apiserver"),
+        )
+        .unwrap();
         let mut runner = DiscoveryRunner::new(&fixture.selected, true);
         runner.helper = Some(helper.selected);
-        runner.helper_version = Some("container CLI version 1.7.0 (build: release, commit: old)");
+        runner.helper_version = Some("container CLI version 0.10.0 (build: release, commit: old)");
 
         let error = select_runtime(&runner, "gui/501", None).unwrap_err();
         assert!(error.to_string().contains("expected Apple container 1.7.1"));
