@@ -245,20 +245,23 @@ KALISTO_FIRECRACKER_ROOTFS=/path/to/rootfs.raw \
 Run this command only on the configured native CI host. Dispatch
 `.forgejo/workflows/ci.yml` with `firecracker_live=true` for the dedicated
 `firecracker-live` job on the existing `tomis-host` runner. It does not depend on
-showcase recording and never builds a kernel or changes the Firecracker service.
+showcase recording and never changes the Firecracker service. Kernel compilation
+is opt-in via the separate `prepare_firecracker_kernel=true` dispatch input.
 The job uses configured `KALISTO_FIRECRACKER_KERNEL` /
 `KALISTO_FIRECRACKER_ROOTFS`, or discovers the existing versioned host artifact
 cache for a manual run. Missing prerequisites fail rather than skip the live test.
 
 Prepare a compatible kernel ahead of time using the existing
 [`build_firecracker_kernel.sh`](../scripts/linux/build_firecracker_kernel.sh)
-artifact procedure on an appropriate builder, not on every test invocation.
+artifact procedure, or explicitly request the source-pinned CI preparation once.
+CI preparation creates a new owned kernel directory, never replaces user
+artifacts, and retains the verified kernel for subsequent runs without rebuilding.
 The native job requires `kalisto-vmlinux.config` and `kalisto-vmlinux.manifest`
 beside the image, matching `KERNEL_SHA256` / `KERNEL_CONFIG_SHA256` values,
 and built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y` for multi-endpoint
 kube-proxy Services. A checksum-valid older kernel without this option is not
 sufficient. Provide a prepared raw ext4 rootfs separately; the CI job does not
-create or publish guest artifacts.
+create a rootfs or publish guest artifacts.
 
 To enable this job on every main push after a successful manual run, configure
 the repository's `KALISTO_FIRECRACKER_KERNEL` Actions variable with that verified

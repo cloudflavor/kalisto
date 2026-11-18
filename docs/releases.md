@@ -114,7 +114,7 @@ default in Git. Do not put actual host paths or private image names in the workf
 | `KALISTO_MACOS_VOLUME` | Absolute path to an already-mounted external volume, not `/`. |
 | `KALISTO_MACOS_BUILD_ROOT` | Writable directory strictly beneath that volume, on the same filesystem. Workspaces and shared `cargo-home`, `release-rustup`, `sccache`, `apple-container-ci/target`, `apple-container-ci/artifacts` and per-target `release-target` caches live here. |
 | `KALISTO_LINUX_BUILD_ROOT` | Optional absolute, user-owned mode-0700 storage directory for the native Linux job; defaults to `~/.cache/kalisto-firecracker-ci`. It reuses `firecracker-ci/target` and creates an owned temporary checkout, without changing host services or networking configuration. |
-| `KALISTO_FIRECRACKER_KERNEL` | Optional prepared absolute kernel path on `tomis-host`. Setting it enables native Linux acceptance on main pushes. The sibling `.config` and `.manifest` must match kernel/config SHA256 values and include built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y`. No kernel is rebuilt by this job. |
+| `KALISTO_FIRECRACKER_KERNEL` | Optional prepared absolute kernel path on `tomis-host`. Setting it enables native Linux acceptance on main pushes. The sibling `.config` and `.manifest` must match kernel/config SHA256 values and include built-in `CONFIG_NETFILTER_XT_MATCH_STATISTIC=y`. Ordinary runs never rebuild or replace it. |
 | `KALISTO_FIRECRACKER_ROOTFS` | Optional prepared absolute raw ext4 rootfs path on `tomis-host`. If omitted, native CI searches the existing versioned Firecracker artifact cache as described in the Linux guide. |
 | `KALISTO_LINUX_CA_BUNDLE` | Optional existing CA bundle for native Linux source checkout and website download staging against the configured Forgejo origin. |
 
@@ -135,17 +135,25 @@ targets users' cluster state.
 Native Linux acceptance is independent of showcase recordings. Dispatch **CI**
 with `firecracker_live=true` to run `firecracker-live` on the existing `tomis-host`.
 It reuses Firecracker v1.18.0, KVM and prepared host images; it does not install
-tools, rebuild kernels, record demos, or publish artifacts. When explicit image
-variables are absent, a manual run searches
+tools, record demos or publish artifacts. Kernel preparation requires the separate
+explicit `prepare_firecracker_kernel=true` dispatch input. When explicit image
+variables are absent, an ordinary manual run searches
 `~/.local/share/kalisto/artifacts/firecracker-node/{v1.18,v1.13}/x86_64/` for
 `kalisto-vmlinux` and `ubuntu-24.04-minimal-k3s-amd64-rootfs.raw`.
 Kernel/config sidecar hashes and the multi-endpoint Service kernel option are
 checked before compilation. Missing or incompatible prerequisites fail explicitly.
 Setting `KALISTO_FIRECRACKER_KERNEL` opts main pushes into this native gate;
 without it, the job is skipped on ordinary pushes, not reported as native success.
-The variable is not configured in the current deployment, so default main CI
-does not yet establish ongoing native Linux acceptance. Configure the verified
-kernel after a successful manual run to activate that gate.
+To prepare a compatible kernel without replacing user artifacts, dispatch with
+both `firecracker_live=true` and `prepare_firecracker_kernel=true`. This uses the
+existing builder and host build tools with checksum-pinned Linux 6.19.9 source and
+the current repository fragment. A new private `firecracker-ci/kalisto-kernel.*`
+directory retains only the kernel/config/manifest plus its run ownership marker;
+source and large build temporaries stay in the owned checkout and are cleaned.
+The existing user kernel and rootfs are untouched. After native acceptance passes,
+configure the printed verified kernel path as `KALISTO_FIRECRACKER_KERNEL` to
+activate the main gate and avoid repeating kernel compilation. Retain that
+directory while the variable references it.
 
 Private Linux evidence stays in
 `$CARGO_TARGET_DIR/kalisto/firecracker-budget/<unique-cluster>/`; no guest logs,

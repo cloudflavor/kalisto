@@ -10,6 +10,11 @@ on:
         required: false
         default: false
         type: boolean
+      prepare_firecracker_kernel:
+        description: Build a pinned kernel in owned CI storage without replacing user artifacts
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: kalisto-ci-${{ github.ref }}
@@ -153,6 +158,7 @@ jobs:
       KALISTO_FIRECRACKER_KERNEL: ${{ vars.KALISTO_FIRECRACKER_KERNEL }}
       KALISTO_FIRECRACKER_ROOTFS: ${{ vars.KALISTO_FIRECRACKER_ROOTFS }}
       KALISTO_LIVE_FIRECRACKER_TESTS: "1"
+      KALISTO_PREPARE_FIRECRACKER_KERNEL: ${{ github.event.inputs.prepare_firecracker_kernel }}
     steps:
       - name: Reuse native tools and verified prepared artifacts without provisioning
         run: |
@@ -187,6 +193,8 @@ jobs:
               ("KALISTO_FIRECRACKER_KERNEL", "kalisto-vmlinux"),
               ("KALISTO_FIRECRACKER_ROOTFS", "ubuntu-24.04-minimal-k3s-amd64-rootfs.raw"),
           ):
+              if key == "KALISTO_FIRECRACKER_KERNEL" and os.environ.get("KALISTO_PREPARE_FIRECRACKER_KERNEL") == "true":
+                  continue
               configured = os.environ.get(key)
               candidates = [Path(configured)] if configured else [
                   cache / track / "x86_64" / filename for track in ("v1.18", "v1.13")
@@ -197,18 +205,18 @@ jobs:
               assert image.stat().st_size > 0 and os.access(image, os.R_OK)
               assert "\n" not in str(image) and "\r" not in str(image)
               images[key] = image
-          kernel = images["KALISTO_FIRECRACKER_KERNEL"]
-          config = Path(str(kernel) + ".config")
-          manifest = dict(line.split("=", 1) for line in Path(str(kernel) + ".manifest").read_text().splitlines())
-          assert "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y" in config.read_text().splitlines(), "Prepare a kernel supporting multi-endpoint Services"
-          def digest(path):
-              result = hashlib.sha256()
-              with path.open("rb") as stream:
-                  for block in iter(lambda: stream.read(1024 * 1024), b""):
-                      result.update(block)
-              return result.hexdigest()
-          assert digest(kernel) == manifest["KERNEL_SHA256"], "Prepared kernel checksum mismatch"
-          assert digest(config) == manifest["KERNEL_CONFIG_SHA256"], "Prepared kernel config checksum mismatch"
+          if kernel := images.get("KALISTO_FIRECRACKER_KERNEL"):
+              config = Path(str(kernel) + ".config")
+              manifest = dict(line.split("=", 1) for line in Path(str(kernel) + ".manifest").read_text().splitlines())
+              assert "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y" in config.read_text().splitlines(), "Prepare a kernel supporting multi-endpoint Services"
+              def digest(path):
+                  result = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for block in iter(lambda: stream.read(1024 * 1024), b""):
+                          result.update(block)
+                  return result.hexdigest()
+              assert digest(kernel) == manifest["KERNEL_SHA256"], "Prepared kernel checksum mismatch"
+              assert digest(config) == manifest["KERNEL_CONFIG_SHA256"], "Prepared kernel config checksum mismatch"
           with open(os.environ["GITHUB_ENV"], "a") as output:
               output.write(f"KALISTO_LINUX_BUILD_ROOT={root}\n")
               for key, image in images.items():
@@ -233,6 +241,51 @@ jobs:
           fi
           unset url
           git checkout -q --detach "${GITHUB_SHA}^{commit}"
+      - name: Prepare an explicitly requested source-pinned kernel
+        if: ${{ env.KALISTO_PREPARE_FIRECRACKER_KERNEL == 'true' }}
+        run: |
+          set -eu
+          umask 077
+          cd "$KALISTO_FIRECRACKER_WORKSPACE"
+          for tool in gcc make flex bison bc rsync tar xz file awk sha256sum; do
+            command -v "$tool" >/dev/null
+          done
+          export KALISTO_FIRECRACKER_VERSION=v1.18.0
+          export KALISTO_FIRECRACKER_ARCH=x86_64
+          export KALISTO_FIRECRACKER_ARTIFACT_TRACK=v1.18
+          export KALISTO_FIRECRACKER_KERNEL_VERSION=6.19.9
+          export KALISTO_FIRECRACKER_KERNEL_SOURCE_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.9.tar.xz
+          export KALISTO_FIRECRACKER_KERNEL_SOURCE_SHA256=c16068a3af12e3943dee3b1eef57ca70229c069128bfa1184fb3f48b219d55bf
+          export KALISTO_FIRECRACKER_KERNEL_CONFIG_FRAGMENT="$PWD/scripts/linux/firecracker-k3s-x86_64.config"
+          export KALISTO_FIRECRACKER_OUTPUT_DIR
+          KALISTO_FIRECRACKER_OUTPUT_DIR=$(mktemp -d "$KALISTO_LINUX_BUILD_ROOT/firecracker-ci/kalisto-kernel.XXXXXX")
+          printf '%s\n' "$GITHUB_RUN_ID" > "$KALISTO_FIRECRACKER_OUTPUT_DIR/.native-kernel-owner"
+          export KALISTO_FIRECRACKER_KERNEL_WORK_DIR="$PWD/kernel-source"
+          export KALISTO_FIRECRACKER_KERNEL_TMP_DIR="$PWD/tmp/kernel-build"
+          export KALISTO_FIRECRACKER_KERNEL_JOBS=4
+          if ! bash scripts/linux/build_firecracker_kernel.sh > kernel-build.log 2>&1; then
+            tail -n 80 kernel-build.log >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          kernel = Path(os.environ["KALISTO_FIRECRACKER_OUTPUT_DIR"]) / "kalisto-vmlinux"
+          config = Path(str(kernel) + ".config")
+          manifest = dict(line.split("=", 1) for line in Path(str(kernel) + ".manifest").read_text().splitlines())
+          assert manifest["KERNEL_SOURCE_SHA256"] == os.environ["KALISTO_FIRECRACKER_KERNEL_SOURCE_SHA256"]
+          assert "CONFIG_NETFILTER_XT_MATCH_STATISTIC=y" in config.read_text().splitlines()
+          for path, field in ((kernel, "KERNEL_SHA256"), (config, "KERNEL_CONFIG_SHA256")):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(block)
+              assert digest.hexdigest() == manifest[field]
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"KALISTO_FIRECRACKER_KERNEL={kernel}\n")
+          print(f"Prepared native kernel: {kernel}")
+          PY
       - name: Prove installed CLI cold boot, persistence and worker scaling natively
         run: |
           set -eu
