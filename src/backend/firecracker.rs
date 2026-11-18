@@ -2215,7 +2215,7 @@ mod tests {
         BACKEND, FirecrackerNetworkMode, NetworkConfig, ROOTLESS_SLIRP_SHORT_SOCKET_DIR,
         UNIX_SOCKET_PATH_MAX, build_config_json, choose_slirp_api_socket_path, firecracker_subnet,
         load_slirp_api_socket_path, nat_postrouting_rule_args, parse_default_route_interface,
-        parse_pid_and_args_line,
+        parse_pid_and_args_line, stable_hash,
     };
     use crate::backend::InstanceConfig;
     use crate::backend::runtime::ClusterBackend;
@@ -2621,10 +2621,8 @@ mod tests {
     #[test]
     fn rootless_guest_addresses_survive_concurrent_start_and_resume() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "kalisto-rootless-addresses-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("kalisto-rootless-addresses-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         // These real run-5194 node names previously shared 10.0.2.179.
         let names = [
@@ -2714,7 +2712,10 @@ mod tests {
         }
         let runtime = super::RuntimeFiles::new(&root.join("cp"));
         assert!(super::reserve_rootless_guest_ip(&runtime).is_err());
-        assert_eq!(fs::read_to_string(&runtime.guest_ip).unwrap(), "10.0.2.179\n");
+        assert_eq!(
+            fs::read_to_string(&runtime.guest_ip).unwrap(),
+            "10.0.2.179\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
