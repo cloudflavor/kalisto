@@ -154,8 +154,10 @@ directory while the variable references it.
 
 Private Linux evidence stays in
 `$CARGO_TARGET_DIR/kalisto/firecracker-budget/<unique-cluster>/`; no guest logs,
-credentials or cluster state are uploaded. The test destroys only its unique
-cluster, and the workflow removes only its own checkout.
+credentials or cluster state are uploaded. After destroying its unique cluster,
+the test removes its prepared-image cache and installed binary while retaining
+diagnostic logs. If destruction fails, it retains the owned data for recovery.
+The workflow removes only its own checkout.
 
 Forgejo supplies `GITHUB_SERVER_URL` (HTTPS origin), `GITHUB_REPOSITORY`
 (`owner/name`), `GITHUB_TOKEN`, `GITHUB_EVENT_NAME`, `GITHUB_REF`, `GITHUB_SHA`,

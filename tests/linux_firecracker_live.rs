@@ -165,6 +165,19 @@ impl LiveCluster {
         }));
         nodes
     }
+
+    fn remove_prepared_data(&self) {
+        for directory in [&self.data, &self.evidence.join("install")] {
+            if let Err(error) = fs::remove_dir_all(directory)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "could not remove owned prepared data {}: {error}",
+                    directory.display()
+                );
+            }
+        }
+    }
 }
 
 impl Drop for LiveCluster {
@@ -173,6 +186,7 @@ impl Drop for LiveCluster {
         // named cluster in this test's private XDG roots. Never touch user state.
         let cluster = self.data.join("kalisto/clusters").join(&self.name);
         if !cluster.exists() {
+            self.remove_prepared_data();
             return;
         }
         let mut guests = Vec::new();
@@ -209,12 +223,54 @@ impl Drop for LiveCluster {
                 Instant::now() + Duration::from_secs(120),
             )
         }));
-        if cleanup.is_err() {
+        if cleanup.is_err() || cluster.exists() {
             eprintln!(
                 "owned cluster cleanup failed; inspect {}",
                 self.evidence.display()
             );
+        } else {
+            self.remove_prepared_data();
         }
+    }
+}
+
+#[test]
+fn owned_cache_cleanup_keeps_failed_clusters_and_diagnostic_logs() {
+    for failed_cleanup in [false, true] {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let evidence = std::env::temp_dir().join(format!(
+            "kalisto-firecracker-cleanup-{}-{nonce}",
+            std::process::id()
+        ));
+        let data = evidence.join("data");
+        let install = evidence.join("install/bin");
+        fs::create_dir_all(data.join("kalisto/artifacts")).unwrap();
+        fs::create_dir_all(&install).unwrap();
+        fs::write(data.join("kalisto/artifacts/asset"), "owned prepared image").unwrap();
+        fs::write(evidence.join("up.stderr"), "startup diagnostics").unwrap();
+        let binary = install.join("kalisto");
+        fs::copy("/bin/false", &binary).unwrap();
+        if failed_cleanup {
+            fs::create_dir_all(data.join("kalisto/clusters/dev")).unwrap();
+        }
+        drop(LiveCluster {
+            name: "dev".to_owned(),
+            binary,
+            evidence: evidence.clone(),
+            data,
+            workspace: evidence.clone(),
+            path: "/usr/bin:/bin".to_owned(),
+        });
+        assert_eq!(evidence.join("data").exists(), failed_cleanup);
+        assert_eq!(evidence.join("install").exists(), failed_cleanup);
+        assert_eq!(
+            fs::read_to_string(evidence.join("up.stderr")).unwrap(),
+            "startup diagnostics"
+        );
+        fs::remove_dir_all(evidence).unwrap();
     }
 }
 
