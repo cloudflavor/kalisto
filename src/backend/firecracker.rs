@@ -1712,6 +1712,7 @@ fn ssh_connection_args<'a>(
         ssh_key.display().to_string(),
     ];
     if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        args.extend(["-o".to_owned(), "ForwardAgent=yes".to_owned()]);
     }
     if let Some(port) = port {
         args.push(port_flag.into());
@@ -2459,6 +2460,7 @@ mod tests {
                 args.windows(2)
                     .any(|pair| pair == ["-o", "IdentitiesOnly=yes"])
             );
+            assert!(args.windows(2).any(|pair| pair == ["-i", "/k/id_ed25519"]));
         }
     }
 
