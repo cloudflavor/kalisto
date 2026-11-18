@@ -345,7 +345,10 @@ fn verify_borrowed_helper(
         .ok_or_else(|| service_conflict(label))?;
     if !owned_service(output, &selected.app_root, &install_root)
         || program.canonicalize().map_err(io_error)?
-            != install_root.join(relative).canonicalize().map_err(io_error)?
+            != install_root
+                .join(relative)
+                .canonicalize()
+                .map_err(io_error)?
     {
         return Err(service_conflict(label));
     }
@@ -1454,10 +1457,7 @@ mod reuse_tests {
                 .unwrap_or(&self.selected);
             assert_eq!(
                 env[1],
-                (
-                    "CONTAINER_INSTALL_ROOT",
-                    selected.install_root.as_path()
-                )
+                ("CONTAINER_INSTALL_ROOT", selected.install_root.as_path())
             );
             assert_eq!(env[0].0, "CONTAINER_APP_ROOT");
             assert!(env[0].1.is_absolute());
@@ -1508,7 +1508,10 @@ mod reuse_tests {
     fn compatible_helper_from_another_installation_is_borrowed_without_mutation() {
         let fixture = Fixture::new("cli");
         let mut helper = Fixture::new("bin");
-        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        helper
+            .selected
+            .app_root
+            .clone_from(&fixture.selected.app_root);
         let mut runner = DiscoveryRunner::new(&fixture.selected, true);
         runner.helper = Some(helper.selected.clone());
         let plist = helper.selected.install_root.join("service.plist");
@@ -1524,7 +1527,10 @@ mod reuse_tests {
     fn incompatible_helper_installation_is_not_adopted_or_replaced() {
         let fixture = Fixture::new("cli");
         let mut helper = Fixture::new("bin");
-        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        helper
+            .selected
+            .app_root
+            .clone_from(&fixture.selected.app_root);
         let mut runner = DiscoveryRunner::new(&fixture.selected, true);
         runner.helper = Some(helper.selected);
         runner.helper_version = Some("container CLI version 1.7.0 (build: release, commit: old)");
@@ -1548,7 +1554,10 @@ mod reuse_tests {
     fn borrowed_helper_must_run_its_expected_packaged_executable() {
         let fixture = Fixture::new("cli");
         let mut helper = Fixture::new("bin");
-        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        helper
+            .selected
+            .app_root
+            .clone_from(&fixture.selected.app_root);
         let runner = DiscoveryRunner::new(&fixture.selected, true);
         let output = DiscoveryRunner::service(&helper.selected, &helper.selected.executable);
 

@@ -67,6 +67,13 @@ replacing their executable, configuration, application root or data. It refuses
 to take over an incompatible running daemon. Coordinate any engine upgrade or
 service restart separately with users of existing clusters and containers.
 
+A user-owned helper left running from another installation can be reused when it
+shares the API service's application root, runs its expected packaged executable,
+and belongs to a complete installation with the supported release CLI version.
+Kalisto validates that helper independently; it does not re-register it or rewrite
+its installation root. Managed services and the API daemon still require their
+selected installation identity.
+
 Application firewalls such as LuLu may require explicit allow rules for
 Homebrew's `container-core-images` and `container-runtime-linux` helpers after an
 upgrade. Approve only the required helpers; do not disable the firewall.
