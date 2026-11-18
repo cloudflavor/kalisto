@@ -10,6 +10,49 @@ Current scope:
 - Kubernetes distro: `k3s`
 - image pipeline: prepared Ubuntu/k3s node images, optional Lima VM disks, and a read-only Firecracker boot-asset disk
 
+## Demos
+
+Click a preview to play the original asciinema recording.
+
+### macOS · Apple containers
+
+#### Fresh three-node Cilium startup
+
+[![Watch a fresh three-node Cilium cluster start on macOS](images/demos/apple-container-start.svg)](https://asciinema.org/a/9NiazaB8VfoFCw3k)
+
+#### Deploy an HTTP application
+
+[![Watch an HTTP application deploy on macOS](images/demos/apple-container-deploy.svg)](https://asciinema.org/a/0INmR0OqGcLGeNjq)
+
+#### Stop and resume with persisted state
+
+[![Watch state-preserving cluster resume on macOS](images/demos/apple-container-resume.svg)](https://asciinema.org/a/eUJ9iZO0kTBWH8BD)
+
+#### Add a worker and spread replicas
+
+[![Watch worker scaling on macOS](images/demos/apple-container-scale.svg)](https://asciinema.org/a/VstCRHViyYAFGEBr)
+
+### Linux · Firecracker
+
+#### Fresh three-node Cilium startup
+
+[![Watch a fresh three-node Cilium cluster start on Linux](images/demos/firecracker-start.svg)](https://asciinema.org/a/60uyxYoIpzIXhliw)
+
+#### Deploy an HTTP application
+
+[![Watch an HTTP application deploy on Linux](images/demos/firecracker-deploy.svg)](https://asciinema.org/a/AWGgMs2Jo7h0DQxf)
+
+#### Stop and resume with persisted state
+
+[![Watch state-preserving cluster resume on Linux](images/demos/firecracker-resume.svg)](https://asciinema.org/a/YmlRAv2BCcgNcDcx)
+
+#### Add a worker and spread replicas
+
+[![Watch worker scaling on Linux](images/demos/firecracker-scale.svg)](https://asciinema.org/a/nZWS17frmHFgIEPm)
+
+Recorded development revisions: Apple `93390c52e4f0` (macOS Apple silicon),
+Firecracker `4fe2abc74675` (Linux x86_64). Preparation is outside startup recordings.
+
 ## Binary releases
 
 The release workflow is configured to publish packages for
