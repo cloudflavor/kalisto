@@ -21,9 +21,11 @@ jobs:
         run: |
           set -eu
           python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
           import re
+          import subprocess
 
           volume = Path(os.environ["KALISTO_MACOS_VOLUME"]).resolve(strict=True)
           base = Path(os.environ["KALISTO_MACOS_BUILD_ROOT"]).resolve(strict=True)
@@ -39,4 +41,35 @@ jobs:
           assert resolved.parent == evidence.resolve(strict=True) and resolved.is_relative_to(base)
           assert resolved.is_file() and resolved.stat().st_uid == os.getuid()
           print(resolved.read_text()[-16384:])
+
+          identity_path = evidence / "runtime-before-pull.json"
+          assert not identity_path.is_symlink() and identity_path.stat().st_uid == os.getuid()
+          identity = json.loads(identity_path.read_text())
+          required = [
+              "bin/container", "cli/container", "bin/container-apiserver", "cli/container-apiserver",
+              "libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux",
+              "libexec/container/plugins/container-network-vmnet/bin/container-network-vmnet",
+              "libexec/container/plugins/container-core-images/bin/container-core-images",
+              "libexec/container/plugins/container-core-clusters/bin/container-core-clusters",
+              "libexec/container/plugins/machine-apiserver/bin/machine-apiserver",
+          ]
+          for label, service in identity["services"].items():
+              root = Path(service["CONTAINER_INSTALL_ROOT"])
+              assert root.is_absolute() and root != Path("/") and ".." not in root.parts
+              canonical = root.resolve(strict=True)
+              print(f"\nRegistered service: {label}; install root: {root}")
+              for relative in required:
+                  candidate = root / relative
+                  print(f"{'PRESENT' if candidate.is_file() else 'MISSING'} {candidate}")
+              program = Path(service["program"])
+              assert program.is_absolute() and ".." not in program.parts
+              assert program == root / required[2] or program == root / required[3] or program in {
+                  root / relative for relative in required[4:]
+              }
+              for candidate in dict.fromkeys([root / "cli/container", root / "bin/container", program]):
+                  if candidate.is_file() and candidate.resolve(strict=True).is_relative_to(canonical):
+                      version = subprocess.run([str(candidate), "--version"], capture_output=True,
+                                               text=True, timeout=10)
+                      print(f"VERSION {candidate}: exit={version.returncode} "
+                            f"{version.stdout.strip()[:2000]} {version.stderr.strip()[:2000]}")
           PY
