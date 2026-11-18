@@ -325,6 +325,49 @@ fn registered_services(runner: &dyn CommandRunner) -> Result<Vec<String>> {
         .collect())
 }
 
+fn verify_borrowed_helper(
+    runner: &dyn CommandRunner,
+    label: &str,
+    output: &str,
+    selected: &Selection,
+) -> Result<()> {
+    let install_root = launchctl_value(output, "CONTAINER_INSTALL_ROOT", "=>")
+        .map(PathBuf::from)
+        .ok_or_else(|| service_conflict(label))?;
+    validate_absolute(&install_root)?;
+    let name = label.rsplit('.').next().unwrap_or_default();
+    let relative = REQUIRED_BINARIES[2..]
+        .iter()
+        .find(|path| Path::new(path).file_name().is_some_and(|file| file == name))
+        .ok_or_else(|| service_conflict(label))?;
+    let program = launchctl_value(output, "program", "=")
+        .map(Path::new)
+        .ok_or_else(|| service_conflict(label))?;
+    if !owned_service(output, &selected.app_root, &install_root)
+        || program.canonicalize().map_err(io_error)?
+            != install_root.join(relative).canonicalize().map_err(io_error)?
+    {
+        return Err(service_conflict(label));
+    }
+    let native_cli = install_root.join("cli/container");
+    let executable = if native_cli.is_file() {
+        native_cli
+    } else {
+        install_root.join("bin/container")
+    };
+    let helper_installation = Selection {
+        version: VERSION.into(),
+        managed: false,
+        api_program: executable.with_file_name("container-apiserver"),
+        executable,
+        install_root,
+        app_root: selected.app_root.clone(),
+    };
+    helper_installation.validate()?;
+    validate_installation(&helper_installation)?;
+    verify_cli(runner, &helper_installation)
+}
+
 fn verify_selected_services(
     runner: &dyn CommandRunner,
     domain: &str,
@@ -336,10 +379,16 @@ fn verify_selected_services(
             "/bin/launchctl",
             &strings(&["print", &format!("{domain}/{label}")]),
         )?;
-        if !owned_service(&service.stdout, &selected.app_root, &selected.install_root)
-            || (label == API_LABEL
-                && launchctl_value(&service.stdout, "program", "=").map(Path::new)
-                    != Some(selected.api_program.as_path()))
+        if !owned_service(&service.stdout, &selected.app_root, &selected.install_root) {
+            if selected.managed || label == API_LABEL {
+                return Err(service_conflict(label));
+            }
+            // A compatible user-owned helper may outlive a Homebrew upgrade.
+            // Validate its own installation without re-registering or replacing it.
+            verify_borrowed_helper(runner, label, &service.stdout, selected)?;
+        } else if label == API_LABEL
+            && launchctl_value(&service.stdout, "program", "=").map(Path::new)
+                != Some(selected.api_program.as_path())
         {
             return Err(service_conflict(label));
         }
@@ -1310,6 +1359,8 @@ mod reuse_tests {
 
     struct DiscoveryRunner {
         selected: Selection,
+        helper: Option<Selection>,
+        helper_version: Option<&'static str>,
         running: bool,
         cli_version: &'static str,
         status: Value,
@@ -1321,6 +1372,8 @@ mod reuse_tests {
         fn new(selected: &Selection, running: bool) -> Self {
             Self {
                 selected: selected.clone(),
+                helper: None,
+                helper_version: None,
                 running,
                 cli_version: "container CLI version 1.7.1 (build: release, commit: a15b460)",
                 status: serde_json::json!({
@@ -1333,12 +1386,12 @@ mod reuse_tests {
             }
         }
 
-        fn service(&self, program: &Path) -> String {
+        fn service(selected: &Selection, program: &Path) -> String {
             format!(
                 "program = {}\nCONTAINER_APP_ROOT => {}\nCONTAINER_INSTALL_ROOT => {}\n",
                 program.display(),
-                self.selected.app_root.display(),
-                self.selected.install_root.display()
+                selected.app_root.display(),
+                selected.install_root.display()
             )
         }
     }
@@ -1357,16 +1410,24 @@ mod reuse_tests {
             } else if program == "/bin/launchctl"
                 && args == ["print", &format!("gui/501/{API_LABEL}")]
             {
-                self.service(&self.selected.api_program)
+                Self::service(&self.selected, &self.selected.api_program)
             } else if program == "/bin/launchctl"
                 && args == ["print", &format!("gui/501/{IMAGES_LABEL}")]
             {
-                self.service(&self.selected.install_root.join(REQUIRED_BINARIES[4]))
+                let helper = self.helper.as_ref().unwrap_or(&self.selected);
+                Self::service(helper, &helper.install_root.join(REQUIRED_BINARIES[4]))
             } else if Path::new(program) == self.selected.executable && args == ["--version"] {
                 if self.fail_version {
                     return Err(invalid("injected CLI execution failure"));
                 }
                 self.cli_version.into()
+            } else if self
+                .helper
+                .as_ref()
+                .is_some_and(|helper| Path::new(program) == helper.executable)
+                && args == ["--version"]
+            {
+                self.helper_version.unwrap_or(self.cli_version).into()
             } else if Path::new(program) == self.selected.executable
                 && args == ["system", "status", "--format", "json"]
             {
@@ -1386,22 +1447,27 @@ mod reuse_tests {
             args: &[String],
             env: &[(&str, &Path)],
         ) -> Result<Output> {
+            let selected = self
+                .helper
+                .as_ref()
+                .filter(|helper| env[1].1 == helper.install_root)
+                .unwrap_or(&self.selected);
             assert_eq!(
                 env[1],
                 (
                     "CONTAINER_INSTALL_ROOT",
-                    self.selected.install_root.as_path()
+                    selected.install_root.as_path()
                 )
             );
             assert_eq!(env[0].0, "CONTAINER_APP_ROOT");
             assert!(env[0].1.is_absolute());
             if self.running {
-                assert_eq!(env[0].1, self.selected.app_root);
+                assert_eq!(env[0].1, selected.app_root);
             }
             if program == "/usr/bin/env" {
                 let executable = args
                     .iter()
-                    .position(|arg| Path::new(arg) == self.selected.executable)
+                    .position(|arg| Path::new(arg) == selected.executable)
                     .unwrap();
                 self.run(&args[executable], &args[executable + 1..])
             } else {
@@ -1436,6 +1502,59 @@ mod reuse_tests {
             select_runtime(&runner, "gui/501", None).unwrap(),
             fixture.selected
         );
+    }
+
+    #[test]
+    fn compatible_helper_from_another_installation_is_borrowed_without_mutation() {
+        let fixture = Fixture::new("cli");
+        let mut helper = Fixture::new("bin");
+        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.helper = Some(helper.selected.clone());
+        let plist = helper.selected.install_root.join("service.plist");
+        fs::write(&plist, b"existing image helper").unwrap();
+
+        let selected = select_runtime(&runner, "gui/501", None).unwrap();
+        prepare_service(&runner, "gui/501", &selected).unwrap();
+        assert_eq!(selected, fixture.selected);
+        assert_eq!(fs::read(plist).unwrap(), b"existing image helper");
+    }
+
+    #[test]
+    fn incompatible_helper_installation_is_not_adopted_or_replaced() {
+        let fixture = Fixture::new("cli");
+        let mut helper = Fixture::new("bin");
+        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.helper = Some(helper.selected);
+        runner.helper_version = Some("container CLI version 1.7.0 (build: release, commit: old)");
+
+        let error = select_runtime(&runner, "gui/501", None).unwrap_err();
+        assert!(error.to_string().contains("expected Apple container 1.7.1"));
+    }
+
+    #[test]
+    fn helper_with_another_application_root_remains_a_conflict() {
+        let fixture = Fixture::new("cli");
+        let helper = Fixture::new("bin");
+        let mut runner = DiscoveryRunner::new(&fixture.selected, true);
+        runner.helper = Some(helper.selected);
+
+        let error = select_runtime(&runner, "gui/501", None).unwrap_err();
+        assert!(error.to_string().contains(IMAGES_LABEL));
+    }
+
+    #[test]
+    fn borrowed_helper_must_run_its_expected_packaged_executable() {
+        let fixture = Fixture::new("cli");
+        let mut helper = Fixture::new("bin");
+        helper.selected.app_root.clone_from(&fixture.selected.app_root);
+        let runner = DiscoveryRunner::new(&fixture.selected, true);
+        let output = DiscoveryRunner::service(&helper.selected, &helper.selected.executable);
+
+        let error =
+            verify_borrowed_helper(&runner, IMAGES_LABEL, &output, &fixture.selected).unwrap_err();
+        assert!(error.to_string().contains(IMAGES_LABEL));
     }
 
     #[test]
