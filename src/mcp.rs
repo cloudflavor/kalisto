@@ -202,6 +202,11 @@ fn execute_task_runner_manifest(manifest: &TaskRunnerManifest) -> Result<()> {
             } else {
                 println!("added nodes: {}", outcome.added_workers.join(", "));
             }
+            if outcome.removed_workers.is_empty() {
+                println!("removed nodes: none");
+            } else {
+                println!("removed nodes: {}", outcome.removed_workers.join(", "));
+            }
             Ok(())
         }
         "addons.install" => {
@@ -1430,7 +1435,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "clusters.scale",
-        description: "Scale a running Kalisto cluster up by adding workers.",
+        description: "Resize a running Kalisto cluster; scale-down drains highest-index workers respecting PodDisruptionBudgets.",
         task_support: TaskSupport::Required,
     },
     ToolSpec {

@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,10 +61,34 @@ impl ClusterState {
         })?;
 
         let content = self.to_bytes()?;
-        fs::write(Self::state_file(root), content).map_err(|source| Error::CommandIo {
-            program: "write".to_owned(),
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| Error::InvalidArgs(error.to_string()))?
+            .as_nanos();
+        let temporary = root.join(format!(".cluster.state.{nonce}.tmp"));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|source| Error::CommandIo {
+                program: "create temporary cluster state".to_owned(),
+                source,
+            })?;
+        let result = (|| {
+            file.write_all(&content)?;
+            file.sync_all()?;
+            fs::rename(&temporary, Self::state_file(root))?;
+            fs::File::open(root)?.sync_all()
+        })()
+        .map_err(|source| Error::CommandIo {
+            program: "persist cluster state".to_owned(),
             source,
-        })
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
     }
 
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {

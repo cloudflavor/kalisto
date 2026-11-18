@@ -107,6 +107,7 @@ pub struct ScaleOutcome {
     pub previous_workers: usize,
     pub current_workers: usize,
     pub added_workers: Vec<String>,
+    pub removed_workers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,11 +266,26 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     }
     let _operation = crate::operation::lock(&state_root)?;
     let state = ClusterState::load(&state_root)?;
+    let pending_removal = load_worker_removal(&state_root, &state)?;
+    if pending_removal.is_some() {
+        validate_scale_down_ownership(&state_root, &state)?;
+    }
     if cluster_has_running_nodes(runner, &state)? {
         info!(cluster = %state.name, "resuming existing cluster bring-up");
         progress.set_message("Resuming existing cluster; rechecking startup readiness");
     }
-    let resolved_spec = resolve_up_spec(&state, spec);
+    let mut resolved_spec = resolve_up_spec(&state, spec);
+    if let Some(removal) = &pending_removal {
+        // A blocked drain has not deleted anything: restart its existing guest
+        // so graceful eviction can finish. Once drained, never restart it.
+        resolved_spec.worker_count = if removal.phase == WorkerRemovalPhase::Draining {
+            state.worker_count
+        } else {
+            removal.index
+        };
+        resolved_spec.requested_worker_count = Some(resolved_spec.worker_count);
+        resolved_spec.keep_failed_runtime = true;
+    }
     let spec = &resolved_spec;
     let prepared = if spec.backend.uses_prepared_assets() {
         let assets = crate::pull::load(spec)?;
@@ -611,22 +627,26 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     debug_feedback(format!("up: control-plane ready in {control_plane_ready}"));
 
     progress.set_message("Deploying network and selected add-ons");
-    if let Err(error) = install_addons_and_wait_for_nodes(
-        PostReadyAddonRequest {
-            backend,
-            runner,
-            control_plane: &control_plane,
-            guest_kubeconfig: &control_plane_guest_kubeconfig,
-            cni: spec.cni_plugin,
-            builtin_flannel: !spec.component_toggles.flannel_backend_none,
-            cilium_version: &spec.cilium_version,
-            addons: &spec.addons,
-            metallb: &spec.metallb,
-        },
-        &worker_instances,
-        spec.server_mode,
-        prepared.as_ref(),
-    ) {
+    // Recovery must not wait on cluster-wide DaemonSet rollouts that still
+    // include the deliberately stopped, pending-removal Node.
+    if pending_removal.is_none()
+        && let Err(error) = install_addons_and_wait_for_nodes(
+            PostReadyAddonRequest {
+                backend,
+                runner,
+                control_plane: &control_plane,
+                guest_kubeconfig: &control_plane_guest_kubeconfig,
+                cni: spec.cni_plugin,
+                builtin_flannel: !spec.component_toggles.flannel_backend_none,
+                cilium_version: &spec.cilium_version,
+                addons: &spec.addons,
+                metallb: &spec.metallb,
+            },
+            &worker_instances,
+            spec.server_mode,
+            prepared.as_ref(),
+        )
+    {
         return Err(rollback_failed_up(
             backend,
             runner,
@@ -673,6 +693,12 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
         "node token",
     )?;
 
+    if let Some(removal) = pending_removal {
+        return Err(Error::InvalidArgs(format!(
+            "cluster nodes resumed without recreating removed workers; retry scale --name {} --workers {} or fewer to finish removing `{}`",
+            state.name, removal.index, removal.name
+        )));
+    }
     let state = ClusterState {
         name: spec.name.clone(),
         backend: spec.backend,
@@ -1156,11 +1182,16 @@ pub fn install_addon_with_runner(
 #[allow(clippy::too_many_lines)] // orchestrator; split tracked for a follow-up
 fn scale_at_root(
     state_root: &Path,
-    _name: &str,
+    name: &str,
     workers: usize,
     runner: &dyn CommandRunner,
 ) -> Result<ScaleOutcome> {
     let mut state = ClusterState::load(state_root)?;
+    if state.name != name {
+        return Err(Error::InvalidArgs(
+            "cluster state name does not match the selected cluster".to_owned(),
+        ));
+    }
     let previous_workers = state.worker_count;
     let scale_span = info_span!(
         "cluster_scale",
@@ -1171,12 +1202,14 @@ fn scale_at_root(
     );
     let _scale_guard = scale_span.enter();
     info!("starting cluster scale");
-    let progress = Progress::spinner("Checking cluster for worker scale-up");
-
-    if workers < state.worker_count {
+    let progress = Progress::spinner("Checking cluster for worker scaling");
+    let pending_removal = load_worker_removal(state_root, &state)?;
+    if let Some(removal) = &pending_removal
+        && workers > removal.index
+    {
         return Err(Error::InvalidArgs(format!(
-            "scaling down is not implemented yet; current workers={}, requested workers={workers}",
-            state.worker_count
+            "worker `{}` has an incomplete removal; retry scale with --workers {} or fewer",
+            removal.name, removal.index
         )));
     }
     if workers == state.worker_count {
@@ -1187,6 +1220,7 @@ fn scale_at_root(
             previous_workers: state.worker_count,
             current_workers: state.worker_count,
             added_workers: Vec::new(),
+            removed_workers: Vec::new(),
         });
     }
 
@@ -1225,11 +1259,27 @@ fn scale_at_root(
         NodeRole::ControlPlane,
         control_plane_state.artifacts_root.clone(),
     );
-    let control_plane_host =
-        backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root)?;
     let control_plane_guest_artifacts =
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
+    if workers < state.worker_count {
+        let outcome = scale_down_at_root(
+            state_root,
+            &mut state,
+            workers,
+            runner,
+            &control_plane,
+            &control_plane_guest_kubeconfig,
+            pending_removal,
+        )?;
+        progress.finish(&format!(
+            "Scale-down complete: {previous_workers} -> {} workers",
+            outcome.current_workers
+        ));
+        return Ok(outcome);
+    }
+    let control_plane_host =
+        backend.control_plane_host(&control_plane.name, &control_plane.artifacts.root)?;
     let server_token = fs::read_to_string(&state.token_path)
         .map_err(io_error("read_to_string"))?
         .trim()
@@ -1365,6 +1415,305 @@ fn scale_at_root(
         previous_workers,
         current_workers: workers,
         added_workers,
+        removed_workers: Vec::new(),
+    })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerRemoval {
+    name: String,
+    index: usize,
+    uid: String,
+    phase: WorkerRemovalPhase,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkerRemovalPhase {
+    Draining,
+    Drained,
+    NodeDeleted,
+    InstanceDeleted,
+}
+
+fn worker_removal_path(state_root: &Path) -> std::path::PathBuf {
+    state_root.join("scale-down.json")
+}
+
+fn save_worker_removal(state_root: &Path, removal: &WorkerRemoval) -> Result<()> {
+    let value =
+        serde_json::to_value(removal).map_err(|error| Error::InvalidArgs(error.to_string()))?;
+    write_private_scale_snapshot(&worker_removal_path(state_root), &value)
+}
+
+fn load_worker_removal(state_root: &Path, state: &ClusterState) -> Result<Option<WorkerRemoval>> {
+    let path = worker_removal_path(state_root);
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("read worker removal journal")(error)),
+    };
+    let removal: WorkerRemoval = serde_json::from_slice(&content)
+        .map_err(|error| Error::InvalidArgs(format!("invalid worker removal journal: {error}")))?;
+    if removal.name != format!("kalisto-{}-w{}", state.name, removal.index)
+        || removal.uid.is_empty()
+    {
+        return Err(Error::InvalidArgs(
+            "worker removal journal does not match cluster".to_owned(),
+        ));
+    }
+    if state.worker_count == removal.index
+        && removal.phase == WorkerRemovalPhase::InstanceDeleted
+        && state.nodes.iter().all(|node| node.name != removal.name)
+    {
+        fs::remove_file(path).map_err(io_error("remove completed worker removal journal"))?;
+        return Ok(None);
+    }
+    if removal.index.checked_add(1) != Some(state.worker_count) {
+        return Err(Error::InvalidArgs(
+            "worker removal journal does not match worker count".to_owned(),
+        ));
+    }
+    Ok(Some(removal))
+}
+
+fn validate_scale_down_ownership(state_root: &Path, state: &ClusterState) -> Result<()> {
+    let runtime_root = state_root.join("runtime");
+    if state
+        .nodes
+        .iter()
+        .filter(|node| node.role == NodeRole::Worker)
+        .count()
+        != state.worker_count
+    {
+        return Err(Error::InvalidArgs(
+            "worker count does not match owned cluster nodes".to_owned(),
+        ));
+    }
+    let control_plane_name = format!("kalisto-{}-cp", state.name);
+    let mut control_planes = state
+        .nodes
+        .iter()
+        .filter(|node| node.role == NodeRole::ControlPlane);
+    if control_planes.next().is_none_or(|node| {
+        node.name != control_plane_name || node.artifacts_root != runtime_root.join("control-plane")
+    }) || control_planes.next().is_some()
+    {
+        return Err(Error::InvalidArgs(
+            "cluster control-plane ownership is inconsistent".to_owned(),
+        ));
+    }
+    for index in 0..state.worker_count {
+        let name = format!("kalisto-{}-w{index}", state.name);
+        let root = runtime_root.join(&name);
+        let mut matching = state.nodes.iter().filter(|node| node.name == name);
+        let node = matching.next();
+        if matching.next().is_some()
+            || node.is_none_or(|node| node.role != NodeRole::Worker || node.artifacts_root != root)
+            || Path::new(&name).components().count() != 1
+            || state.nodes.iter().any(|node| {
+                node.name != name
+                    && (root.starts_with(&node.artifacts_root)
+                        || node.artifacts_root.starts_with(&root))
+            })
+        {
+            return Err(Error::InvalidArgs(format!(
+                "refusing to remove worker `{name}`: cluster ownership is inconsistent"
+            )));
+        }
+    }
+    // Reject redirected paths for retained nodes too: a symlink could alias a
+    // worker disk even when the textual control-plane path looks unrelated.
+    for directory in std::iter::once(&runtime_root)
+        .chain(state.nodes.iter().map(|node| &node.artifacts_root))
+    {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidArgs(format!(
+                    "cluster runtime path is not an owned directory: {}",
+                    directory.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect cluster runtime directory")(error)),
+        }
+    }
+    Ok(())
+}
+
+fn scale_down_node_uid(
+    backend: &dyn ClusterBackend,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    kubectl: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let output = backend.guest_sudo_shell(
+        runner,
+        &control_plane.name,
+        &control_plane.artifacts.root,
+        &format!(
+            "{kubectl} get node {} --ignore-not-found -o json",
+            shell_escape(name)
+        ),
+    )?;
+    if output.stdout.trim().is_empty() {
+        return Ok(None);
+    }
+    let node: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| Error::InvalidArgs(format!("invalid Kubernetes Node response: {error}")))?;
+    let metadata = &node["metadata"];
+    let labels = &metadata["labels"];
+    if metadata["name"].as_str() != Some(name)
+        || labels
+            .get("node-role.kubernetes.io/control-plane")
+            .is_some()
+        || labels.get("node-role.kubernetes.io/master").is_some()
+        || matches!(
+            labels
+                .get("kubernetes.io/role")
+                .and_then(serde_json::Value::as_str),
+            Some("master" | "control-plane")
+        )
+    {
+        return Err(Error::InvalidArgs(format!(
+            "refusing to remove Kubernetes Node `{name}`: not an owned worker"
+        )));
+    }
+    let uid = metadata["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| Error::InvalidArgs(format!("Kubernetes Node `{name}` has no UID")))?;
+    Ok(Some(uid.to_owned()))
+}
+
+#[allow(clippy::too_many_lines)] // phase-journaled removal orchestrator
+fn scale_down_at_root(
+    state_root: &Path,
+    state: &mut ClusterState,
+    workers: usize,
+    runner: &dyn CommandRunner,
+    control_plane: &Instance,
+    kubeconfig: &Path,
+    mut pending: Option<WorkerRemoval>,
+) -> Result<ScaleOutcome> {
+    validate_scale_down_ownership(state_root, state)?;
+    let backend = backend_for(state.backend);
+    let previous_workers = state.worker_count;
+    let kubectl = format!(
+        "KUBECONFIG={} /usr/local/bin/k3s kubectl --request-timeout=10s",
+        shell_escape(&kubeconfig.display().to_string())
+    );
+    let mut removed_workers = Vec::with_capacity(previous_workers - workers);
+    while state.worker_count > workers {
+        let index = state.worker_count - 1;
+        let name = format!("kalisto-{}-w{index}", state.name);
+        let root = state_root.join("runtime").join(&name);
+        let mut removal = if let Some(removal) = pending.take() {
+            removal
+        } else {
+            let uid = scale_down_node_uid(backend, runner, control_plane, &kubectl, &name)?
+                .ok_or_else(|| {
+                    Error::InvalidArgs(format!(
+                        "worker `{name}` is missing from Kubernetes; cannot safely drain it"
+                    ))
+                })?;
+            let removal = WorkerRemoval {
+                name: name.clone(),
+                index,
+                uid,
+                phase: WorkerRemovalPhase::Draining,
+            };
+            save_worker_removal(state_root, &removal)?;
+            removal
+        };
+        if matches!(
+            removal.phase,
+            WorkerRemovalPhase::Draining | WorkerRemovalPhase::Drained
+        ) {
+            let uid = scale_down_node_uid(backend, runner, control_plane, &kubectl, &name)?;
+            if uid.as_ref().is_some_and(|uid| uid != &removal.uid)
+                || (uid.is_none() && removal.phase == WorkerRemovalPhase::Draining)
+            {
+                return Err(Error::InvalidArgs(format!(
+                    "worker `{name}` changed during removal; refusing to remove a replacement Node"
+                )));
+            }
+            if removal.phase == WorkerRemovalPhase::Draining {
+                // Default drain uses the eviction API (PDBs apply) and refuses
+                // unmanaged pods and emptyDir data. Never bypass those safeguards.
+                backend.guest_sudo_shell(
+                    runner,
+                    &control_plane.name,
+                    &control_plane.artifacts.root,
+                    &format!(
+                        "{kubectl} drain {} --ignore-daemonsets --timeout=120s",
+                        shell_escape(&name)
+                    ),
+                )?;
+                removal.phase = WorkerRemovalPhase::Drained;
+                save_worker_removal(state_root, &removal)?;
+            }
+            // Quiesce the drained guest before deleting its Node so kubelet
+            // cannot re-register while the backend instance is being removed.
+            backend.stop_instance(runner, &name, &root, false)?;
+            if uid.is_some() {
+                // UID preconditions protect a replacement Node even if it appears
+                // between the preceding ownership check and the delete request.
+                let options = serde_json::json!({
+                    "apiVersion": "v1", "kind": "DeleteOptions",
+                    "preconditions": { "uid": removal.uid },
+                });
+                backend.guest_sudo_shell(
+                    runner,
+                    &control_plane.name,
+                    &control_plane.artifacts.root,
+                    &format!(
+                        "printf '%s' {} | {kubectl} delete --raw {} -f -",
+                        shell_escape(&options.to_string()),
+                        shell_escape(&format!("/api/v1/nodes/{name}"))
+                    ),
+                )?;
+            }
+            backend.guest_sudo_shell(
+                runner,
+                &control_plane.name,
+                &control_plane.artifacts.root,
+                &format!("{kubectl} wait --for=delete node/{name} --timeout=60s"),
+            )?;
+            removal.phase = WorkerRemovalPhase::NodeDeleted;
+            save_worker_removal(state_root, &removal)?;
+        }
+        if removal.phase == WorkerRemovalPhase::NodeDeleted {
+            backend.delete_instance(runner, &name, &root)?;
+            removal.phase = WorkerRemovalPhase::InstanceDeleted;
+            save_worker_removal(state_root, &removal)?;
+        }
+        match fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("remove worker runtime directory")(error)),
+        }
+        state.nodes.retain(|node| node.name != name);
+        state.worker_count = index;
+        state.save(state_root)?;
+        fs::remove_file(worker_removal_path(state_root))
+            .map_err(io_error("remove completed worker removal journal"))?;
+        removed_workers.push(name);
+    }
+    info!(
+        previous_workers,
+        current_workers = state.worker_count,
+        "cluster scale-down completed"
+    );
+    Ok(ScaleOutcome {
+        name: state.name.clone(),
+        previous_workers,
+        current_workers: state.worker_count,
+        added_workers: Vec::new(),
+        removed_workers,
     })
 }
 
@@ -1481,7 +1830,13 @@ fn write_private_scale_snapshot(path: &Path, snapshot: &serde_json::Value) -> Re
             .map_err(|error| Error::InvalidArgs(error.to_string()))?;
         file.sync_all()
             .map_err(io_error("sync private scale snapshot"))?;
-        fs::rename(&temporary, path).map_err(io_error("publish private scale snapshot"))
+        fs::rename(&temporary, path).map_err(io_error("publish private scale snapshot"))?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error("sync private scale snapshot directory"))?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -2777,6 +3132,521 @@ fn debug_feedback(message: impl AsRef<str>) {
 
 #[cfg(test)]
 mod tests {
+    mod worker_scale_down {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        use super::{FakeRunner, save_state};
+        use crate::cluster::manager::scale_at_root;
+        use crate::cluster::state::ClusterState;
+        use crate::error::{Error, Result};
+        use crate::k3s::NodeRole;
+        use crate::process::{CommandRunner, Output};
+
+        struct Fixture {
+            root: PathBuf,
+            state_root: PathBuf,
+            runner: RemovalRunner,
+        }
+
+        impl Fixture {
+            fn new(label: &str) -> Self {
+                let root = std::env::temp_dir()
+                    .join(format!("kalisto-scale-down-{label}-{}", std::process::id()));
+                let state_root = root.join("workspace/.kalisto/clusters/dev");
+                fs::create_dir_all(&state_root).unwrap();
+                save_state(
+                    &state_root,
+                    "dev",
+                    vec![
+                        ("kalisto-dev-cp", NodeRole::ControlPlane),
+                        ("kalisto-dev-w0", NodeRole::Worker),
+                        ("kalisto-dev-w1", NodeRole::Worker),
+                        ("kalisto-dev-w2", NodeRole::Worker),
+                    ],
+                );
+                let mut state = ClusterState::load(&state_root).unwrap();
+                for node in &mut state.nodes {
+                    node.artifacts_root = state_root.join("runtime").join(
+                        if node.role == NodeRole::ControlPlane {
+                            "control-plane"
+                        } else {
+                            &node.name
+                        },
+                    );
+                    fs::create_dir_all(&node.artifacts_root).unwrap();
+                    fs::write(node.artifacts_root.join("disk"), node.name.as_bytes()).unwrap();
+                }
+                state.save(&state_root).unwrap();
+                let nodes = state
+                    .nodes
+                    .iter()
+                    .filter(|node| node.role == NodeRole::Worker)
+                    .map(|node| {
+                        (
+                            node.name.clone(),
+                            serde_json::json!({
+                                "metadata": {
+                                    "name": node.name,
+                                    "uid": format!("uid-{}", node.name),
+                                    "labels": {}
+                                },
+                                "spec": {"unschedulable": false}
+                            }),
+                        )
+                    })
+                    .collect();
+                let runner = RemovalRunner {
+                    inner: FakeRunner::with_statuses([("kalisto-dev-cp", "Running")]),
+                    nodes: Mutex::new(nodes),
+                    actions: Mutex::new(Vec::new()),
+                    failure: Mutex::new(None),
+                    block_runtime_cleanup: Mutex::new(None),
+                    recovering: Mutex::new(false),
+                    started: Mutex::new(Vec::new()),
+                };
+                Self {
+                    root,
+                    state_root,
+                    runner,
+                }
+            }
+
+            fn state(&self) -> ClusterState {
+                ClusterState::load(&self.state_root).unwrap()
+            }
+
+            fn scale(&self, workers: usize) -> Result<super::super::ScaleOutcome> {
+                scale_at_root(&self.state_root, "dev", workers, &self.runner)
+            }
+
+            fn fail(&self, action: &str, name: &str) {
+                *self.runner.failure.lock().unwrap() = Some((action.to_owned(), name.to_owned()));
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        struct RemovalRunner {
+            inner: FakeRunner,
+            nodes: Mutex<HashMap<String, serde_json::Value>>,
+            actions: Mutex<Vec<(String, String)>>,
+            failure: Mutex<Option<(String, String)>>,
+            block_runtime_cleanup: Mutex<Option<PathBuf>>,
+            recovering: Mutex<bool>,
+            started: Mutex<Vec<String>>,
+        }
+
+        impl RemovalRunner {
+            fn action(&self, action: &str, name: &str) -> Result<()> {
+                self.actions
+                    .lock()
+                    .unwrap()
+                    .push((action.to_owned(), name.to_owned()));
+                if self.failure.lock().unwrap().as_ref()
+                    == Some(&(action.to_owned(), name.to_owned()))
+                {
+                    return Err(Error::CommandFailed {
+                        program: action.to_owned(),
+                        args: vec![name.to_owned()],
+                        code: Some(1),
+                        stdout: String::new(),
+                        stderr: format!("{action} blocked for {name}"),
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        impl CommandRunner for RemovalRunner {
+            fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+                let output = self.inner.run(program, args)?;
+                let command = args.last().map_or("", String::as_str);
+                if *self.recovering.lock().unwrap() {
+                    if program == "limactl" && args.first().is_some_and(|arg| arg == "list") {
+                        let stdout = if args.iter().any(|arg| arg == "--json") {
+                            serde_json::json!({"status": "Stopped", "config": {"mounts": []}})
+                                .to_string()
+                        } else if args.iter().any(|arg| arg == "{{ .Name }}") {
+                            command.to_owned()
+                        } else {
+                            let started = self.started.lock().unwrap();
+                            let status = if started.iter().any(|name| name == command) {
+                                "Running"
+                            } else {
+                                "Stopped"
+                            };
+                            format!("{command} {status} vz\n")
+                        };
+                        return Ok(Output {
+                            stdout,
+                            stderr: String::new(),
+                        });
+                    }
+                    if program == "limactl" && args.first().is_some_and(|arg| arg == "start") {
+                        self.action("start", command)?;
+                        self.started.lock().unwrap().push(command.to_owned());
+                    }
+                    if command.starts_with("test -s ") && command.contains(" && cat ") {
+                        return Ok(Output {
+                            stdout: if command.contains("kubeconfig.yaml") {
+                                "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n".to_owned()
+                            } else {
+                                "recovered-token\n".to_owned()
+                            },
+                            stderr: String::new(),
+                        });
+                    }
+                }
+                if command.contains(" get node ") {
+                    let nodes = self.nodes.lock().unwrap();
+                    let node = nodes.iter().find(|(name, _)| command.contains(name.as_str()));
+                    return Ok(Output {
+                        stdout: node.map_or_else(String::new, |(_, node)| node.to_string()),
+                        stderr: String::new(),
+                    });
+                }
+                if command.contains(" drain ") || command.contains(" delete --raw ") {
+                    let name = (0..3)
+                        .map(|index| format!("kalisto-dev-w{index}"))
+                        .find(|name| command.contains(name.as_str()))
+                        .expect("only owned worker names may be mutated");
+                    if command.contains(" drain ") {
+                        assert!(!command.contains("--force"));
+                        assert!(!command.contains("--delete-emptydir-data"));
+                        assert!(!command.contains("--disable-eviction"));
+                        self.nodes.lock().unwrap().get_mut(&name).unwrap()["spec"]
+                            ["unschedulable"] = serde_json::json!(true);
+                        self.action("drain", &name)?;
+                    } else {
+                        let mut nodes = self.nodes.lock().unwrap();
+                        let uid = nodes[&name]["metadata"]["uid"].as_str().unwrap();
+                        assert!(command.contains(uid), "Node deletion must use its UID");
+                        self.action("node", &name)?;
+                        nodes.remove(&name);
+                    }
+                }
+                if program == "limactl" && args.iter().any(|arg| arg == "stop") {
+                    self.action("stop", command)?;
+                }
+                if program == "limactl" && args.iter().any(|arg| arg == "delete") {
+                    self.action("instance", command)?;
+                    if let Some(root) = self.block_runtime_cleanup.lock().unwrap().take() {
+                        fs::remove_dir_all(&root).unwrap();
+                        fs::write(root, "runtime cleanup blocker").unwrap();
+                    }
+                }
+                Ok(output)
+            }
+        }
+
+        #[test]
+        fn scale_down_removes_highest_indices_and_preserves_retained_data() {
+            let fixture = Fixture::new("happy");
+            let outcome = fixture.scale(1).unwrap();
+            assert_eq!(outcome.previous_workers, 3);
+            assert_eq!(outcome.current_workers, 1);
+            assert!(outcome.added_workers.is_empty());
+            assert_eq!(outcome.removed_workers, ["kalisto-dev-w2", "kalisto-dev-w1"]);
+            let state = fixture.state();
+            assert_eq!(state.worker_count, 1);
+            assert_eq!(
+                state
+                    .nodes
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["kalisto-dev-cp", "kalisto-dev-w0"]
+            );
+            for node in &state.nodes {
+                assert_eq!(
+                    fs::read(node.artifacts_root.join("disk")).unwrap(),
+                    node.name.as_bytes()
+                );
+            }
+            for name in ["kalisto-dev-w2", "kalisto-dev-w1"] {
+                assert!(!fixture.state_root.join("runtime").join(name).exists());
+                assert!(!fixture.runner.nodes.lock().unwrap().contains_key(name));
+            }
+            assert_eq!(
+                *fixture.runner.actions.lock().unwrap(),
+                [
+                    ("drain".to_owned(), "kalisto-dev-w2".to_owned()),
+                    ("stop".to_owned(), "kalisto-dev-w2".to_owned()),
+                    ("node".to_owned(), "kalisto-dev-w2".to_owned()),
+                    ("instance".to_owned(), "kalisto-dev-w2".to_owned()),
+                    ("drain".to_owned(), "kalisto-dev-w1".to_owned()),
+                    ("stop".to_owned(), "kalisto-dev-w1".to_owned()),
+                    ("node".to_owned(), "kalisto-dev-w1".to_owned()),
+                    ("instance".to_owned(), "kalisto-dev-w1".to_owned()),
+                ]
+            );
+        }
+
+        #[test]
+        fn scale_down_blocked_drain_persists_only_completed_workers_and_can_resume() {
+            let fixture = Fixture::new("blocked");
+            fixture.fail("drain", "kalisto-dev-w1");
+            let error = fixture.scale(0).unwrap_err();
+            assert!(error.to_string().contains("drain blocked"));
+            assert_eq!(fixture.state().worker_count, 2);
+            assert_eq!(fixture.state().nodes.len(), 3);
+            assert!(!fixture.state_root.join("runtime/kalisto-dev-w2").exists());
+            assert!(fixture.state_root.join("runtime/kalisto-dev-w1/disk").exists());
+            assert_eq!(
+                fixture.runner.nodes.lock().unwrap()["kalisto-dev-w1"]["spec"]["unschedulable"],
+                true
+            );
+            assert!(
+                !fixture
+                    .runner
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(action, name)| action != "drain" && name == "kalisto-dev-w1")
+            );
+            assert!(
+                fixture
+                    .scale(2)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete removal")
+            );
+            assert!(
+                fixture
+                    .scale(4)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete removal")
+            );
+            *fixture.runner.failure.lock().unwrap() = None;
+            let outcome = fixture.scale(0).unwrap();
+            assert_eq!(outcome.previous_workers, 2);
+            assert_eq!(outcome.current_workers, 0);
+            assert_eq!(outcome.removed_workers, ["kalisto-dev-w1", "kalisto-dev-w0"]);
+            assert_eq!(fixture.state().nodes.len(), 1);
+            assert!(!fixture.state_root.join("scale-down.json").exists());
+        }
+
+        #[test]
+        fn scale_down_retries_node_and_backend_failures_without_losing_progress() {
+            for action in ["stop", "node", "instance"] {
+                let fixture = Fixture::new(action);
+                fixture.fail(action, "kalisto-dev-w2");
+                assert!(fixture.scale(2).is_err());
+                assert_eq!(fixture.state().worker_count, 3);
+                assert_eq!(fixture.state().nodes.len(), 4);
+                assert!(fixture.state_root.join("runtime/kalisto-dev-w2/disk").exists());
+                assert_eq!(
+                    fixture.runner.nodes.lock().unwrap().contains_key("kalisto-dev-w2"),
+                    action != "instance"
+                );
+                *fixture.runner.failure.lock().unwrap() = None;
+                let outcome = fixture.scale(2).unwrap();
+                assert_eq!(outcome.removed_workers, ["kalisto-dev-w2"]);
+                assert_eq!(fixture.state().worker_count, 2);
+                assert_eq!(
+                    fixture
+                        .runner
+                        .actions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(action, _)| action == "drain")
+                        .count(),
+                    1,
+                    "a successful durable drain must not be repeated"
+                );
+            }
+        }
+
+        #[test]
+        fn scale_down_runtime_cleanup_failure_keeps_recoverable_owned_state() {
+            let fixture = Fixture::new("runtime");
+            let runtime = fixture.state_root.join("runtime/kalisto-dev-w2");
+            *fixture.runner.block_runtime_cleanup.lock().unwrap() = Some(runtime.clone());
+            assert!(fixture.scale(2).is_err());
+            assert_eq!(fixture.state().worker_count, 3);
+            assert!(!fixture.runner.nodes.lock().unwrap().contains_key("kalisto-dev-w2"));
+            fs::remove_file(&runtime).unwrap();
+            fs::create_dir(&runtime).unwrap();
+            fixture.scale(2).unwrap();
+            assert_eq!(fixture.state().worker_count, 2);
+            assert_eq!(
+                fixture
+                    .runner
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(action, _)| action == "instance")
+                    .count(),
+                1,
+                "runtime cleanup recovery must not delete the instance again"
+            );
+        }
+
+        #[test]
+        fn scale_down_rejects_replacement_node_and_control_plane_labels() {
+            let fixture = Fixture::new("replacement");
+            fixture.fail("node", "kalisto-dev-w2");
+            assert!(fixture.scale(2).is_err());
+            fixture
+                .runner
+                .nodes
+                .lock()
+                .unwrap()
+                .get_mut("kalisto-dev-w2")
+                .unwrap()["metadata"]["uid"] = serde_json::json!("replacement-uid");
+            fixture.runner.actions.lock().unwrap().clear();
+            *fixture.runner.failure.lock().unwrap() = None;
+            assert!(
+                fixture
+                    .scale(2)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("replacement Node")
+            );
+            assert!(fixture.runner.actions.lock().unwrap().is_empty());
+            assert_eq!(fixture.state().worker_count, 3);
+
+            let fixture = Fixture::new("control-plane-label");
+            fixture
+                .runner
+                .nodes
+                .lock()
+                .unwrap()
+                .get_mut("kalisto-dev-w2")
+                .unwrap()["metadata"]["labels"]["node-role.kubernetes.io/control-plane"] =
+                serde_json::json!("");
+            assert!(
+                fixture
+                    .scale(2)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not an owned worker")
+            );
+            assert!(fixture.runner.actions.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn scale_down_rejects_unowned_names_paths_and_roles() {
+            for mismatch in ["name", "path", "role", "symlink"] {
+                let fixture = Fixture::new(mismatch);
+                let mut state = fixture.state();
+                let node = state.nodes.last_mut().unwrap();
+                match mismatch {
+                    "name" => node.name = "another-cluster-worker".to_owned(),
+                    "path" => node.artifacts_root = fixture.root.join("unowned-data"),
+                    "role" => node.role = NodeRole::ControlPlane,
+                    "symlink" => {
+                        let target = fixture.root.join("unowned-data");
+                        fs::create_dir(&target).unwrap();
+                        fs::remove_dir_all(&node.artifacts_root).unwrap();
+                        std::os::unix::fs::symlink(target, &node.artifacts_root).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                state.save(&fixture.state_root).unwrap();
+                assert!(fixture.scale(2).is_err(), "{mismatch} must be rejected");
+                assert!(fixture.runner.actions.lock().unwrap().is_empty());
+                assert_eq!(fixture.state().worker_count, 3);
+            }
+        }
+
+        #[test]
+        fn scale_noop_requires_neither_running_nodes_nor_boot_assets() {
+            let fixture = Fixture::new("noop");
+            let runner = FakeRunner::default();
+            let outcome = scale_at_root(&fixture.state_root, "dev", 3, &runner).unwrap();
+            assert_eq!(outcome.previous_workers, 3);
+            assert_eq!(outcome.current_workers, 3);
+            assert!(outcome.added_workers.is_empty());
+            assert!(outcome.removed_workers.is_empty());
+            assert!(runner.invocations.lock().unwrap().is_empty());
+            let error = scale_at_root(&fixture.state_root, "dev", 2, &runner).unwrap_err();
+            assert!(error.to_string().contains("is not running"));
+            assert_eq!(fixture.state().worker_count, 3);
+            assert!(fixture.state_root.join("runtime/kalisto-dev-w2/disk").exists());
+        }
+
+        #[test]
+        fn scale_down_interrupted_removal_can_recover_through_down_up_and_retry() {
+            let _guard = crate::test_support::env_lock();
+            for action in ["drain", "instance"] {
+                let mut fixture = Fixture::new(&format!("restart-{action}"));
+                fixture.fail(action, "kalisto-dev-w2");
+                assert!(fixture.scale(2).is_err());
+                let original_data_home = std::env::var_os("XDG_DATA_HOME");
+                let original_cache_home = std::env::var_os("XDG_CACHE_HOME");
+                unsafe {
+                    std::env::set_var("XDG_DATA_HOME", fixture.root.join("recovery-data"));
+                    std::env::set_var("XDG_CACHE_HOME", fixture.root.join("recovery-cache"));
+                }
+                let destination = crate::cluster::spec::ClusterSpec::state_root_for("dev").unwrap();
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::rename(&fixture.state_root, &destination).unwrap();
+                fixture.state_root = destination;
+                let mut state = fixture.state();
+                for node in &mut state.nodes {
+                    node.artifacts_root = fixture.state_root.join("runtime").join(
+                        if node.role == NodeRole::ControlPlane {
+                            "control-plane"
+                        } else {
+                            &node.name
+                        },
+                    );
+                }
+                state.workspace_root = fixture.root.join("workspace");
+                let template = fixture.root.join("node.yaml");
+                let image = fixture.root.join("node.qcow2");
+                fs::write(&image, "cached image").unwrap();
+                fs::write(
+                    &template,
+                    format!("vmType: vz\nimages:\n  - location: {}\n", image.display()),
+                )
+                .unwrap();
+                state.template = template.display().to_string();
+                state.cni_plugin = super::CniPlugin::None;
+                state
+                    .cni_plugin
+                    .apply_component_defaults(&mut state.component_toggles);
+                state.kubeconfig_path = fixture.state_root.join("kubeconfig.yaml");
+                state.token_path = fixture.state_root.join("node-token");
+                state.save(&fixture.state_root).unwrap();
+                let spec = super::super::cluster_spec_from_state(&state);
+                crate::pull::test_fixture(&spec);
+                *fixture.runner.failure.lock().unwrap() = None;
+                super::super::down_at_root(&fixture.state_root, "dev", false, &fixture.runner)
+                    .unwrap();
+                *fixture.runner.recovering.lock().unwrap() = true;
+                fixture.runner.actions.lock().unwrap().clear();
+                let error = super::super::up_with_runner(&spec, &fixture.runner).unwrap_err();
+                assert!(error.to_string().contains("cluster nodes resumed"));
+                let started = fixture.runner.started.lock().unwrap().clone();
+                assert!(started.iter().any(|name| name == "kalisto-dev-cp"));
+                assert!(started.iter().any(|name| name == "kalisto-dev-w0"));
+                assert!(started.iter().any(|name| name == "kalisto-dev-w1"));
+                assert_eq!(
+                    started.iter().any(|name| name == "kalisto-dev-w2"),
+                    action == "drain",
+                    "only an undrained existing worker may resume; deleted workers must not be recreated"
+                );
+                assert_eq!(fixture.state().worker_count, 3);
+                fixture.scale(2).unwrap();
+                assert_eq!(fixture.state().worker_count, 2);
+                super::restore_env("XDG_DATA_HOME", original_data_home);
+                super::restore_env("XDG_CACHE_HOME", original_cache_home);
+            }
+        }
+    }
     mod scale_failure_diagnostics {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -3300,6 +4170,7 @@ mod tests {
         assert_eq!(outcome.previous_workers, 1);
         assert_eq!(outcome.current_workers, 2);
         assert_eq!(outcome.added_workers, vec!["kalisto-dev-w1".to_owned()]);
+        assert!(outcome.removed_workers.is_empty());
 
         let loaded = ClusterState::load(&state_root).unwrap();
         assert_eq!(loaded.worker_count, 2);
@@ -3345,6 +4216,7 @@ mod tests {
         assert_eq!(outcome.previous_workers, 1);
         assert_eq!(outcome.current_workers, 2);
         assert_eq!(outcome.added_workers, vec!["kalisto-dev-w1".to_owned()]);
+        assert!(outcome.removed_workers.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

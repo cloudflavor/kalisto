@@ -104,6 +104,8 @@ jobs:
           git checkout -q FETCH_HEAD
       - name: Test website release staging
         run: python3 -m unittest discover -s scripts/release -p 'test_stage.py' -v
+      - name: Test worker removal and interrupted lifecycle recovery
+        run: cargo test --locked --lib cluster::manager::tests::worker_scale_down -- --test-threads=1
       - name: Test
         run: cargo test -- --test-threads=1
       - name: Test native terminal progress and plain output

@@ -460,6 +460,11 @@ fn run_scale(args: &ScaleArgs) -> Result<()> {
     } else {
         println!("added nodes: {}", outcome.added_workers.join(", "));
     }
+    if outcome.removed_workers.is_empty() {
+        println!("removed nodes: none");
+    } else {
+        println!("removed nodes: {}", outcome.removed_workers.join(", "));
+    }
     Ok(())
 }
 

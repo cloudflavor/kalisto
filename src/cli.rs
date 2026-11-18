@@ -50,6 +50,9 @@ pub enum Command {
     Addon(AddonArgs),
     Plugin(AddonArgs),
     Use(NamedClusterArgs),
+    /// Resize workers; shrinking drains highest-index nodes respecting PDBs, then
+    /// permanently removes their VM disks and local data. Blocked drains leave
+    /// workers cordoned; retry the same scale request after resolving the blocker.
     Scale(ScaleArgs),
     Completions(CompletionsArgs),
     #[structopt(name = "list", alias = "ls")]
@@ -643,6 +646,7 @@ pub struct NamedClusterArgs {
 pub struct ScaleArgs {
     #[structopt(long)]
     pub name: Option<String>,
+    /// Desired worker count, including zero. A blocked drain leaves the worker intact.
     #[structopt(long)]
     pub workers: usize,
 }

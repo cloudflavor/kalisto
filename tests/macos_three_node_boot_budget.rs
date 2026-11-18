@@ -710,7 +710,7 @@ fn cold_cli_boot(backend: BackendKind) {
             .unwrap(),
         )
         .unwrap();
-        prove_persistent_restart_and_worker_scale(&name, &prepared_spec, &kubeconfig);
+        prove_persistent_restart_and_worker_scale(&name, &prepared_spec, &kubeconfig, &evidence);
         borrowed_runtime
             .as_ref()
             .unwrap()
@@ -723,7 +723,12 @@ fn cold_cli_boot(backend: BackendKind) {
     }
 }
 
-fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kubeconfig: &Path) {
+fn prove_persistent_restart_and_worker_scale(
+    name: &str,
+    spec: &ClusterSpec,
+    kubeconfig: &Path,
+    evidence: &Path,
+) {
     kubectl(
         kubeconfig,
         &[
@@ -778,6 +783,83 @@ fn prove_persistent_restart_and_worker_scale(name: &str, spec: &ClusterSpec, kub
         "the added worker must join with a functional CNI"
     );
     assert_kubelet_access(kubeconfig, nodes);
+
+    let removed_name = format!("kalisto-{name}-w2");
+    let output = Command::new(env!("CARGO_BIN_EXE_kalisto"))
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .current_dir(&spec.workspace_root)
+        .args(["scale", "--name", name, "--workers", "2"])
+        .output()
+        .expect("CLI worker scale-down should run");
+    fs::write(evidence.join("scale-down.stdout.log"), &output.stdout).unwrap();
+    fs::write(evidence.join("scale-down.stderr.log"), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "worker scale-down failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == "workers: 3 -> 2"));
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("removed nodes: {removed_name}"))
+    );
+    let retained: serde_json::Value =
+        serde_json::from_slice(&kubectl(kubeconfig, &["get", "nodes", "-o", "json"])).unwrap();
+    let retained = retained["items"].as_array().unwrap();
+    assert_eq!(retained.len(), 3);
+    for original in resumed_nodes {
+        assert!(
+            retained.iter().any(|node| {
+                node["metadata"]["name"] == original["metadata"]["name"]
+                    && node["metadata"]["uid"] == original["metadata"]["uid"]
+            }),
+            "scale-down must retain every original Node and its identity"
+        );
+    }
+    assert_kubelet_access(kubeconfig, retained);
+    assert_eq!(
+        kubectl(
+            kubeconfig,
+            &[
+                "exec",
+                "boot-budget-http",
+                "--",
+                "wget",
+                "-q",
+                "-T",
+                "5",
+                "-O",
+                "-",
+                "http://boot-budget-http.default.svc.cluster.local:8080/",
+            ],
+        ),
+        b"ready\n",
+        "the functional HTTP application must remain reachable after scale-down"
+    );
+    let instances: serde_json::Value = serde_json::from_slice(&runtime_output(
+        Path::new("container"),
+        &["list", "--all", "--format", "json"],
+    ))
+    .unwrap();
+    fs::write(
+        evidence.join("scale-down-instances.json"),
+        serde_json::to_vec_pretty(&instances).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        instances
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|instance| instance["id"].as_str() != Some(removed_name.as_str())),
+        "the removed worker instance must be absent from the actual backend"
+    );
+    let state = kalisto::cluster::state::ClusterState::load(&spec.state_root()).unwrap();
+    assert_eq!(state.worker_count, 2);
+    assert_eq!(state.nodes.len(), 3);
+    assert!(!spec.state_root().join("runtime").join(removed_name).exists());
 }
 
 fn assert_kubelet_access(kubeconfig: &Path, nodes: &[serde_json::Value]) {

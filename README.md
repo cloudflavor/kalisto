@@ -48,6 +48,22 @@ and Firecracker on Linux.
 Recorded development revisions: Apple `93390c52e4f0` (macOS Apple silicon),
 Firecracker `4fe2abc74675` (Linux x86_64). Preparation is outside startup recordings.
 
+## Resize a cluster
+
+```sh
+kalisto scale --name dev --workers 3
+kalisto scale --name dev --workers 1
+```
+
+The count excludes the control plane. Scale-down drains the highest-index
+workers first, respecting disruption budgets and refusing forced eviction or
+automatic deletion of `emptyDir` data. Removed workers' VM disks and local data
+are permanently deleted; back up any data you need before shrinking.
+
+If removal fails, resolve the reported problem and repeat the same command.
+Completed removals remain persisted; an unfinished removal must be resumed
+before scaling up.
+
 ## Documentation
 
 The canonical guides and reference live at
