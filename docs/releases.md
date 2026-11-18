@@ -1,6 +1,9 @@
 # Tagged binary releases
 
-Source: [cloudflavor/kalisto](https://github.com/cloudflavor/kalisto).
+Development, PRs, builds, tests and release validation run on
+[Iceberg](https://iceberg.home.arpa/cloudflavor/kalisto). GitHub receives validated
+changes afterward; do not execute workflows there.
+
 Pushed SemVer tags (`vMAJOR.MINOR.PATCH`, with optional prerelease/build suffixes)
 trigger `.forgejo/workflows/release.yml`, which publishes to the Forgejo instance
 and repository supplied by the workflow environment. There is no hardcoded release
@@ -124,9 +127,18 @@ Use a manual release workflow run to build and verify all four candidates withou
 publishing. Run native functional checks only on the configured CI runner; they
 create and destroy their own real cluster, not a mock.
 
+For versioned candidate preparation, set the existing release workflow's optional
+manual-dispatch input `candidate_tag` to the intended SemVer tag, such as `v0.1.0`.
+All four packages then embed that version and the exact dispatched source commit.
+This does not create a tag or publish a release, and the input cannot enable the
+tag-push publication step. Leave it empty for ordinary `ci-<commit>` development
+packages.
+
 ## Create a release
 
-Choose a reviewed commit with green CI and a new version. Example only:
+Choose a reviewed commit with green CI and a new version. Require passing native
+startup acceptance and the complete four-target candidate inventory for that exact
+commit before creating the release tag. Example only:
 
 ```bash
 git tag -s v0.1.0 COMMIT
