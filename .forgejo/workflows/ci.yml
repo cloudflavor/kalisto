@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: kalisto-ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: false
 
 jobs:
   rust-fmt:
