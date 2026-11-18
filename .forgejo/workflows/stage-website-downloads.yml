@@ -33,6 +33,8 @@ jobs:
           unset url
           git checkout -q --detach "${GITHUB_SHA}^{commit}"
       - name: Stage published assets without replacing existing downloads
+        env:
+          GITHUB_TOKEN: ${{ secrets.KALISTO_RELEASE_TOKEN }}
         run: |
           set -eu
           if [ -n "${KALISTO_LINUX_CA_BUNDLE:-}" ]; then

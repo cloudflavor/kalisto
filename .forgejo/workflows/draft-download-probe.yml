@@ -8,6 +8,8 @@ jobs:
       image: ${{ vars.KALISTO_CI_IMAGE }}
     steps:
       - name: Compare repository-scoped download authentication
+        env:
+          GITHUB_TOKEN: ${{ secrets.KALISTO_RELEASE_TOKEN }}
         run: |
           python3 - <<'PY'
           import base64, json, os, urllib.error, urllib.request
