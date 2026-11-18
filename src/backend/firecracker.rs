@@ -691,11 +691,10 @@ struct RootlessClusterNetwork {
 }
 
 impl RootlessClusterNetwork {
-    fn from_runtime_root(runtime_root: &Path) -> Result<Self> {
-        let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
+    fn from_network_root(root: &Path) -> Result<Self> {
         let anchor_pid = read_required_pid(&root.join("anchor.pid"), "rootless firecracker netns")?;
         let _ = read_required_pid(&root.join("slirp4netns.pid"), "slirp4netns")?;
-        let api_socket = load_slirp_api_socket_path(&root)?;
+        let api_socket = load_slirp_api_socket_path(root)?;
         Ok(Self {
             anchor_pid,
             api_socket,
@@ -1301,7 +1300,10 @@ fn firecracker_command(
     let mut command = match net.mode {
         FirecrackerNetworkMode::Bridge => Command::new("firecracker"),
         FirecrackerNetworkMode::RootlessSlirp => {
-            let cluster_network = RootlessClusterNetwork::from_runtime_root(&instance.runtime_root)
+            let root = cluster_runtime_root(&instance.runtime_root)
+                .expect("rootless runtime should have a cluster parent")
+                .join(ROOTLESS_NETWORK_DIR);
+            let cluster_network = RootlessClusterNetwork::from_network_root(&root)
                 .expect("rootless cluster network should exist before firecracker spawn");
             let mut command = Command::new("nsenter");
             command.args([
@@ -1833,13 +1835,15 @@ fn stop_process(
             );
             // Firecracker exits on CPU reset, not guest halt. sshd stops before
             // disks are flushed, so wait for VMM exit instead of SSH loss.
-            if !wait_for_process_exit(runner, pid, Duration::from_secs(30)) {
+            // Permit systemd's final container-termination grace period and
+            // filesystem flush, which can outlive the SSH session by 90s.
+            if !wait_for_process_exit(runner, pid, Duration::from_secs(120)) {
                 let detail = shutdown
                     .err()
                     .map(|error| format!("; shutdown request: {error}"))
                     .unwrap_or_default();
                 return Err(Error::InvalidArgs(format!(
-                    "guest shutdown did not finish within 30s; refusing to terminate Firecracker process {pid} with unflushed disks{detail}"
+                    "guest shutdown did not finish within 120s; refusing to terminate Firecracker process {pid} with unflushed disks{detail}"
                 )));
             }
         }
@@ -1857,10 +1861,17 @@ fn cleanup_rootless_instance_network(
     runtime: &RuntimeFiles,
     net: &NetworkConfig,
 ) -> Result<()> {
-    let cluster =
-        RootlessClusterNetwork::from_runtime_root(runtime.pid.parent().ok_or_else(|| {
-            Error::InvalidArgs("missing runtime root for rootless cleanup".to_owned())
-        })?)?;
+    let runtime_root = runtime.pid.parent().ok_or_else(|| {
+        Error::InvalidArgs("missing runtime root for rootless cleanup".to_owned())
+    })?;
+    let root = cluster_runtime_root(runtime_root)?.join(ROOTLESS_NETWORK_DIR);
+    if !root
+        .try_exists()
+        .map_err(io_error("inspect rootless network"))?
+    {
+        return Ok(());
+    }
+    let cluster = RootlessClusterNetwork::from_network_root(&root)?;
     if let Some(ssh_port) = net.ssh_port {
         let _ = remove_slirp_host_forward(&cluster.api_socket, ssh_port, &net.guest_ip, 22);
     }
@@ -2678,6 +2689,28 @@ mod tests {
         super::stop_process(&runner, &runtime, &net, false).unwrap();
         assert_eq!(*runner.0.lock().unwrap(), 3);
         assert!(!runtime.pid.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_rootless_network_cleanup_preserves_the_guest_address() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("kalisto-rootless-stopped-{}", std::process::id()));
+        let directory = root.join("vm");
+        fs::create_dir_all(&directory).unwrap();
+        let runtime = super::RuntimeFiles::new(&directory);
+        fs::write(&runtime.guest_ip, "10.0.2.100\n").unwrap();
+        let net =
+            NetworkConfig::for_rootless_instance("vm", "10.0.2.100".parse().unwrap(), 12345, None);
+        for _ in 0..2 {
+            super::stop_process(&PanicRunner, &runtime, &net, false).unwrap();
+            assert!(!runtime.pid.exists());
+            assert_eq!(
+                fs::read_to_string(&runtime.guest_ip).unwrap(),
+                "10.0.2.100\n"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

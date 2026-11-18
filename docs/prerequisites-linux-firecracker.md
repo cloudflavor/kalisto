@@ -293,9 +293,10 @@ prepared boot cache available for future fresh clusters.
 
 Graceful stop requests an orderly guest reboot (Firecracker exits on CPU reset),
 then waits for the Firecracker process to exit, not merely for SSH to disconnect.
-If shutdown does not finish within 30 seconds, Kalisto returns an error and
-retains the VM's PID and network ownership rather than killing a guest that may
-still be flushing its disks.
+The wait allows systemd's final container-termination grace period and disk
+flush. If shutdown does not finish within 120 seconds, Kalisto returns an error
+identifying failed nodes and retains their PID/network ownership and the cluster
+definition instead of claiming success or killing a guest with unflushed disks.
 
 ## Inspection Script
 
