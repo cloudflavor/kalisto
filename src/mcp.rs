@@ -2942,16 +2942,13 @@ fn parse_scale_result(stdout: &str) -> Option<Value> {
     let values = parse_key_value_lines(stdout);
     let workers = values.get("workers")?;
     let (previous, current) = workers.split_once(" -> ")?;
-    let added = values
-        .get("added nodes")
-        .map(|value| {
-            if value == "none" {
-                Vec::new()
-            } else {
-                value.split(", ").map(ToOwned::to_owned).collect::<Vec<_>>()
-            }
-        })
-        .unwrap_or_default();
+    let node_names = |key: &str| {
+        values
+            .get(key)
+            .filter(|value| value.as_str() != "none")
+            .map(|value| value.split(", ").collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
     Some(success_tool_result(
         &format!(
             "Scaled cluster `{}` from {} to {} worker(s).",
@@ -2963,7 +2960,8 @@ fn parse_scale_result(stdout: &str) -> Option<Value> {
             "cluster": values.get("cluster")?,
             "previousWorkers": previous.parse::<usize>().ok()?,
             "currentWorkers": current.parse::<usize>().ok()?,
-            "addedWorkers": added
+            "addedWorkers": node_names("added nodes"),
+            "removedWorkers": node_names("removed nodes")
         }),
     ))
 }
@@ -3491,6 +3489,24 @@ mod tests {
                 .and_then(|execution| execution.get("taskSupport"))
                 .and_then(Value::as_str),
             Some("required")
+        );
+    }
+
+    #[test]
+    fn scale_result_reports_removed_workers_without_confusing_them_with_added_workers() {
+        let result = super::parse_scale_result(
+            "cluster: dev\nworkers: 3 -> 1\nadded nodes: none\nremoved nodes: kalisto-dev-w2, kalisto-dev-w1\n",
+        )
+        .expect("scale-down result should parse");
+        assert_eq!(
+            result["structuredContent"],
+            json!({
+                "cluster": "dev",
+                "previousWorkers": 3,
+                "currentWorkers": 1,
+                "addedWorkers": [],
+                "removedWorkers": ["kalisto-dev-w2", "kalisto-dev-w1"]
+            })
         );
     }
 

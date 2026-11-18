@@ -694,6 +694,9 @@ pub fn up_with_runner(spec: &ClusterSpec, runner: &dyn CommandRunner) -> Result<
     )?;
 
     if let Some(removal) = pending_removal {
+        if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, &state_root, &runtime_root) {
+            warn!(error = %error, "failed to hand off resumed cluster files to invoking user");
+        }
         return Err(Error::InvalidArgs(format!(
             "cluster nodes resumed without recreating removed workers; retry scale --name {} --workers {} or fewer to finish removing `{}`",
             state.name, removal.index, removal.name
@@ -1263,6 +1266,7 @@ fn scale_at_root(
         backend.guest_artifact_root(&control_plane.name, &control_plane.artifacts.root)?;
     let control_plane_guest_kubeconfig = control_plane_guest_artifacts.join("kubeconfig.yaml");
     if workers < state.worker_count {
+        validate_scale_down_ownership(state_root, &state)?;
         let outcome = scale_down_at_root(
             state_root,
             &mut state,
@@ -1271,7 +1275,11 @@ fn scale_at_root(
             &control_plane,
             &control_plane_guest_kubeconfig,
             pending_removal,
-        )?;
+        );
+        if let Err(error) = handoff_cluster_paths_to_invoking_user(runner, state_root, &runtime_root) {
+            warn!(error = %error, "failed to hand off scaled cluster files to invoking user");
+        }
+        let outcome = outcome?;
         progress.finish(&format!(
             "Scale-down complete: {previous_workers} -> {} workers",
             outcome.current_workers
@@ -1600,13 +1608,22 @@ fn scale_down_at_root(
     kubeconfig: &Path,
     mut pending: Option<WorkerRemoval>,
 ) -> Result<ScaleOutcome> {
-    validate_scale_down_ownership(state_root, state)?;
     let backend = backend_for(state.backend);
     let previous_workers = state.worker_count;
     let kubectl = format!(
         "KUBECONFIG={} /usr/local/bin/k3s kubectl --request-timeout=10s",
         shell_escape(&kubeconfig.display().to_string())
     );
+    let network_config = (state.backend == BackendKind::Firecracker).then(|| BackendConfig {
+        template: state.template.clone(),
+        workspace_root: state.workspace_root.clone(),
+        enable_rosetta: state.enable_rosetta,
+        network: state.network.clone(),
+        firecracker_kernel: state.firecracker_kernel.clone(),
+        firecracker_rootfs: state.firecracker_rootfs.clone(),
+        boot_assets_root: None,
+        stream_vm_logs: false,
+    });
     let mut removed_workers = Vec::with_capacity(previous_workers - workers);
     while state.worker_count > workers {
         let index = state.worker_count - 1;
@@ -1691,6 +1708,9 @@ fn scale_down_at_root(
             backend.delete_instance(runner, &name, &root)?;
             removal.phase = WorkerRemovalPhase::InstanceDeleted;
             save_worker_removal(state_root, &removal)?;
+        }
+        if let Some(config) = &network_config {
+            backend.cleanup_cluster_network(runner, config, std::slice::from_ref(&name))?;
         }
         match fs::remove_dir_all(&root) {
             Ok(()) => {}
@@ -3134,7 +3154,7 @@ fn debug_feedback(message: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     mod worker_scale_down {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::fs;
         use std::path::PathBuf;
         use std::sync::Mutex;
@@ -3208,6 +3228,7 @@ mod tests {
                     block_runtime_cleanup: Mutex::new(None),
                     recovering: Mutex::new(false),
                     started: Mutex::new(Vec::new()),
+                    bridge_taps: Mutex::new(None),
                 };
                 Self {
                     root,
@@ -3243,6 +3264,7 @@ mod tests {
             block_runtime_cleanup: Mutex<Option<PathBuf>>,
             recovering: Mutex<bool>,
             started: Mutex<Vec<String>>,
+            bridge_taps: Mutex<Option<HashSet<String>>>,
         }
 
         impl RemovalRunner {
@@ -3268,6 +3290,33 @@ mod tests {
 
         impl CommandRunner for RemovalRunner {
             fn run(&self, program: &str, args: &[String]) -> Result<Output> {
+                if program == "chown"
+                    && std::env::var("KALISTO_TEST_SUDO_HANDOFF").as_deref() == Ok("1")
+                {
+                    return crate::process::SystemRunner.run(program, args);
+                }
+                if let Some(taps) = self.bridge_taps.lock().unwrap().as_mut() {
+                    if program == "ssh" && args.last().is_some_and(|arg| arg == "true") {
+                        return Err(Error::InvalidArgs("guest is stopped".to_owned()));
+                    }
+                    if program == "kill" {
+                        return Ok(Output {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        });
+                    }
+                    if program == "ip" {
+                        if args.first().is_some_and(|arg| arg == "link")
+                            && args.get(1).is_some_and(|arg| arg == "del")
+                        {
+                            taps.remove(args.last().unwrap());
+                        }
+                        return Ok(Output {
+                            stdout: taps.iter().cloned().collect::<Vec<_>>().join("\n"),
+                            stderr: String::new(),
+                        });
+                    }
+                }
                 let output = self.inner.run(program, args)?;
                 let command = args.last().map_or("", String::as_str);
                 if *self.recovering.lock().unwrap() {
@@ -3353,6 +3402,78 @@ mod tests {
                     }
                 }
                 Ok(output)
+            }
+        }
+
+        #[test]
+        fn scale_down_removes_only_the_deleted_workers_bridge_device() {
+            let fixture = Fixture::new("bridge");
+            let mut state = fixture.state();
+            state.backend = crate::backend::BackendKind::Firecracker;
+            state.network = "bridge".to_owned();
+            let tap = |name: &str| {
+                let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+                    (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+                });
+                format!("ktap{hash:08x}")
+            };
+            let taps = state.nodes.iter().map(|node| tap(&node.name)).collect();
+            *fixture.runner.bridge_taps.lock().unwrap() = Some(taps);
+            fs::write(state.nodes[0].artifacts_root.join("firecracker.pid"), "123").unwrap();
+            state.save(&fixture.state_root).unwrap();
+            fixture.scale(2).unwrap();
+            let retained = fixture.state();
+            assert_eq!(
+                fixture.runner.bridge_taps.lock().unwrap().as_ref().unwrap(),
+                &retained.nodes.iter().map(|node| tap(&node.name)).collect()
+            );
+            assert_eq!(retained.worker_count, 2);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn scale_down_hands_files_back_to_sudo_user_even_after_a_blocked_drain() {
+            use std::os::unix::fs::MetadataExt;
+
+            // SAFETY: geteuid only reads this process's effective user ID.
+            if unsafe { libc::geteuid() } != 0 {
+                return;
+            }
+            if std::env::var("KALISTO_TEST_SUDO_HANDOFF").as_deref() != Ok("1") {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cluster::manager::tests::worker_scale_down::scale_down_hands_files_back_to_sudo_user_even_after_a_blocked_drain",
+                        "--nocapture",
+                    ])
+                    .env("KALISTO_TEST_SUDO_HANDOFF", "1")
+                    .env("SUDO_UID", "65534")
+                    .env("SUDO_GID", "65534")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "isolated sudo ownership regression failed");
+                return;
+            }
+            for blocked in [false, true] {
+                let fixture = Fixture::new(if blocked { "sudo-blocked" } else { "sudo-success" });
+                if blocked {
+                    fixture.fail("drain", "kalisto-dev-w1");
+                }
+                assert_eq!(fixture.scale(0).is_err(), blocked);
+                assert_eq!(
+                    fs::metadata(ClusterState::state_file(&fixture.state_root))
+                        .unwrap()
+                        .uid(),
+                    65534
+                );
+                if blocked {
+                    assert_eq!(
+                        fs::metadata(fixture.state_root.join("scale-down.json"))
+                            .unwrap()
+                            .uid(),
+                        65534
+                    );
+                }
             }
         }
 
