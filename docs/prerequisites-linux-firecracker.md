@@ -205,6 +205,12 @@ Kalisto currently has two Linux Firecracker networking modes:
 
 `slirp4netns` is now the default Firecracker mode on Linux.
 
+Guest addresses are allocated from `10.0.2.100`–`10.0.2.254` under a per-cluster
+file lock before boot. Each node keeps its persisted address across stop/resume;
+removing the node releases it. Allocation fails explicitly when the pool is full.
+Older clusters with duplicate persisted addresses must be backed up and recreated;
+Kalisto does not silently renumber running guests or their existing rootfs.
+
 Use `--network bridge` only when you explicitly want host bridge/TAP networking
 and have the required host privileges (sudo).
 
@@ -284,6 +290,13 @@ not enter the shared cache.
 `down` stops the VMs while retaining their disks and identities. `up` resumes
 that persisted profile. `destroy` removes the named cluster but leaves the
 prepared boot cache available for future fresh clusters.
+
+Graceful stop requests an orderly guest reboot (Firecracker exits on CPU reset),
+then waits for the Firecracker process to exit, not merely for SSH to disconnect.
+The wait allows systemd's final container-termination grace period and disk
+flush. If shutdown does not finish within 120 seconds, Kalisto returns an error
+identifying failed nodes and retains their PID/network ownership and the cluster
+definition instead of claiming success or killing a guest with unflushed disks.
 
 ## Inspection Script
 

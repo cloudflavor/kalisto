@@ -44,6 +44,10 @@ artifacts when behavior changes.
   resolution. Firecracker startup never downloads missing guest artifacts.
 - Shared read-only Firecracker boot-asset disk; per-cluster writable disks,
   SSH identities and private manifests.
+- Rootless Firecracker guest addresses are reserved under a per-cluster file
+  lock, persisted across stop/resume and released only with node removal.
+- Graceful Firecracker stop waits for orderly guest shutdown and VMM exit,
+  preserving disk writes rather than treating early SSH shutdown as completion.
 - Three-target release packaging (macOS ARM64, Linux ARM64 and Linux x86_64),
   checksums/provenance and draft-first GitHub Releases publication from reviewed
   main tags, without website staging or Bunny artifact uploads;

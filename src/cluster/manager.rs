@@ -1012,7 +1012,7 @@ fn down_at_root(
 ) -> Result<()> {
     let state = ClusterState::load(state_root)?;
     let backend = backend_for(state.backend);
-    stop_instances(backend, runner, &state.nodes, force);
+    stop_instances(backend, runner, &state.nodes, force)?;
     info!(cluster = %name, force, state_root = %state_root.display(), "cluster stopped");
     Ok(())
 }
@@ -2561,7 +2561,8 @@ fn stop_instances(
     runner: &dyn CommandRunner,
     nodes: &[NodeState],
     force: bool,
-) {
+) -> Result<()> {
+    let mut failures = Vec::new();
     for node in nodes.iter().rev() {
         info!(
             backend = backend.kind().as_str(),
@@ -2569,8 +2570,17 @@ fn stop_instances(
             force,
             "stopping backend instance"
         );
-        let _ = backend.stop_instance(runner, &node.name, &node.artifacts_root, force);
+        if let Err(error) = backend.stop_instance(runner, &node.name, &node.artifacts_root, force) {
+            failures.push(format!("{}: {error}", node.name));
+        }
     }
+    if !failures.is_empty() {
+        return Err(Error::InvalidArgs(format!(
+            "failed to stop cluster nodes: {}",
+            failures.join("; ")
+        )));
+    }
+    Ok(())
 }
 
 fn delete_instances(backend: &dyn ClusterBackend, runner: &dyn CommandRunner, nodes: &[NodeState]) {
@@ -2995,8 +3005,14 @@ fn rollback_failed_up(
     }
     // A retry may be resuming existing VMs with user data. Failed bring-up
     // must never delete their disks; only an explicit destroy may do that.
-    if !keep_failed_runtime {
-        stop_instances(backend, runner, started_instances, true);
+    if !keep_failed_runtime
+        && let Err(stop_error) = stop_instances(backend, runner, started_instances, true)
+    {
+        warn!(
+            error = %stop_error,
+            state_root = %state_root.display(),
+            "failed to stop all instances after unsuccessful bring-up"
+        );
     }
     error
 }
@@ -4324,7 +4340,7 @@ mod tests {
     }
 
     #[test]
-    fn down_removes_cluster_state_directory() {
+    fn down_reports_stop_failure_and_preserves_cluster_state_for_retry() {
         let root = std::env::temp_dir().join(format!("kalisto-down-{}", std::process::id()));
         let workspace_root = root.join("workspace");
         let state_root = workspace_root.join(".kalisto").join("clusters").join("dev");
@@ -4336,6 +4352,18 @@ mod tests {
                 ("kalisto-dev-cp", NodeRole::ControlPlane),
                 ("kalisto-dev-w0", NodeRole::Worker),
             ],
+        );
+
+        let failed = FakeRunner::with_invocation_failure_containing([], "kalisto-dev-w0");
+        assert!(down_at_root(&state_root, "dev", false, &failed).is_err());
+        let retained = ClusterState::load(&state_root).unwrap();
+        assert_eq!(
+            retained
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["kalisto-dev-cp", "kalisto-dev-w0"]
         );
 
         let runner = FakeRunner::default();
